@@ -37,62 +37,86 @@ class LoginReq(BaseModel):
     user_id: str
     password: str
 
-# ================= HELPERS ================
-def hash_password(pwd: str) -> str:
-    return hashlib.sha256(pwd.encode()).hexdigest()
+# ---- helpers (same behavior as old code) ----
+def _norm(s: Optional[str]) -> str:
+    return (s or "").strip()
 
-def user_file(user_id: str) -> str:
-    return os.path.join(USERS_DIR, f"{user_id}.json")
+def _safe(s: str) -> str:
+    s = _norm(s).replace(" ", "_")
+    return "".join(ch for ch in s if ch.isalnum() or ch in ("_", "-"))
 
-def create_jwt(user_id: str) -> str:
-    payload = {
-        "sub": user_id,
-        "exp": datetime.utcnow() + timedelta(minutes=TOKEN_EXP_MIN)
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+def hash_password(p: str) -> str:
+    return hashlib.sha256(_norm(p).encode("utf-8")).hexdigest()
 
-# ================= ROUTES =================
+# ---- GitHub raw read config ----
+GITHUB_OWNER = os.getenv("GITHUB_REPO_OWNER", "wealthoceaninstitute-commits")
+GITHUB_REPO  = os.getenv("GITHUB_REPO_NAME", "Multiuser_clients")
+BRANCH = os.getenv("GITHUB_BRANCH", "main")
+
+# ---- REGISTER (permissive, frontend-safe) ----
 @app.post("/auth/register")
-def register(req: RegisterReq):
-    if os.path.exists(user_file(req.user_id)):
-        raise HTTPException(status_code=400, detail="User ID already exists")
+def register(payload: Dict[str, Any] = Body(...)):
+    userid = _norm(payload.get("userid") or payload.get("user_id") or payload.get("username"))
+    email = _norm(payload.get("email"))
+    password = _norm(payload.get("password"))
 
-    # ensure email uniqueness
-    for f in os.listdir(USERS_DIR):
-        with open(os.path.join(USERS_DIR, f), "r") as fp:
-            u = json.load(fp)
-            if u.get("email") == req.email:
-                raise HTTPException(status_code=400, detail="Email already registered")
+    if not userid or not email or not password:
+        raise HTTPException(status_code=400, detail="All fields required")
 
-    user = {
-        "user_id": req.user_id,
-        "email": req.email,
-        "password_hash": hash_password(req.password),
-        "created_at": datetime.utcnow().isoformat()
+    profile = {
+        "userid": userid,
+        "email": email,
+        "password": hash_password(password),
+        "created_at": datetime.utcnow().isoformat(),
     }
 
-    with open(user_file(req.user_id), "w") as fp:
-        json.dump(user, fp, indent=2)
+    try:
+        github_write_json(f"data/users/{userid}/profile.json", profile)
+
+        safe_email = _safe(email)
+        if safe_email and safe_email != userid:
+            github_write_json(f"data/users/{safe_email}/profile.json", profile)
+
+    except Exception as e:
+        print("[auth] GitHub write failed:", str(e)[:200])
 
     return {"success": True, "message": "User created"}
 
+# ---- LOGIN (userid OR email OR username) ----
 @app.post("/auth/login")
-def login(req: LoginReq):
-    path = user_file(req.user_id)
-    if not os.path.exists(path):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+def login(payload: Dict[str, Any] = Body(...)):
+    username = _norm(
+        payload.get("userid")
+        or payload.get("user_id")
+        or payload.get("username")
+        or payload.get("email")
+    )
+    password = _norm(payload.get("password"))
 
-    with open(path, "r") as fp:
-        user = json.load(fp)
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="Missing credentials")
 
-    if user["password_hash"] != hash_password(req.password):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+    candidates = [username]
+    safe_u = _safe(username)
+    if safe_u not in candidates:
+        candidates.append(safe_u)
+
+    user = None
+    for key in candidates:
+        path = f"data/users/{key}/profile.json"
+        url = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/{BRANCH}/{path}"
+        try:
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                user = r.json()
+                break
+        except Exception:
+            continue
+
+    if not user or user.get("password") != hash_password(password):
+        raise HTTPException(status_code=401, detail="Invalid login")
 
     return {
-        "access_token": create_jwt(req.user_id),
-        "token_type": "bearer"
+        "success": True,
+        "userid": user.get("userid") or username
     }
-
-@app.get("/")
-def health():
-    return {"status": "auth service running"}
