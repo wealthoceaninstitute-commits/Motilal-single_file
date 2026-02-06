@@ -192,89 +192,92 @@ def add_client(
     payload: dict = Body(...),
     user_id: str = Depends(get_current_user)
 ):
-    """
-    Payload must match CT_FastAPI client structure
-    """
     name = payload.get("name")
     client_id = payload.get("userid")
 
     if not name or not client_id:
         raise HTTPException(400, "name and userid required")
 
-    user_dir = os.path.join("data", "users", user_id, "clients")
-    os.makedirs(user_dir, exist_ok=True)
-
-    filename = f"{name.replace(' ', '_')}_{client_id}.json"
-    path = os.path.join(user_dir, filename)
+    path = f"data/users/{user_id}/clients/{client_id}.json"
 
     payload["session_active"] = False
     payload["created_at"] = datetime.utcnow().isoformat()
 
-    with open(path, "w") as f:
-        json.dump(payload, f, indent=4)
+    # ✅ write to GitHub, not disk
+    write_github_json(path, payload)
 
-    # 🔐 login immediately (same as CT_FastAPI)
+    # 🔐 login immediately (same logic as CT_FastAPI)
     session_ok = login_motilal_client(payload)
 
     if session_ok:
         payload["session_active"] = True
-        with open(path, "w") as f:
-            json.dump(payload, f, indent=4)
+        write_github_json(path, payload)
 
     return {
         "success": True,
         "session_active": session_ok,
         "message": "Client added"
     }
-
 @app.get("/clients")
 def get_clients(user_id: str = Depends(get_current_user)):
-    user_dir = os.path.join("data", "users", user_id, "clients")
-    clients = []
+    api = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/data/users/{user_id}/clients"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
 
-    if not os.path.exists(user_dir):
+    r = requests.get(api, headers=headers)
+
+    if r.status_code == 404:
         return {"clients": []}
 
-    for fname in os.listdir(user_dir):
-        if fname.endswith(".json"):
-            try:
-                with open(os.path.join(user_dir, fname)) as f:
-                    c = json.load(f)
-                    clients.append({
-                        "name": c.get("name"),
-                        "client_id": c.get("userid"),
-                        "capital": c.get("capital", 0),
-                        "session": "Logged in" if c.get("session_active") else "Logged out"
-                    })
-            except Exception:
-                continue
+    if r.status_code != 200:
+        raise HTTPException(500, "Failed to fetch clients")
+
+    clients = []
+    for item in r.json():
+        if item["type"] != "file" or not item["name"].endswith(".json"):
+            continue
+
+        raw = requests.get(item["download_url"]).json()
+        clients.append({
+            "name": raw.get("name"),
+            "client_id": raw.get("userid"),
+            "capital": raw.get("capital", 0),
+            "session": "Logged in" if raw.get("session_active") else "Logged out"
+        })
 
     return {"clients": clients}
 
 @app.post("/clients/login_all")
 def login_all_clients(user_id: str = Depends(get_current_user)):
-    user_dir = os.path.join("data", "users", user_id, "clients")
-    if not os.path.exists(user_dir):
-        return {"message": "No clients"}
+    api = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/data/users/{user_id}/clients"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
+
+    r = requests.get(api, headers=headers)
+    if r.status_code != 200:
+        return {"results": []}
 
     results = []
 
-    for fname in os.listdir(user_dir):
-        if not fname.endswith(".json"):
+    for item in r.json():
+        if item["type"] != "file":
             continue
 
-        path = os.path.join(user_dir, fname)
-        with open(path) as f:
-            client = json.load(f)
-
+        client = requests.get(item["download_url"]).json()
         ok = login_motilal_client(client)
         client["session_active"] = ok
 
-        with open(path, "w") as f:
-            json.dump(client, f, indent=4)
+        write_github_json(
+            f"data/users/{user_id}/clients/{client['userid']}.json",
+            client
+        )
 
         results.append({
-            "client_id": client.get("userid"),
+            "client_id": client["userid"],
             "session_active": ok
         })
 
