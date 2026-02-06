@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
 from jose import jwt, JWTError
 import hashlib, os, json, requests
+import base64
 
 # ======================================================
 # CONFIG
@@ -56,17 +57,27 @@ def read_github_json(path: str):
 
 def write_github_json(path: str, data: dict):
     api = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{path}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
+
+    content_bytes = json.dumps(data, indent=2).encode("utf-8")
+    content_b64 = base64.b64encode(content_bytes).decode("utf-8")
 
     payload = {
-        "message": f"write {path}",
-        "content": json.dumps(data, indent=2).encode().decode("utf-8"),
+        "message": f"create {path}",
+        "content": content_b64,
         "branch": GITHUB_BRANCH,
     }
 
     r = requests.put(api, headers=headers, json=payload)
+
     if r.status_code not in (200, 201):
-        raise HTTPException(400, "GitHub write failed")
+        raise HTTPException(
+            400,
+            f"GitHub write failed: {r.status_code} {r.text[:200]}"
+        )
 
 # ======================================================
 # AUTH ROUTES
