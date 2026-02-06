@@ -201,23 +201,17 @@ async def add_client(
     if not name or not userid:
         raise HTTPException(status_code=400, detail="Name and User ID required")
 
-    # ---- GitHub path (single broker, per user) ----
+    payload["session_active"] = False  # 👈 important
+
     path = f"data/users/{user_id}/clients/{userid}.json"
 
-    try:
-        # 1️⃣ Save client to GitHub (web-safe persistence)
-        write_github_json(path, payload)
+    write_github_json(path, payload)
+    background_tasks.add_task(login_motilal_client, payload)
 
-        # 2️⃣ Start login in background (same idea as desktop app)
-        background_tasks.add_task(login_motilal_client, payload)
-
-        return {
-            "success": True,
-            "message": "Client saved. Login started in background.",
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "success": True,
+        "message": "Client saved. Login started in background.",
+    }
         
 @app.get("/get_clients")
 def get_clients(user_id: str = Depends(get_current_user)):
