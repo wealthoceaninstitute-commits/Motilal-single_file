@@ -4,6 +4,11 @@ from datetime import datetime, timedelta
 from jose import jwt, JWTError
 import hashlib, os, json, requests
 import base64
+from fastapi import Depends, HTTPException
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import jwt, JWTError
+import pyotp
+from MOFSLOPENAPI import MOFSLOPENAPI
 
 # ======================================================
 # CONFIG
@@ -138,3 +143,139 @@ def login(payload: dict = Body(...)):
         "userid": profile["userid"],
         "email": profile["email"],
     }
+
+security = HTTPBearer()
+
+def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security)):
+    token = creds.credentials
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        userid = payload.get("sub")
+        if not userid:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return userid
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+
+Base_Url = "https://openapi.motilaloswal.com"
+SourceID = "Desktop"
+browsername = "chrome"
+browserversion = "104"
+
+mofsl_sessions = {}  # userid → (Mofsl, client_userid)
+
+def login_motilal_client(client: dict):
+    name = client.get("name")
+    userid = client.get("userid")
+    password = client.get("password")
+    pan = client.get("pan", "")
+    apikey = client.get("apikey", "")
+    totp_key = client.get("totpkey", "")
+
+    try:
+        totp = pyotp.TOTP(totp_key).now() if totp_key else ""
+        Mofsl = MOFSLOPENAPI(apikey, Base_Url, None, SourceID, browsername, browserversion)
+        resp = Mofsl.login(userid, password, pan, totp, userid)
+
+        if resp.get("status") == "SUCCESS":
+            mofsl_sessions[userid] = (Mofsl, userid)
+            return True
+    except Exception:
+        pass
+
+    return False
+
+@app.post("/clients/add")
+def add_client(
+    payload: dict = Body(...),
+    user_id: str = Depends(get_current_user)
+):
+    """
+    Payload must match CT_FastAPI client structure
+    """
+    name = payload.get("name")
+    client_id = payload.get("userid")
+
+    if not name or not client_id:
+        raise HTTPException(400, "name and userid required")
+
+    user_dir = os.path.join("data", "users", user_id, "clients")
+    os.makedirs(user_dir, exist_ok=True)
+
+    filename = f"{name.replace(' ', '_')}_{client_id}.json"
+    path = os.path.join(user_dir, filename)
+
+    payload["session_active"] = False
+    payload["created_at"] = datetime.utcnow().isoformat()
+
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=4)
+
+    # 🔐 login immediately (same as CT_FastAPI)
+    session_ok = login_motilal_client(payload)
+
+    if session_ok:
+        payload["session_active"] = True
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=4)
+
+    return {
+        "success": True,
+        "session_active": session_ok,
+        "message": "Client added"
+    }
+
+@app.get("/clients")
+def get_clients(user_id: str = Depends(get_current_user)):
+    user_dir = os.path.join("data", "users", user_id, "clients")
+    clients = []
+
+    if not os.path.exists(user_dir):
+        return {"clients": []}
+
+    for fname in os.listdir(user_dir):
+        if fname.endswith(".json"):
+            try:
+                with open(os.path.join(user_dir, fname)) as f:
+                    c = json.load(f)
+                    clients.append({
+                        "name": c.get("name"),
+                        "client_id": c.get("userid"),
+                        "capital": c.get("capital", 0),
+                        "session": "Logged in" if c.get("session_active") else "Logged out"
+                    })
+            except Exception:
+                continue
+
+    return {"clients": clients}
+
+@app.post("/clients/login_all")
+def login_all_clients(user_id: str = Depends(get_current_user)):
+    user_dir = os.path.join("data", "users", user_id, "clients")
+    if not os.path.exists(user_dir):
+        return {"message": "No clients"}
+
+    results = []
+
+    for fname in os.listdir(user_dir):
+        if not fname.endswith(".json"):
+            continue
+
+        path = os.path.join(user_dir, fname)
+        with open(path) as f:
+            client = json.load(f)
+
+        ok = login_motilal_client(client)
+        client["session_active"] = ok
+
+        with open(path, "w") as f:
+            json.dump(client, f, indent=4)
+
+        results.append({
+            "client_id": client.get("userid"),
+            "session_active": ok
+        })
+
+    return {"results": results}
