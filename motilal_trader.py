@@ -59,12 +59,21 @@ if not JWT_SECRET or not GITHUB_TOKEN or not GITHUB_REPO:
 # ========== FASTAPI ==========
 app = FastAPI(title="Motilal Trader WebApp")
 
+_frontend_origins = os.getenv(
+    "FRONTEND_ORIGINS",
+    "http://localhost:3000,http://127.0.0.1:3000,https://multibroker-trader-multiuser.vercel.app",
+)
+
+allow_origins = [o.strip() for o in _frontend_origins.split(",") if o.strip()]
+if len(allow_origins) == 1 and allow_origins[0] == "*":
+    allow_origins = ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allow_origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-)
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
