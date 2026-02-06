@@ -187,68 +187,76 @@ def login_motilal_client(client: dict):
 
     return False
 
-@app.post("/clients/add")
-def add_client(
+from fastapi import BackgroundTasks, Body, HTTPException, Depends
+
+@app.post("/add_client")
+async def add_client(
+    background_tasks: BackgroundTasks,
     payload: dict = Body(...),
-    user_id: str = Depends(get_current_user)
+    user_id: str = Depends(get_current_user),
 ):
     name = payload.get("name")
-    client_id = payload.get("userid")
+    userid = payload.get("userid")
 
-    if not name or not client_id:
-        raise HTTPException(400, "name and userid required")
+    if not name or not userid:
+        raise HTTPException(status_code=400, detail="Name and User ID required")
 
-    path = f"data/users/{user_id}/clients/{client_id}.json"
+    # ---- GitHub path (single broker, per user) ----
+    path = f"data/users/{user_id}/clients/{userid}.json"
 
-    payload["session_active"] = False
-    payload["created_at"] = datetime.utcnow().isoformat()
-
-    # ✅ write to GitHub, not disk
-    write_github_json(path, payload)
-
-    # 🔐 login immediately (same logic as CT_FastAPI)
-    session_ok = login_motilal_client(payload)
-
-    if session_ok:
-        payload["session_active"] = True
+    try:
+        # 1️⃣ Save client to GitHub (web-safe persistence)
         write_github_json(path, payload)
 
-    return {
-        "success": True,
-        "session_active": session_ok,
-        "message": "Client added"
-    }
-@app.get("/clients")
+        # 2️⃣ Start login in background (same idea as desktop app)
+        background_tasks.add_task(login_motilal_client, payload)
+
+        return {
+            "success": True,
+            "message": "Client saved. Login started in background.",
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+        
+@app.get("/get_clients")
 def get_clients(user_id: str = Depends(get_current_user)):
+    clients = []
+
     api = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/data/users/{user_id}/clients"
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github+json",
     }
 
-    r = requests.get(api, headers=headers)
+    try:
+        r = requests.get(api, headers=headers)
+        if r.status_code != 200:
+            return {"clients": []}
 
-    if r.status_code == 404:
+        for item in r.json():
+            if item.get("type") != "file":
+                continue
+
+            try:
+                client = requests.get(item["download_url"], timeout=10).json()
+
+                clients.append({
+                    "name": client.get("name", ""),
+                    "client_id": client.get("userid", ""),
+                    "capital": client.get("capital", ""),
+                    "session": "Logged in"
+                    if client.get("session_active")
+                    else "Logged out",
+                })
+
+            except Exception:
+                continue
+
+    except Exception:
         return {"clients": []}
 
-    if r.status_code != 200:
-        raise HTTPException(500, "Failed to fetch clients")
-
-    clients = []
-    for item in r.json():
-        if item["type"] != "file" or not item["name"].endswith(".json"):
-            continue
-
-        raw = requests.get(item["download_url"]).json()
-        clients.append({
-            "name": raw.get("name"),
-            "client_id": raw.get("userid"),
-            "capital": raw.get("capital", 0),
-            "session": "Logged in" if raw.get("session_active") else "Logged out"
-        })
-
     return {"clients": clients}
-
 @app.post("/clients/login_all")
 def login_all_clients(user_id: str = Depends(get_current_user)):
     api = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/data/users/{user_id}/clients"
