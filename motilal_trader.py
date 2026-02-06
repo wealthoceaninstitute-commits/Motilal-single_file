@@ -1,122 +1,129 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from datetime import datetime, timedelta
-import hashlib, json, os, jwt
+from jose import jwt, JWTError
+import hashlib, os, json, requests
 
-# ================= CONFIG =================
+# ======================================================
+# CONFIG
+# ======================================================
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret")
 JWT_ALGO = "HS256"
-TOKEN_EXP_MIN = 1440
+JWT_EXP_MINUTES = 60 * 24  # 1 day
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-USERS_DIR = os.path.join(BASE_DIR, "data", "users")
-os.makedirs(USERS_DIR, exist_ok=True)
+GITHUB_OWNER = os.getenv("GITHUB_REPO_OWNER", "wealthoceaninstitute-commits")
+GITHUB_REPO = os.getenv("GITHUB_REPO_NAME", "Multiuser_clients")
+GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
-# ================= APP ====================
+if not GITHUB_TOKEN:
+    raise RuntimeError("GITHUB_TOKEN not set")
+
+# ======================================================
+# APP
+# ======================================================
 app = FastAPI(title="Multibroker Auth")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://multibroker-trader-multiuser.vercel.app",
-        "http://localhost:3000"
+        "http://localhost:3000",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ================= MODELS =================
-class RegisterReq(BaseModel):
-    user_id: str
-    email: str
-    password: str
+# ======================================================
+# HELPERS
+# ======================================================
+def hash_password(pwd: str) -> str:
+    return hashlib.sha256(pwd.encode()).hexdigest()
 
-class LoginReq(BaseModel):
-    user_id: str
-    password: str
+def create_token(userid: str) -> str:
+    payload = {
+        "sub": userid,
+        "exp": datetime.utcnow() + timedelta(minutes=JWT_EXP_MINUTES),
+        "iat": datetime.utcnow(),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
 
-# ---- helpers (same behavior as old code) ----
-def _norm(s: Optional[str]) -> str:
-    return (s or "").strip()
+def read_github_json(path: str):
+    url = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/{GITHUB_BRANCH}/{path}"
+    r = requests.get(url, timeout=10)
+    return r.json() if r.status_code == 200 else None
 
-def _safe(s: str) -> str:
-    s = _norm(s).replace(" ", "_")
-    return "".join(ch for ch in s if ch.isalnum() or ch in ("_", "-"))
+def write_github_json(path: str, data: dict):
+    api = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{path}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
 
-def hash_password(p: str) -> str:
-    return hashlib.sha256(_norm(p).encode("utf-8")).hexdigest()
+    payload = {
+        "message": f"write {path}",
+        "content": json.dumps(data, indent=2).encode().decode("utf-8"),
+        "branch": GITHUB_BRANCH,
+    }
 
-# ---- GitHub raw read config ----
-GITHUB_OWNER = os.getenv("GITHUB_REPO_OWNER", "wealthoceaninstitute-commits")
-GITHUB_REPO  = os.getenv("GITHUB_REPO_NAME", "Multiuser_clients")
-BRANCH = os.getenv("GITHUB_BRANCH", "main")
+    r = requests.put(api, headers=headers, json=payload)
+    if r.status_code not in (200, 201):
+        raise HTTPException(400, "GitHub write failed")
 
-# ---- REGISTER (permissive, frontend-safe) ----
+# ======================================================
+# AUTH ROUTES
+# ======================================================
 @app.post("/auth/register")
-def register(payload: Dict[str, Any] = Body(...)):
-    userid = _norm(payload.get("userid") or payload.get("user_id") or payload.get("username"))
-    email = _norm(payload.get("email"))
-    password = _norm(payload.get("password"))
+def register(payload: dict = Body(...)):
+    userid = payload.get("user_id") or payload.get("userid") or payload.get("username")
+    email = payload.get("email")
+    password = payload.get("password")
 
     if not userid or not email or not password:
-        raise HTTPException(status_code=400, detail="All fields required")
+        raise HTTPException(400, "All fields required")
+
+    path = f"data/users/{userid}/profile.json"
+    if read_github_json(path):
+        raise HTTPException(400, "User already exists")
 
     profile = {
         "userid": userid,
         "email": email,
-        "password": hash_password(password),
+        "password_hash": hash_password(password),
         "created_at": datetime.utcnow().isoformat(),
     }
 
-    try:
-        github_write_json(f"data/users/{userid}/profile.json", profile)
-
-        safe_email = _safe(email)
-        if safe_email and safe_email != userid:
-            github_write_json(f"data/users/{safe_email}/profile.json", profile)
-
-    except Exception as e:
-        print("[auth] GitHub write failed:", str(e)[:200])
-
-    return {"success": True, "message": "User created"}
-
-# ---- LOGIN (userid OR email OR username) ----
-@app.post("/auth/login")
-def login(payload: Dict[str, Any] = Body(...)):
-    username = _norm(
-        payload.get("userid")
-        or payload.get("user_id")
-        or payload.get("username")
-        or payload.get("email")
-    )
-    password = _norm(payload.get("password"))
-
-    if not username or not password:
-        raise HTTPException(status_code=400, detail="Missing credentials")
-
-    candidates = [username]
-    safe_u = _safe(username)
-    if safe_u not in candidates:
-        candidates.append(safe_u)
-
-    user = None
-    for key in candidates:
-        path = f"data/users/{key}/profile.json"
-        url = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/{BRANCH}/{path}"
-        try:
-            r = requests.get(url, timeout=10)
-            if r.status_code == 200:
-                user = r.json()
-                break
-        except Exception:
-            continue
-
-    if not user or user.get("password") != hash_password(password):
-        raise HTTPException(status_code=401, detail="Invalid login")
+    write_github_json(path, profile)
 
     return {
         "success": True,
-        "userid": user.get("userid") or username
+        "message": "User created",
+    }
+
+@app.post("/auth/login")
+def login(payload: dict = Body(...)):
+    userid = (
+        payload.get("user_id")
+        or payload.get("userid")
+        or payload.get("username")
+        or payload.get("email")
+    )
+    password = payload.get("password")
+
+    if not userid or not password:
+        raise HTTPException(400, "Missing credentials")
+
+    profile = read_github_json(f"data/users/{userid}/profile.json")
+    if not profile:
+        raise HTTPException(401, "Invalid credentials")
+
+    if profile["password_hash"] != hash_password(password):
+        raise HTTPException(401, "Invalid credentials")
+
+    token = create_token(profile["userid"])
+
+    return {
+        "success": True,
+        "access_token": token,
+        "token_type": "bearer",
+        "userid": profile["userid"],
+        "email": profile["email"],
     }
