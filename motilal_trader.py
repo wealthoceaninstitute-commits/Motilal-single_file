@@ -303,6 +303,22 @@ def get_clients(
 
     return {"clients": clients}
 
+# Alias route so frontend calls to /clients stop returning 404
+@app.get("/clients")
+def clients_alias(
+    request: Request,
+    userid: str | None = Query(None),
+    user_id: str | None = Query(None),
+    token_userid: str = Depends(get_current_user),
+):
+    # Reuse the same logic by calling get_clients() directly
+    return get_clients(
+        request=request,
+        userid=userid,
+        user_id=user_id,
+        token_userid=token_userid,
+    )
+
 @app.post("/clients/login_all")
 def login_all_clients(user_id: str = Depends(get_current_user)):
     api = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/data/users/{user_id}/clients"
