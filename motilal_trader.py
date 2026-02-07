@@ -213,27 +213,55 @@ async def add_client(
         "message": "Client saved. Login started in background.",
     }
         
+from fastapi import Depends
+import requests
+import traceback
+
 @app.get("/get_clients")
 def get_clients(user_id: str = Depends(get_current_user)):
+    print("\n========== DEBUG /get_clients ==========")
+    print("user_id from Depends(get_current_user):", repr(user_id))
+    print("type(user_id):", type(user_id))
+    print("=======================================")
+
     clients = []
 
     api = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/data/users/{user_id}/clients"
+
+    print("GitHub API URL:", api)
+
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github+json",
     }
 
     try:
-        r = requests.get(api, headers=headers)
+        r = requests.get(api, headers=headers, timeout=10)
+
+        print("GitHub response status:", r.status_code)
+
         if r.status_code != 200:
+            print("GitHub response body:", r.text)
             return {"clients": []}
 
-        for item in r.json():
+        items = r.json()
+        print("GitHub items count:", len(items))
+
+        for item in items:
+            print("Item:", item.get("name"), "type:", item.get("type"))
+
             if item.get("type") != "file":
                 continue
 
             try:
-                client = requests.get(item["download_url"], timeout=10).json()
+                client = requests.get(
+                    item["download_url"],
+                    timeout=10
+                ).json()
+
+                print("Loaded client file:", item.get("name"))
+                print("Client JSON userid:", repr(client.get("userid")))
+                print("Client session_active:", client.get("session_active"))
 
                 clients.append({
                     "name": client.get("name", ""),
@@ -244,11 +272,20 @@ def get_clients(user_id: str = Depends(get_current_user)):
                     else "Logged out",
                 })
 
-            except Exception:
+            except Exception as e:
+                print("ERROR loading client file:", item.get("name"))
+                print("Exception:", e)
+                traceback.print_exc()
                 continue
 
-    except Exception:
+    except Exception as e:
+        print("ERROR accessing GitHub clients folder")
+        print("Exception:", e)
+        traceback.print_exc()
         return {"clients": []}
+
+    print("Final clients count:", len(clients))
+    print("========== END DEBUG /get_clients ==========\n")
 
     return {"clients": clients}
 @app.post("/clients/login_all")
