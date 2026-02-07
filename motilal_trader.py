@@ -95,7 +95,7 @@ else:
     allow_origins = ["http://localhost:3000", "http://127.0.0.1:3000", "https://multibroker-trader-multiuser.vercel.app"]
     allow_credentials = True
 
-SECRET_KEY = os.getenv("SECRET_KEY", "")
+SECRET_KEY = os.getenv("SECRET_KEY") or "CHANGE_ME_PLEASE_SET_SECRET_KEY"
 TOKEN_EXPIRE_HOURS = int(os.getenv("TOKEN_EXPIRE_HOURS", "24"))
 
 GITHUB_OWNER = os.getenv("GITHUB_OWNER", "")
@@ -137,8 +137,11 @@ def normalize_userid(v: Any) -> str:
     return str(v).strip()
 
 def require_secret():
-    if not SECRET_KEY:
-        raise RuntimeError("Missing SECRET_KEY env var")
+    # For production: ALWAYS set SECRET_KEY as an environment variable.
+    # This fallback prevents runtime crashes during initial testing.
+    if SECRET_KEY == "CHANGE_ME_PLEASE_SET_SECRET_KEY":
+        # Only a warning; app still runs so you can test end-to-end.
+        print("WARNING: SECRET_KEY is not set. Using an insecure default. Set SECRET_KEY in env for production.")
 
 def password_hash(password: str, salt: str) -> str:
     # Same as your motilal_trader.py
