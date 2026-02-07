@@ -323,6 +323,182 @@ def auth_login(payload: dict):
 def me(userid: str = Depends(get_current_user)):
     return {"success": True, "userid": userid}
 
+# -----------------------------
+# Per-user storage paths
+# -----------------------------
+def user_root(userid: str) -> str:
+    return f"data/users/{userid}"
+
+def user_profile_path(userid: str) -> str:
+    return f"{user_root(userid)}/profile.json"
+
+def _safe_filename(s: str) -> str:
+    s = (s or "").strip().replace(" ", "_")
+    return re.sub(r"[^A-Za-z0-9_\-]", "_", s)[:80] or "client"
+
+def user_clients_dir(userid: str) -> str:
+    return f"{user_root(userid)}/clients"
+
+def user_client_file(userid: str, name: str, client_id: str) -> str:
+    safe = _safe_filename(name)
+    cid = (client_id or "").strip()
+    return f"{user_clients_dir(userid)}/{safe}_{cid}.json"
+
+
+# -----------------------------
+# Auth dependency
+# -----------------------------
+def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> str:
+    require_secret()
+    if credentials is None or not credentials.credentials:
+        raise HTTPException(status_code=401, detail="Missing token")
+    try:
+        payload = jwt_decode(credentials.credentials, SECRET_KEY)
+        userid = (payload.get("userid") or "").strip()
+        if not userid:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return userid
+    except JWTError as e:
+        msg = str(e) or "Invalid token"
+        if "expired" in msg.lower():
+            raise HTTPException(status_code=401, detail="Token expired")
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+# -----------------------------
+# Routes
+# -----------------------------
+@app.get("/")
+def root():
+    return {"ok": True, "name": APP_NAME, "version": API_VERSION}
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+# ---------- AUTH ----------
+@app.post("/auth/register")
+def auth_register(payload: dict = Body(...)):
+    """
+    Payload:
+      { "userid": "...", "email": "...", "password": "...", "confirm_password": "..." }
+    Stores:
+      data/users/{userid}/profile.json
+    """
+    userid = normalize_userid(payload.get("userid"))
+    email = (payload.get("email") or "").strip()
+    password = (payload.get("password") or "").strip()
+    confirm = (payload.get("confirm_password") or payload.get("confirmPassword") or "").strip()
+
+    if not userid or not email or not password:
+        return {"success": False, "error": "Missing userid/email/password"}
+    if confirm and password != confirm:
+        return {"success": False, "error": "Passwords do not match"}
+
+    existing, _ = gh_get_json(user_profile_path(userid))
+    if existing:
+        return {"success": False, "error": "User already exists"}
+
+    salt = base64.b64encode(os.urandom(12)).decode("utf-8")
+    profile = {
+        "userid": userid,
+        "email": email,
+        "salt": salt,
+        "password_hash": password_hash(password, salt),
+        "created_at": utcnow_iso(),
+        "updated_at": utcnow_iso(),
+    }
+    gh_put_json(user_profile_path(userid), profile, message=f"register {userid}")
+    return {"success": True, "userid": userid}
+
+@app.post("/auth/login")
+def auth_login(payload: dict = Body(...)):
+    """
+    Payload:
+      { "userid": "...", "password": "..." }
+    Returns:
+      { "success": True, "userid": "...", "access_token": "<JWT>" }
+    """
+    userid = normalize_userid(payload.get("userid"))
+    password = (payload.get("password") or "").strip()
+
+    if not userid or not password:
+        return {"success": False}
+
+    profile, _ = gh_get_json(user_profile_path(userid))
+    if not profile or not isinstance(profile, dict):
+        return {"success": False}
+
+    salt = profile.get("salt", "")
+    ph = profile.get("password_hash", "")
+    if not salt or not ph:
+        return {"success": False}
+
+    if password_hash(password, salt) != ph:
+        return {"success": False}
+
+    token = create_token(userid)
+    return {"success": True, "userid": userid, "access_token": token}
+
+@app.get("/me")
+def me(userid: str = Depends(get_current_user)):
+    return {"success": True, "userid": userid}
+
+# ---------- CLIENTS ----------
+def _require_fields(d: Dict[str, Any], keys: List[str]):
+    missing = [k for k in keys if not (d.get(k) or "").strip()]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing required fields: {', '.join(missing)}")
+
+@app.post("/add_client")
+def add_client(payload: dict = Body(...), userid: str = Depends(get_current_user)):
+    """
+    Saves client under logged-in user:
+      data/users/<userid>/clients/<safe_name>_<client_id>.json
+
+    Fields reference from CT_FastAPI.py:
+      name, userid (client id), password, pan, apikey, totpkey, capital
+    """
+    data = payload or {}
+    name = (data.get("name") or "").strip()
+    client_id = (data.get("userid") or data.get("client_id") or "").strip()
+
+    _require_fields({"name": name, "userid": client_id}, ["name", "userid"])
+
+    # bind to owner
+    data["owner_userid"] = userid
+    data.setdefault("broker", "motilal")
+
+    path = user_client_file(userid, name=name, client_id=client_id)
+    gh_put_json(path, data, message=f"add_client {userid} {name} {client_id}")
+    return {"success": True, "message": "Client saved", "path": path}
+
+@app.get("/get_clients")
+@app.get("/clients")
+def get_clients(userid: str = Depends(get_current_user)):
+    """
+    Lists clients from:
+      data/users/<userid>/clients/
+
+    Returns:
+      { success: True, userid: "...", clients: [...] }
+    """
+    dir_path = user_clients_dir(userid)
+    entries = gh_list_dir(dir_path)
+
+    clients: List[Dict[str, Any]] = []
+    for e in entries:
+        if e.get("type") != "file":
+            continue
+        p = e.get("path") or ""
+        if not p.endswith(".json"):
+            continue
+        obj, _ = gh_get_json(p)
+        if not isinstance(obj, dict):
+            continue
+        clients.append(obj)
+
+    return {"success": True, "userid": userid, "clients": clients}
 
 # -----------------------------
 # Error formatting
