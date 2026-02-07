@@ -213,23 +213,57 @@ async def add_client(
         "message": "Client saved. Login started in background.",
     }
         
-from fastapi import Depends
+from fastapi import Depends, Request, Query, HTTPException
 import requests
 import traceback
 
+def normalize_userid(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    v = raw.strip()
+
+    # remove wrapping quotes if present: "pra" or 'pra'
+    if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+        v = v[1:-1].strip()
+
+    return v or None
+
+
 @app.get("/get_clients")
-def get_clients(user_id: str = Depends(get_current_user)):
+def get_clients(
+    request: Request,
+    userid: str | None = Query(None),
+    user_id: str | None = Query(None),
+    token_userid: str = Depends(get_current_user),  # keep your current auth shape
+):
+    # --- normalize all incoming forms ---
+    raw_qp = dict(request.query_params)
+    req_userid = normalize_userid(userid) or normalize_userid(user_id)
+
     print("\n========== DEBUG /get_clients ==========")
-    print("user_id from Depends(get_current_user):", repr(user_id))
-    print("type(user_id):", type(user_id))
-    print("=======================================")
+    print("Raw query params:", raw_qp)
+    print("userid raw:", repr(userid), "-> normalized:", repr(normalize_userid(userid)))
+    print("user_id raw:", repr(user_id), "-> normalized:", repr(normalize_userid(user_id)))
+    print("token_userid from auth:", repr(token_userid))
+    print("chosen req_userid:", repr(req_userid))
+    print("========================================\n")
+
+    # --- decide effective userid (secure) ---
+    # If frontend sends no userid, use token userid
+    if req_userid is None:
+        effective_userid = normalize_userid(token_userid)
+    else:
+        # If frontend sends userid, it must match token userid
+        if normalize_userid(token_userid) != req_userid:
+            raise HTTPException(
+                status_code=403,
+                detail=f"userid mismatch: token={token_userid}, requested={req_userid}"
+            )
+        effective_userid = req_userid
 
     clients = []
 
-    api = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/data/users/{user_id}/clients"
-
-    print("GitHub API URL:", api)
-
+    api = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/data/users/{effective_userid}/clients"
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github+json",
@@ -237,57 +271,38 @@ def get_clients(user_id: str = Depends(get_current_user)):
 
     try:
         r = requests.get(api, headers=headers, timeout=10)
-
-        print("GitHub response status:", r.status_code)
+        print("GitHub folder status:", r.status_code, "URL:", api)
 
         if r.status_code != 200:
-            print("GitHub response body:", r.text)
+            print("GitHub folder body:", r.text)
             return {"clients": []}
 
-        items = r.json()
-        print("GitHub items count:", len(items))
-
-        for item in items:
-            print("Item:", item.get("name"), "type:", item.get("type"))
-
+        for item in r.json():
             if item.get("type") != "file":
                 continue
 
             try:
-                client = requests.get(
-                    item["download_url"],
-                    timeout=10
-                ).json()
-
-                print("Loaded client file:", item.get("name"))
-                print("Client JSON userid:", repr(client.get("userid")))
-                print("Client session_active:", client.get("session_active"))
+                client = requests.get(item["download_url"], timeout=10).json()
 
                 clients.append({
                     "name": client.get("name", ""),
                     "client_id": client.get("userid", ""),
                     "capital": client.get("capital", ""),
-                    "session": "Logged in"
-                    if client.get("session_active")
-                    else "Logged out",
+                    "session": "Logged in" if client.get("session_active") else "Logged out",
                 })
 
             except Exception as e:
-                print("ERROR loading client file:", item.get("name"))
-                print("Exception:", e)
+                print("ERROR reading client file:", item.get("name"), "err:", e)
                 traceback.print_exc()
                 continue
 
     except Exception as e:
-        print("ERROR accessing GitHub clients folder")
-        print("Exception:", e)
+        print("ERROR accessing GitHub:", e)
         traceback.print_exc()
         return {"clients": []}
 
-    print("Final clients count:", len(clients))
-    print("========== END DEBUG /get_clients ==========\n")
-
     return {"clients": clients}
+
 @app.post("/clients/login_all")
 def login_all_clients(user_id: str = Depends(get_current_user)):
     api = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/data/users/{user_id}/clients"
