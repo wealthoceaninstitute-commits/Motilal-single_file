@@ -499,7 +499,6 @@ def get_clients(userid: str = Depends(get_current_user)):
         clients.append(obj)
 
     return {"success": True, "userid": userid, "clients": clients}
-
 # -----------------------------
 # Error formatting
 # -----------------------------
