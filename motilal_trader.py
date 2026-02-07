@@ -24,10 +24,59 @@ import hashlib
 import json
 import os
 import time
+
+# ---------------- JWT (HS256) helpers (no external dependency) ----------------
+import base64
+import hmac
+import hashlib
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
+
+def _b64url_decode(data: str) -> bytes:
+    pad = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + pad)
+
+def jwt_encode(payload: dict, secret: str) -> str:
+    header = {"alg": "HS256", "typ": "JWT"}
+    header_b64 = _b64url_encode(json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    payload_b64 = _b64url_encode(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
+    sig = hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    sig_b64 = _b64url_encode(sig)
+    return f"{header_b64}.{payload_b64}.{sig_b64}"
+
+class JWTError(Exception):
+    pass
+
+def jwt_decode(token: str, secret: str) -> dict:
+    try:
+        header_b64, payload_b64, sig_b64 = token.split(".")
+    except ValueError:
+        raise JWTError("Invalid token format")
+
+    signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
+    expected_sig = hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    if not hmac.compare_digest(_b64url_encode(expected_sig), sig_b64):
+        raise JWTError("Invalid token signature")
+
+    payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
+
+    # exp may be int timestamp (seconds)
+    exp = payload.get("exp")
+    if exp is not None:
+        try:
+            exp_int = int(exp)
+        except Exception:
+            raise JWTError("Invalid exp")
+        if int(time.time()) >= exp_int:
+            raise JWTError("Token expired")
+
+    return payload
+
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-import jwt
 import requests
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -70,13 +119,31 @@ SYMBOLS_GH_PATH = os.getenv("SYMBOLS_GH_PATH", "")
 # -----------------------------
 app = FastAPI(title=APP_NAME, version=API_VERSION)
 
+# ---------------- CORS (env-driven) ----------------
+# Set CORS_ORIGINS as comma-separated origins, e.g.
+# CORS_ORIGINS=https://multibroker-trader-multiuser.vercel.app,http://localhost:3000
+# If you set CORS_ORIGINS=*, we will allow all origins but disable credentials (required by browsers).
+cors_origins_raw = (os.getenv("CORS_ORIGINS") or "").strip()
+
+if cors_origins_raw == "*":
+    allow_origins = ["*"]
+    allow_credentials = False
+elif cors_origins_raw:
+    allow_origins = [o.strip().rstrip("/") for o in cors_origins_raw.split(",") if o.strip()]
+    allow_credentials = True
+else:
+    # Safe default for dev; in prod please set CORS_ORIGINS explicitly.
+    allow_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+    allow_credentials = True
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
+    allow_origins=allow_origins,
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 security = HTTPBearer(auto_error=False)
 
@@ -127,23 +194,34 @@ def require_secret():
 
 def create_token(userid: str) -> str:
     require_secret()
-    payload = {"userid": userid, "exp": datetime.utcnow() + timedelta(hours=TOKEN_EXPIRE_HOURS)}
-    return jwt.encode(payload, SECRET_KEY, algorithm=JWT_ALGORITHM)
+    payload = {
+        "userid": userid,
+        # exp as unix timestamp (seconds)
+        "exp": int(time.time()) + int(TOKEN_EXPIRE_HOURS) * 3600,
+    }
+    return jwt_encode(payload, SECRET_KEY)
 
 
-def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> str:
+
+def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> str:
+    require_secret()
+
     if credentials is None or not credentials.credentials:
-        raise HTTPException(status_code=401, detail="Missing Authorization token")
+        raise HTTPException(status_code=401, detail="Missing token")
+
     token = credentials.credentials
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALGORITHM])
-        userid = normalize_userid(payload.get("userid"))
+        payload = jwt_decode(token, SECRET_KEY)
+        userid = (payload.get("userid") or "").strip()
         if not userid:
             raise HTTPException(status_code=401, detail="Invalid token")
         return userid
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except Exception:
+    except JWTError as e:
+        msg = str(e) or "Invalid token"
+        if "expired" in msg.lower():
+            raise HTTPException(status_code=401, detail="Token expired")
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
@@ -745,6 +823,162 @@ def copy_trade(payload: dict, userid: str = Depends(get_current_user)):
     return place_order(order, userid)
 
 
+
+# -----------------------------
+# CT_FastAPI parity endpoints (close/cancel/convert)
+# -----------------------------
+
+@app.post("/cancel_order")
+def cancel_order(payload: dict = Body(...), userid: str = Depends(get_current_user)):
+    """Cancel a single order for a specific client.
+
+    Payload:
+      {"client_id": "...", "order_id": "..."}
+    """
+    client_id = str(payload.get("client_id") or payload.get("name") or "").strip()
+    order_id = str(payload.get("order_id") or payload.get("orderid") or "").strip()
+
+    if not client_id or not order_id:
+        raise HTTPException(status_code=400, detail="client_id and order_id are required")
+
+    sess = ensure_logged_in(userid, client_id)
+    api = sess["api"]
+
+    try:
+        # Most MOFSLOPENAPI builds: CancelOrder(order_id)
+        resp = api.CancelOrder(order_id)
+    except TypeError:
+        # Some builds: CancelOrder(order_id, client_id)
+        resp = api.CancelOrder(order_id, client_id)
+
+    return {"success": True, "data": resp}
+
+
+@app.post("/close_position")
+def close_position(payload: dict = Body(...), userid: str = Depends(get_current_user)):
+    """Close positions by placing opposite market orders.
+
+    Payload:
+      {
+        "positions": [
+          {
+            "client_id": "...",
+            "exchange": "NSE"|"BSE"|"NFO"|"MCX",
+            "symboltoken": "...",
+            "buyorsell": "BUY"|"SELL",   # direction you want to PLACE (opposite of open position)
+            "producttype": "CNC"|"MIS"|"NRML"|"NORMAL"|"INTRADAY",
+            "quantityinlot": 1,
+            "price": 0,
+            "disclosedqty": 0
+          }
+        ]
+      }
+
+    Note: Frontend can build this using /get_positions response.
+    """
+    positions = payload.get("positions") or payload.get("items") or []
+    if not isinstance(positions, list) or len(positions) == 0:
+        raise HTTPException(status_code=400, detail="positions[] is required")
+
+    results = []
+
+    for pos in positions:
+        client_id = str(pos.get("client_id") or pos.get("name") or "").strip()
+        if not client_id:
+            results.append({"success": False, "error": "client_id missing", "input": pos})
+            continue
+
+        sess = ensure_logged_in(userid, client_id)
+        api = sess["api"]
+
+        order = {
+            "exchange": (pos.get("exchange") or "NSE"),
+            "scripcode": pos.get("symboltoken") or pos.get("scripcode"),
+            "quantity": int(pos.get("quantityinlot") or pos.get("quantity") or 0),
+            "price": float(pos.get("price") or 0),
+            "buyorsell": str(pos.get("buyorsell") or "").upper(),
+            "producttype": str(pos.get("producttype") or "MIS").upper(),
+            "ordertype": str(pos.get("ordertype") or "MARKET").upper(),
+            "disclosedqty": int(pos.get("disclosedqty") or 0),
+            "triggerprice": float(pos.get("triggerprice") or 0),
+            "retention": str(pos.get("retention") or "DAY").upper(),
+            "remarks": str(pos.get("remarks") or "close_position"),
+        }
+
+        if not order["scripcode"] or not order["quantity"] or order["quantity"] <= 0:
+            results.append({"success": False, "error": "symboltoken/scripcode and quantity required", "input": pos})
+            continue
+        if order["buyorsell"] not in ("BUY", "SELL"):
+            results.append({"success": False, "error": "buyorsell must be BUY or SELL", "input": pos})
+            continue
+
+        try:
+            resp = api.PlaceOrder(order)
+            results.append({"success": True, "client_id": client_id, "data": resp, "order": order})
+        except Exception as e:
+            results.append({"success": False, "client_id": client_id, "error": str(e), "order": order})
+
+    return {"success": True, "results": results}
+
+
+@app.post("/convert_position")
+def convert_position(payload: dict = Body(...), userid: str = Depends(get_current_user)):
+    """Convert position product type (e.g., MIS -> CNC).
+
+    Payload:
+      {
+        "items": [
+          {
+            "client_id": "...",
+            "exchange": "NSE"|"BSE"|"NFO"|"MCX",
+            "symboltoken": "...",
+            "quantityinlot": 1,
+            "buyorsell": "BUY"|"SELL",
+            "oldproducttype": "MIS",
+            "newproducttype": "CNC"
+          }
+        ]
+      }
+    """
+    items = payload.get("items") or payload.get("positions") or []
+    if not isinstance(items, list) or len(items) == 0:
+        raise HTTPException(status_code=400, detail="items[] is required")
+
+    results = []
+
+    for it in items:
+        client_id = str(it.get("client_id") or it.get("name") or "").strip()
+        if not client_id:
+            results.append({"success": False, "error": "client_id missing", "input": it})
+            continue
+
+        sess = ensure_logged_in(userid, client_id)
+        api = sess["api"]
+
+        conv = {
+            "exchange": (it.get("exchange") or "NSE"),
+            "scripcode": it.get("symboltoken") or it.get("scripcode"),
+            "quantity": int(it.get("quantityinlot") or it.get("quantity") or 0),
+            "buyorsell": str(it.get("buyorsell") or "").upper(),
+            "oldproducttype": str(it.get("oldproducttype") or it.get("old_producttype") or "MIS").upper(),
+            "newproducttype": str(it.get("newproducttype") or it.get("new_producttype") or "CNC").upper(),
+        }
+
+        if not conv["scripcode"] or not conv["quantity"] or conv["quantity"] <= 0:
+            results.append({"success": False, "error": "symboltoken/scripcode and quantity required", "input": it})
+            continue
+        if conv["buyorsell"] not in ("BUY", "SELL"):
+            results.append({"success": False, "error": "buyorsell must be BUY or SELL", "input": it})
+            continue
+
+        try:
+            # Most MOFSLOPENAPI builds: PositionConversion(payload)
+            resp = api.PositionConversion(conv)
+            results.append({"success": True, "client_id": client_id, "data": resp, "conversion": conv})
+        except Exception as e:
+            results.append({"success": False, "client_id": client_id, "error": str(e), "conversion": conv})
+
+    return {"success": True, "results": results}
 # -----------------------------
 # Error formatting
 # -----------------------------
