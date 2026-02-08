@@ -27,7 +27,7 @@ from typing import Any, Dict, Optional, Tuple
 import re
 
 import requests
-from fastapi import Depends, FastAPI, HTTPException, Request,Body
+from fastapi import Depends, FastAPI, HTTPException, Request,Body,Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
