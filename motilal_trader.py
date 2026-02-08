@@ -246,19 +246,17 @@ def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depen
         raise HTTPException(status_code=401, detail="Invalid token")
 
 def get_current_user_optional(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Optional[str]:
-    """Return userid from JWT if Authorization header is present; otherwise return None."""
     if not credentials:
         return None
     token = (credentials.credentials or "").strip()
     if not token:
         return None
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-        sub = payload.get("sub") or ""
-        return normalize_userid(sub) or None
+        payload = jwt_decode(token, SECRET_KEY)
+        userid = payload.get("userid") or ""
+        return normalize_userid(userid) or None
     except Exception:
-        # Invalid token should still be treated as unauthorized
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+        return None
 
 # -----------------------------
 # Routes
