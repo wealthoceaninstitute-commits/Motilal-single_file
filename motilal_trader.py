@@ -24,6 +24,7 @@ import os
 import time
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
+import re
 
 import requests
 from fastapi import Depends, FastAPI, HTTPException, Request,Body
@@ -363,6 +364,20 @@ def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depen
         if "expired" in msg.lower():
             raise HTTPException(status_code=401, detail="Token expired")
         raise HTTPException(status_code=401, detail="Invalid token")
+
+def gh_list_dir(path: str):
+    """
+    Lists a directory via GitHub Contents API.
+    Returns list entries (type/file/dir, name, path, sha, etc.)
+    """
+    if not gh_enabled():
+        raise HTTPException(500, "GitHub storage not configured (set GITHUB_OWNER/GITHUB_REPO/GITHUB_TOKEN)")
+    r = requests.get(gh_url(path), headers=gh_headers(), params={"ref": GITHUB_BRANCH})
+    if r.status_code == 404:
+        return []
+    r.raise_for_status()
+    data = r.json()
+    return data if isinstance(data, list) else []
 
 
 # -----------------------------
