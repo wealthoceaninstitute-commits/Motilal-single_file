@@ -480,6 +480,19 @@ def _require_fields(d: Dict[str, Any], keys: List[str]):
 
 # ✅ ADD THIS HELPER (place anywhere above @app.post("/add_client"))
 
+# =========================
+# DROP-IN: Client save (simple format) + Client login + Auto-login-on-/clients
+# (Keep your existing GitHub helpers + user_client_file() as-is)
+#
+# REQUIRED EXISTING THINGS IN YOUR FILE:
+# - gh_put_json(path, obj, message=...)
+# - MOFSLOPENAPI, Base_Url, SourceID, browsername, browserversion
+# - pyotp imported
+# - your /get_clients (or /clients) already builds `clients` list from GitHub
+# =========================
+:contentReference[oaicite:0]{index=0}
+
+# ---------- 1) SAVE FORMAT (your current change) ----------
 def build_simple_client_record(owner_userid: str, data: dict) -> dict:
     """
     Normalizes incoming payload (either flat fields OR creds{} fields)
@@ -487,11 +500,9 @@ def build_simple_client_record(owner_userid: str, data: dict) -> dict:
     """
     data = data or {}
 
-    # accept both "userid" and "client_id"
     name = (data.get("name") or "").strip()
     client_id = (data.get("userid") or data.get("client_id") or "").strip()
 
-    # allow creds to come from either top-level or inside creds{}
     in_creds = data.get("creds") if isinstance(data.get("creds"), dict) else {}
 
     def pick(*keys):
@@ -515,10 +526,9 @@ def build_simple_client_record(owner_userid: str, data: dict) -> dict:
         "apikey": pick("apikey", "api_key"),
         "totpkey": pick("totpkey", "totp", "totp_key"),
     }
-    # remove empty keys
     creds = {k: v for k, v in creds.items() if v not in (None, "")}
 
-    record = {
+    return {
         "broker": (data.get("broker") or "motilal"),
         "name": name,
         "userid": client_id,
@@ -527,10 +537,7 @@ def build_simple_client_record(owner_userid: str, data: dict) -> dict:
         "owner_userid": owner_userid,
         "session_active": bool(data.get("session_active", True)),
     }
-    return record
 
-
-# ✅ REPLACE ONLY YOUR /add_client FUNCTION WITH THIS VERSION
 
 @app.post("/add_client")
 def add_client(payload: dict = Body(...), userid: str = Depends(get_current_user)):
@@ -544,12 +551,151 @@ def add_client(payload: dict = Body(...), userid: str = Depends(get_current_user
 
     _require_fields({"name": name, "userid": client_id}, ["name", "userid"])
 
-    # ✅ save in SIMPLE non-repeating format
     clean = build_simple_client_record(userid, data)
-
     path = user_client_file(userid, name=name, client_id=client_id)
+
     gh_put_json(path, clean, message=f"add_client {userid} {name} {client_id}")
     return {"success": True, "message": "Client saved", "path": path}
+
+
+# ---------- 2) CLIENT LOGIN + KEEP SESSION LIVE ----------
+# Store sessions in-memory (per backend instance)
+mofsl_sessions = globals().get("mofsl_sessions", {})  # key -> {"ok":bool, "api":obj, "client_id":str, "ts":float}
+globals()["mofsl_sessions"] = mofsl_sessions  # ensure same dict is reused
+
+
+def _session_key(owner_userid: str, client_userid: str) -> str:
+    return f"{(owner_userid or '').strip().lower()}:{(client_userid or '').strip()}"
+
+
+def _now_iso():
+    try:
+        return utcnow_iso()  # if you already have it
+    except Exception:
+        from datetime import datetime
+        return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def login_motilal_client(owner_userid: str, client: dict) -> bool:
+    """
+    Logs in ONE Motilal client and stores session in mofsl_sessions.
+    Also writes session_active + last_login_ts (+ last_error if any) back to GitHub
+    IF you included `_path` in the client dict while reading.
+    """
+    name = (client.get("name") or "").strip()
+    client_id = (client.get("userid") or "").strip()
+
+    creds = client.get("creds") if isinstance(client.get("creds"), dict) else {}
+    password = (creds.get("password") or "").strip()
+    pan = str(creds.get("pan") or "").strip()
+    apikey = (creds.get("apikey") or "").strip()
+    totp_key = (creds.get("totpkey") or "").strip()
+
+    if not (client_id and password and pan and apikey):
+        print(f"❌ Missing creds: owner={owner_userid} client={client_id} name={name}")
+        client["session_active"] = False
+        client["last_login_ts"] = _now_iso()
+        client["last_error"] = "Missing creds (userid/password/pan/apikey)"
+        _persist_client_status_if_possible(client, owner_userid)
+        return False
+
+    try:
+        print(f'🔐 Login start: owner={owner_userid} client={client_id} name="{name}"')
+
+        totp = pyotp.TOTP(totp_key).now() if totp_key else ""
+        api = MOFSLOPENAPI(apikey, Base_Url, None, SourceID, browsername, browserversion)
+        resp = api.login(client_id, password, pan, totp, client_id)
+
+        ok = isinstance(resp, dict) and resp.get("status") == "SUCCESS"
+        key = _session_key(owner_userid, client_id)
+
+        if ok:
+            mofsl_sessions[key] = {"ok": True, "api": api, "client_id": client_id, "ts": time.time()}
+            print(f"✅ Logged in: owner={owner_userid} client={client_id} name={name}")
+            client["session_active"] = True
+            client["last_login_ts"] = _now_iso()
+            client.pop("last_error", None)
+            _persist_client_status_if_possible(client, owner_userid)
+            return True
+
+        print(f"❌ Login failed: owner={owner_userid} client={client_id} name={name} resp={resp}")
+        client["session_active"] = False
+        client["last_login_ts"] = _now_iso()
+        client["last_error"] = f"Login failed: {resp}"
+        _persist_client_status_if_possible(client, owner_userid)
+        return False
+
+    except Exception as e:
+        print(f"❌ Exception login: owner={owner_userid} client={client_id} name={name} err={e}")
+        client["session_active"] = False
+        client["last_login_ts"] = _now_iso()
+        client["last_error"] = str(e)
+        _persist_client_status_if_possible(client, owner_userid)
+        return False
+
+
+def ensure_clients_logged_in(owner_userid: str, clients: list) -> None:
+    """
+    Call this on every /clients (or /get_clients) load.
+    If a session does not exist in memory, it will login and create it.
+    """
+    for c in (clients or []):
+        if not c.get("session_active", True):
+            # If you want: still try login even when marked inactive, remove this continue
+            continue
+
+        client_id = (c.get("userid") or "").strip()
+        if not client_id:
+            continue
+
+        key = _session_key(owner_userid, client_id)
+        sess = mofsl_sessions.get(key)
+
+        if sess and sess.get("ok"):
+            # Optional: log heartbeat
+            # print(f"✅ Session already OK: owner={owner_userid} client={client_id}")
+            continue
+
+        login_motilal_client(owner_userid, c)
+
+
+def _persist_client_status_if_possible(client: dict, owner_userid: str) -> None:
+    """
+    Writes updated status back to GitHub ONLY if client dict has `_path`.
+    This avoids adding any "find file by userid" function.
+    """
+    try:
+        path = client.get("_path")
+        if not path:
+            return
+
+        # remove runtime-only keys before saving
+        rec = dict(client)
+        rec.pop("_path", None)
+
+        gh_put_json(path, rec, message=f"client_status {owner_userid} {rec.get('name','')} {rec.get('userid','')}")
+    except Exception as e:
+        print(f"⚠️ Could not persist client status: owner={owner_userid} err={e}")
+
+
+# ---------- 3) ONE-LINE INTEGRATION INSIDE /get_clients ----------
+# In your existing /get_clients or /clients endpoint, while building clients list from GitHub,
+# ADD `_path` on each record, then call ensure_clients_logged_in() before returning.
+
+# Example patch (apply the same idea in your real loop):
+#
+# clients = []
+# for entry in entries:
+#     if entry.get("type") != "file": continue
+#     path = entry.get("path")
+#     rec, _ = gh_get_json(path)
+#     if not isinstance(rec, dict): continue
+#     rec["_path"] = path                 # ✅ IMPORTANT
+#     clients.append(rec)
+#
+# ensure_clients_logged_in(owner_userid=effective, clients=clients)  # ✅ IMPORTANT
+#
+# return {"success": True, "userid": effective, "clients": clients}
 
 @app.get("/get_clients")
 @app.get("/clients")
@@ -598,87 +744,3 @@ def get_clients(
 async def http_exception_handler(_: Request, exc: HTTPException):
     return JSONResponse(status_code=exc.status_code, content={"success": False, "error": exc.detail})
 
-# =========================
-# CLIENT LOGIN (Motilal) — ONLY REQUIRED FUNCTIONS
-# Reference: CT_FastAPI.py login_client(), adapted to your NEW saved format:
-# client = { name, userid, capital, creds:{password, pan, apikey, totpkey}, owner_userid, session_active }
-#
-# ✅ Where to call:
-# Inside your /clients (or /get_clients) endpoint AFTER you load `clients` list:
-#     ensure_clients_logged_in(owner_userid=effective, clients=clients)
-# =========================
-
-# Global session store (keep it simple)
-# key = "<owner_userid>:<client_userid>"
-mofsl_sessions = globals().get("mofsl_sessions", {})  # { key: (MofslObj, client_userid) }
-client_capital_map = globals().get("client_capital_map", {})  # optional
-
-
-def _session_key(owner_userid: str, client: dict) -> str:
-    owner_userid = (owner_userid or "").strip().lower()
-    client_userid = (client.get("userid") or "").strip()
-    return f"{owner_userid}:{client_userid}"
-
-
-def login_motilal_client(owner_userid: str, client: dict) -> bool:
-    """
-    Logs in ONE Motilal client and stores session in mofsl_sessions.
-    Returns True/False.
-    Uses SAME flow as CT_FastAPI.py login_client().
-    """
-    try:
-        name = (client.get("name") or "").strip()
-        userid = (client.get("userid") or "").strip()
-        capital = client.get("capital", 0) or 0
-
-        creds = client.get("creds") if isinstance(client.get("creds"), dict) else {}
-        password = (creds.get("password") or "").strip()
-        pan = str(creds.get("pan") or "").strip()
-        apikey = (creds.get("apikey") or "").strip()
-        totp_key = (creds.get("totpkey") or "").strip()
-
-        if not userid or not password or not pan or not apikey:
-            print(f"❌ Missing creds for client: {name} ({userid})")
-            return False
-
-        client_capital_map[name or userid] = capital
-
-        totp = pyotp.TOTP(totp_key).now() if totp_key else ""
-        Mofsl = MOFSLOPENAPI(apikey, Base_Url, None, SourceID, browsername, browserversion)
-        response = Mofsl.login(userid, password, pan, totp, userid)
-
-        if isinstance(response, dict) and response.get("status") == "SUCCESS":
-            key = _session_key(owner_userid, client)
-            mofsl_sessions[key] = (Mofsl, userid)
-            print(f"✅ Logged in: {name} | {capital} | logging in...")
-            return True
-
-        print(f"❌ Login failed: {name} ({userid}) | {response}")
-        return False
-
-    except Exception as e:
-        print(f"❌ Exception in login_motilal_client: {e}")
-        return False
-
-
-def ensure_clients_logged_in(owner_userid: str, clients: list) -> None:
-    """
-    Keeps sessions "live" by ensuring every active client has a session.
-    Call this each time user loads /clients (or wherever you need).
-    """
-    for c in (clients or []):
-        try:
-            if not c.get("session_active", True):
-                continue
-
-            key = _session_key(owner_userid, c)
-            if key in mofsl_sessions:
-                # already have a session object for this client
-                continue
-
-            # no session yet → login now
-            login_motilal_client(owner_userid, c)
-
-        except Exception as e:
-            print(f"❌ ensure_clients_logged_in error: {e}")
-            continue
