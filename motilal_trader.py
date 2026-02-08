@@ -31,6 +31,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request,Body,Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from MOFSLOPENAPI import MOFSLOPENAPI
 
 
 # ---------------- JWT (HS256) helpers (no external dependency) ----------------
@@ -596,3 +597,88 @@ def get_clients(
 @app.exception_handler(HTTPException)
 async def http_exception_handler(_: Request, exc: HTTPException):
     return JSONResponse(status_code=exc.status_code, content={"success": False, "error": exc.detail})
+
+# =========================
+# CLIENT LOGIN (Motilal) — ONLY REQUIRED FUNCTIONS
+# Reference: CT_FastAPI.py login_client(), adapted to your NEW saved format:
+# client = { name, userid, capital, creds:{password, pan, apikey, totpkey}, owner_userid, session_active }
+#
+# ✅ Where to call:
+# Inside your /clients (or /get_clients) endpoint AFTER you load `clients` list:
+#     ensure_clients_logged_in(owner_userid=effective, clients=clients)
+# =========================
+
+# Global session store (keep it simple)
+# key = "<owner_userid>:<client_userid>"
+mofsl_sessions = globals().get("mofsl_sessions", {})  # { key: (MofslObj, client_userid) }
+client_capital_map = globals().get("client_capital_map", {})  # optional
+
+
+def _session_key(owner_userid: str, client: dict) -> str:
+    owner_userid = (owner_userid or "").strip().lower()
+    client_userid = (client.get("userid") or "").strip()
+    return f"{owner_userid}:{client_userid}"
+
+
+def login_motilal_client(owner_userid: str, client: dict) -> bool:
+    """
+    Logs in ONE Motilal client and stores session in mofsl_sessions.
+    Returns True/False.
+    Uses SAME flow as CT_FastAPI.py login_client().
+    """
+    try:
+        name = (client.get("name") or "").strip()
+        userid = (client.get("userid") or "").strip()
+        capital = client.get("capital", 0) or 0
+
+        creds = client.get("creds") if isinstance(client.get("creds"), dict) else {}
+        password = (creds.get("password") or "").strip()
+        pan = str(creds.get("pan") or "").strip()
+        apikey = (creds.get("apikey") or "").strip()
+        totp_key = (creds.get("totpkey") or "").strip()
+
+        if not userid or not password or not pan or not apikey:
+            print(f"❌ Missing creds for client: {name} ({userid})")
+            return False
+
+        client_capital_map[name or userid] = capital
+
+        totp = pyotp.TOTP(totp_key).now() if totp_key else ""
+        Mofsl = MOFSLOPENAPI(apikey, Base_Url, None, SourceID, browsername, browserversion)
+        response = Mofsl.login(userid, password, pan, totp, userid)
+
+        if isinstance(response, dict) and response.get("status") == "SUCCESS":
+            key = _session_key(owner_userid, client)
+            mofsl_sessions[key] = (Mofsl, userid)
+            print(f"✅ Logged in: {name} | {capital} | logging in...")
+            return True
+
+        print(f"❌ Login failed: {name} ({userid}) | {response}")
+        return False
+
+    except Exception as e:
+        print(f"❌ Exception in login_motilal_client: {e}")
+        return False
+
+
+def ensure_clients_logged_in(owner_userid: str, clients: list) -> None:
+    """
+    Keeps sessions "live" by ensuring every active client has a session.
+    Call this each time user loads /clients (or wherever you need).
+    """
+    for c in (clients or []):
+        try:
+            if not c.get("session_active", True):
+                continue
+
+            key = _session_key(owner_userid, c)
+            if key in mofsl_sessions:
+                # already have a session object for this client
+                continue
+
+            # no session yet → login now
+            login_motilal_client(owner_userid, c)
+
+        except Exception as e:
+            print(f"❌ ensure_clients_logged_in error: {e}")
+            continue
