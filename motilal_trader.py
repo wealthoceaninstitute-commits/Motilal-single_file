@@ -477,14 +477,65 @@ def _require_fields(d: Dict[str, Any], keys: List[str]):
     if missing:
         raise HTTPException(status_code=400, detail=f"Missing required fields: {', '.join(missing)}")
 
+# ✅ ADD THIS HELPER (place anywhere above @app.post("/add_client"))
+
+def build_simple_client_record(owner_userid: str, data: dict) -> dict:
+    """
+    Normalizes incoming payload (either flat fields OR creds{} fields)
+    into ONE clean, non-repeating storage format.
+    """
+    data = data or {}
+
+    # accept both "userid" and "client_id"
+    name = (data.get("name") or "").strip()
+    client_id = (data.get("userid") or data.get("client_id") or "").strip()
+
+    # allow creds to come from either top-level or inside creds{}
+    in_creds = data.get("creds") if isinstance(data.get("creds"), dict) else {}
+
+    def pick(*keys):
+        for k in keys:
+            v = in_creds.get(k)
+            if v is None or v == "":
+                v = data.get(k)
+            if v is not None and v != "":
+                return v
+        return None
+
+    capital = pick("capital")
+    try:
+        capital = float(capital) if capital not in (None, "") else 0.0
+    except Exception:
+        capital = 0.0
+
+    creds = {
+        "password": pick("password"),
+        "pan": pick("pan"),
+        "apikey": pick("apikey", "api_key"),
+        "totpkey": pick("totpkey", "totp", "totp_key"),
+    }
+    # remove empty keys
+    creds = {k: v for k, v in creds.items() if v not in (None, "")}
+
+    record = {
+        "broker": (data.get("broker") or "motilal"),
+        "name": name,
+        "userid": client_id,
+        "capital": capital,
+        "creds": creds,
+        "owner_userid": owner_userid,
+        "session_active": bool(data.get("session_active", True)),
+    }
+    return record
+
+
+# ✅ REPLACE ONLY YOUR /add_client FUNCTION WITH THIS VERSION
+
 @app.post("/add_client")
 def add_client(payload: dict = Body(...), userid: str = Depends(get_current_user)):
     """
     Saves client under logged-in user:
       data/users/<userid>/clients/<safe_name>_<client_id>.json
-
-    Fields reference from CT_FastAPI.py:
-      name, userid (client id), password, pan, apikey, totpkey, capital
     """
     data = payload or {}
     name = (data.get("name") or "").strip()
@@ -492,12 +543,11 @@ def add_client(payload: dict = Body(...), userid: str = Depends(get_current_user
 
     _require_fields({"name": name, "userid": client_id}, ["name", "userid"])
 
-    # bind to owner
-    data["owner_userid"] = userid
-    data.setdefault("broker", "motilal")
+    # ✅ save in SIMPLE non-repeating format
+    clean = build_simple_client_record(userid, data)
 
     path = user_client_file(userid, name=name, client_id=client_id)
-    gh_put_json(path, data, message=f"add_client {userid} {name} {client_id}")
+    gh_put_json(path, clean, message=f"add_client {userid} {name} {client_id}")
     return {"success": True, "message": "Client saved", "path": path}
 
 @app.get("/get_clients")
