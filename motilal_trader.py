@@ -490,7 +490,12 @@ def add_client(payload: dict = Body(...), userid: str = Depends(get_current_user
 
 @app.get("/get_clients")
 @app.get("/clients")
-def get_clients(userid: str = Depends(get_current_user)):
+def get_clients(
+    userid: Optional[str] = Query(None),
+    user_id: Optional[str] = Query(None),
+    ignored: Optional[str] = Query(None),
+    auth_user: Optional[str] = Depends(get_current_user_optional),
+):
     """
     Lists clients from:
       data/users/<userid>/clients/
@@ -498,7 +503,14 @@ def get_clients(userid: str = Depends(get_current_user)):
     Returns:
       { success: True, userid: "...", clients: [...] }
     """
-    dir_path = user_clients_dir(userid)
+    # Resolve effective user:
+    # 1) If Authorization: Bearer <token> present, use it (auth_user)
+    # 2) Else fallback to query params used by older frontend (userid/user_id/ignored)
+    effective = auth_user or userid or user_id or ignored
+    effective = normalize_userid(effective)
+    if not effective:
+        raise HTTPException(status_code=401, detail="Missing token (Authorization) or userid query param")
+    dir_path = user_clients_dir(effective)
     entries = gh_list_dir(dir_path)
 
     clients: List[Dict[str, Any]] = []
@@ -513,7 +525,9 @@ def get_clients(userid: str = Depends(get_current_user)):
             continue
         clients.append(obj)
 
-    return {"success": True, "userid": userid, "clients": clients}
+    return {"success": True, "userid": effective, "clients": clients}
+
+
 # -----------------------------
 # Error formatting
 # -----------------------------
