@@ -652,6 +652,8 @@ def get_clients(request: Request, userid: str = None):
                 continue
 
             client, sha = gh_get_json(f["path"])   # ← only difference from local
+            session_active = bool(client.get("session_active", False))
+            status = "logged_in" if session_active else "logged_out"
 
             clients.append({
                 "name": client.get("name", ""),
