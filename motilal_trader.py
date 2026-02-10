@@ -29,7 +29,7 @@ import re
 import requests
 from fastapi import Depends, FastAPI, HTTPException, Request,Body,Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from MOFSLOPENAPI import MOFSLOPENAPI
 import pyotp
@@ -688,57 +688,134 @@ GITHUB_CSV_URL = "https://raw.githubusercontent.com/Pramod541988/Stock_List/main
 SQLITE_DB = "symbols.db"
 TABLE_NAME = "symbols"
 
-@app.get("/", response_class=HTMLResponse)
-def index(request: Request):
+def refresh_symbol_db_from_github() -> str:
+    """
+    Download CSV and rebuild SQLite table 'symbols'.
+    Creates helpful indexes for fast LIKE queries.
+    Forces dtype=str to avoid 10666.0 float artifacts.
+    """
+    _ensure_dirs()
+
+    # Download -> dataframe
+    r = requests.get(SYMBOL_CSV_URL, timeout=30)
+    r.raise_for_status()
+
+    csv_path = os.path.join(os.path.dirname(SYMBOL_DB_PATH), "security_id.csv")
+    with open(csv_path, "wb") as f:
+        f.write(r.content)
+
+    # IMPORTANT: keep all columns as strings (no float .0)
+    df = pd.read_csv(csv_path, dtype=str).fillna("")
+
+    # Optional: strip trailing ".0" if present in any ID columns
+    for col in ("Security ID", "Min qty", "Min Qty", "MIN QTY", "MIN_QTY"):
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
+
+    with _symbol_db_lock:
+        conn = sqlite3.connect(SYMBOL_DB_PATH)
+        try:
+            df.to_sql(SYMBOL_TABLE, conn, index=False, if_exists="replace")
+
+            # indexes (ignore failures if columns already indexed / absent)
+            try:
+                conn.execute(f'CREATE INDEX IF NOT EXISTS idx_sym_symbol ON {SYMBOL_TABLE} ("Stock Symbol");')
+            except Exception:
+                pass
+            try:
+                conn.execute(f'CREATE INDEX IF NOT EXISTS idx_sym_exchange ON {SYMBOL_TABLE} (Exchange);')
+            except Exception:
+                pass
+            try:
+                conn.execute(f'CREATE INDEX IF NOT EXISTS idx_sym_secid ON {SYMBOL_TABLE} ("Security ID");')
+            except Exception:
+                pass
+
+            conn.commit()
+        finally:
+            conn.close()
+
+    return "success"
+
+
+def _symbol_db_exists() -> bool:
+    return os.path.exists(SYMBOL_DB_PATH)
+
+def _lazy_init_symbol_db():
+    """Build the DB once if it does not exist."""
+    if not _symbol_db_exists():
+        try:
+            refresh_symbol_db_from_github()
+        except Exception as e:
+            print("❌ Symbol DB init failed:", e)
+
+
+@app.post("/refresh_symbols")
+def router_refresh_symbols():
+    """Force refresh the symbol master from GitHub into SQLite."""
     try:
-        conn = sqlite3.connect(SQLITE_DB)
-        cur = conn.execute(f"SELECT DISTINCT [Stock Symbol] FROM {TABLE_NAME}")
-        symbols = [row[0] for row in cur.fetchall()]
-        conn.close()
-        clients = load_all_clients()
-        return templates.TemplateResponse("index.html", {"request": request, "symbols": symbols, "clients": clients})
+        msg = refresh_symbol_db_from_github()
+        return {"status": msg}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal Error: {e}")
+        return {"status": "error", "message": str(e)}
 
 @app.get("/search_symbols")
-def search_symbols(q: str = Query("", alias="q"), exchange: str = Query("", alias="exchange")):
-    query = (q or "").strip()
-    exchange_filter = (exchange or "").strip().upper()
+def router_search_symbols(q: str = Query(""), exchange: str = Query("")):
+    """
+    Typeahead search with ranking:
+      0 = exact match on whole query
+      1 = symbol startswith whole query
+      2 = symbol contains whole query (anywhere)
+    """
+    _lazy_init_symbol_db()
+    raw = (q or "").strip().lower()
+    exch = (exchange or "").strip().upper()
+    if not raw:
+        return {"results": []}
 
-    if not query:
-        return JSONResponse(content={"results": []})
-
-    words = [w for w in query.lower().split() if w]
+    # split into words for WHERE (AND-of-words)
+    words = [w for w in raw.split() if w]
     if not words:
-        return JSONResponse(content={"results": []})
+        return {"results": []}
 
-    where_clauses = []
-    params = []
+    where_sql, where_params = [], []
     for w in words:
-        where_clauses.append("LOWER([Stock Symbol]) LIKE ?")
-        params.append(f"%{w}%")
+        where_sql.append('LOWER([Stock Symbol]) LIKE ?')
+        where_params.append(f"%{w}%")
+    if exch:
+        where_sql.append('UPPER(Exchange) = ?')
+        where_params.append(exch)
 
-    where_sql = " AND ".join(where_clauses)
-    if exchange_filter:
-        where_sql += " AND UPPER(Exchange) = ?"
-        params.append(exchange_filter)
+    # ranking based on full raw query (not just first word)
+    rank_params = [raw, f"{raw}%", f"%{raw}%"]
 
     sql = f"""
-        SELECT Exchange, [Stock Symbol], [Security ID]
-        FROM {TABLE_NAME}
-        WHERE {where_sql}
-        ORDER BY [Stock Symbol]
-        LIMIT 20
+        SELECT
+            Exchange,
+            [Stock Symbol],
+            [Security ID],
+            CASE
+                WHEN LOWER([Stock Symbol]) = ?     THEN 0
+                WHEN LOWER([Stock Symbol]) LIKE ?  THEN 1
+                WHEN LOWER([Stock Symbol]) LIKE ?  THEN 2
+                ELSE 3
+            END AS rank_score
+        FROM {SYMBOL_TABLE}
+        WHERE {' AND '.join(where_sql)}
+        ORDER BY rank_score, [Stock Symbol]
+        LIMIT 200
     """
 
-    with symbol_db_lock:
-        conn = sqlite3.connect(SQLITE_DB)
-        cur = conn.execute(sql, params)
-        rows = cur.fetchall()
-        conn.close()
+    with _symbol_db_lock:
+        conn = sqlite3.connect(SYMBOL_DB_PATH)
+        try:
+            cur = conn.execute(sql, rank_params + where_params)
+            rows = cur.fetchall()
+        finally:
+            conn.close()
 
     results = [
-        {"id": f"{row[0]}|{row[1]}|{row[2]}", "text": f"{row[0]} | {row[1]}"}
-        for row in rows
+        {"id": f"{r[0]}|{r[1]}|{r[2]}", "text": f"{r[0]} | {r[1]}"}
+        for r in rows
     ]
-    return JSONResponse(content={"results": results})
+    return {"results": results}
