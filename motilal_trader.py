@@ -633,36 +633,48 @@ async def edit_client(request: Request, payload: dict = Body(...)):
     return {"success": True}
 
 @app.get("/clients")
-def get_clients(request: Request, userid: str = None):
+def get_clients(request: Request, userid: str = None, user_id: str = None):
+    # 1) pick userid from header or query
+    uid = request.headers.get("x-user-id") or userid or user_id or request.query_params.get("userid") or request.query_params.get("user_id") or ""
+    uid = str(uid).strip()
 
-    userid = request.headers.get("x-user-id") or userid
-    folder = f"data/users/{userid}/clients"
+    # 2) handle %22pra%22 and "pra"
+    if (uid.startswith('"') and uid.endswith('"')) or (uid.startswith("'") and uid.endswith("'")):
+        uid = uid[1:-1].strip()
 
+    if not uid:
+        return {"clients": []}
+
+    folder = f"data/users/{uid}/clients"
     clients = []
 
     try:
-        files = gh_list_dir(folder)
+        entries = gh_list_dir(folder)  # list of dicts from GitHub API
 
-        for f in files:
-
-            if f.get("type") != "file":
+        for ent in entries:
+            if not isinstance(ent, dict):
+                continue
+            if ent.get("type") != "file":
+                continue
+            if not (ent.get("name", "").endswith(".json") and ent.get("path")):
                 continue
 
-            if not f.get("name", "").endswith(".json"):
-                continue
+            try:
+                client_obj, _sha = gh_get_json(ent["path"])  # returns (dict, sha)
+                if not isinstance(client_obj, dict):
+                    continue
 
-            client, sha = gh_get_json(f["path"])   # ← only difference from local
-            session_active = bool(client.get("session_active", False))
-            status = "logged_in" if session_active else "logged_out"
-
-            clients.append({
-                "name": client.get("name", ""),
-                "client_id": client.get("userid", ""),
-                "capital": client.get("capital", ""),
-                "session": "Logged in" if session_active else "Logged out",  # keep old
-                "session_active": session_active,                            # NEW for UI
-                "status": status,                                            # optional
-            })
+                sa = bool(client_obj.get("session_active", False))
+                clients.append({
+                    "name": client_obj.get("name", ""),
+                    "client_id": client_obj.get("userid", client_obj.get("client_id", "")),
+                    "capital": client_obj.get("capital", ""),
+                    "session": "Logged in" if sa else "Logged out",   # keep old
+                    "session_active": sa,                              # UI needs this
+                    "status": "logged_in" if sa else "logged_out",     # optional
+                })
+            except Exception as per_file_err:
+                print(f"Error reading client file {ent.get('path')}: {per_file_err}")
 
     except Exception as e:
         print("Error loading clients:", e)
