@@ -680,3 +680,65 @@ def get_clients(request: Request, userid: str = None, user_id: str = None):
         print("Error loading clients:", e)
 
     return {"clients": clients}
+#///////////////////
+# Symbol DB
+#//////////////////
+
+GITHUB_CSV_URL = "https://raw.githubusercontent.com/Pramod541988/Stock_List/main/security_id.csv"
+SQLITE_DB = "symbols.db"
+TABLE_NAME = "symbols"
+
+@app.get("/", response_class=HTMLResponse)
+def index(request: Request):
+    try:
+        conn = sqlite3.connect(SQLITE_DB)
+        cur = conn.execute(f"SELECT DISTINCT [Stock Symbol] FROM {TABLE_NAME}")
+        symbols = [row[0] for row in cur.fetchall()]
+        conn.close()
+        clients = load_all_clients()
+        return templates.TemplateResponse("index.html", {"request": request, "symbols": symbols, "clients": clients})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal Error: {e}")
+
+@app.get("/search_symbols")
+def search_symbols(q: str = Query("", alias="q"), exchange: str = Query("", alias="exchange")):
+    query = (q or "").strip()
+    exchange_filter = (exchange or "").strip().upper()
+
+    if not query:
+        return JSONResponse(content={"results": []})
+
+    words = [w for w in query.lower().split() if w]
+    if not words:
+        return JSONResponse(content={"results": []})
+
+    where_clauses = []
+    params = []
+    for w in words:
+        where_clauses.append("LOWER([Stock Symbol]) LIKE ?")
+        params.append(f"%{w}%")
+
+    where_sql = " AND ".join(where_clauses)
+    if exchange_filter:
+        where_sql += " AND UPPER(Exchange) = ?"
+        params.append(exchange_filter)
+
+    sql = f"""
+        SELECT Exchange, [Stock Symbol], [Security ID]
+        FROM {TABLE_NAME}
+        WHERE {where_sql}
+        ORDER BY [Stock Symbol]
+        LIMIT 20
+    """
+
+    with symbol_db_lock:
+        conn = sqlite3.connect(SQLITE_DB)
+        cur = conn.execute(sql, params)
+        rows = cur.fetchall()
+        conn.close()
+
+    results = [
+        {"id": f"{row[0]}|{row[1]}|{row[2]}", "text": f"{row[0]} | {row[1]}"}
+        for row in rows
+    ]
+    return JSONResponse(content={"results": results})
