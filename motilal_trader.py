@@ -632,20 +632,47 @@ async def edit_client(request: Request, payload: dict = Body(...)):
 
     return {"success": True}
 
-@app.get("/get_clients")
+@app.get("/clients")
 def get_clients(request: Request):
 
-    owner_userid = request.headers.get("x-user-id") or request.query_params.get("userid")
+    owner_userid = request.headers.get("x-user-id") \
+        or request.query_params.get("userid") \
+        or request.query_params.get("user_id")
+
+    if not owner_userid:
+        return {"clients": []}
 
     folder = f"data/users/{owner_userid}/clients"
 
-    files = gh_list_dir(folder)
+    try:
+        files = gh_list_dir(folder)
+    except:
+        return {"clients": []}
 
     clients = []
 
     for f in files:
-        if f.endswith(".json"):
-            c = gh_get_json(f"{folder}/{f}")
-            clients.append(c)
+
+        # GitHub returns dict, not string
+        filename = f["name"] if isinstance(f, dict) else f
+
+        if filename.endswith(".json"):
+
+            path = f"{folder}/{filename}"
+
+            client = gh_get_json(path)
+
+            if client:
+
+                clients.append({
+                    "name": client.get("name", ""),
+                    "client_id": client.get("userid", ""),
+                    "userid": client.get("userid", ""),
+                    "capital": client.get("capital", ""),
+                    "session_active": client.get("session_active", False),
+                    "last_login_ts": client.get("last_login_ts", 0),
+                    "last_login_msg": client.get("last_login_msg", ""),
+                    "session": "Logged in" if client.get("session_active") else "Logged out"
+                })
 
     return {"clients": clients}
