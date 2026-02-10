@@ -33,7 +33,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from MOFSLOPENAPI import MOFSLOPENAPI
 import pyotp
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 
 
 # ---------------- JWT (HS256) helpers (no external dependency) ----------------
@@ -547,4 +547,325 @@ def motilal_login(client: dict):
         print(f"Login error: {name} ({userid}) :: {e}")
 
         return False
+
+# ===========================================
+# Clients Routes (GitHub storage) + Login now
+# ===========================================
+
+# Uses your existing: motilal_login_one_client(client, client_path=..., userid_owner=...)
+# Uses your existing GitHub helpers:
+#   - gh_get_json(path) -> dict | None
+#   - gh_put_json(path, obj, message="...") -> None
+#   - gh_list_dir(path) -> list[dict]  (GitHub "contents" entries) OR list[str]
+#   - gh_delete_file(path, message="...") -> None
+
+# -------------------------
+# path builders (NO schema change)
+# -------------------------
+def user_clients_dir(owner_userid: str) -> str:
+    owner_userid = (owner_userid or "").strip()
+    return f"data/users/{owner_userid}/clients"
+
+def user_client_path(owner_userid: str, client_userid: str) -> str:
+    owner_userid = (owner_userid or "").strip()
+    client_userid = (client_userid or "").strip()
+    return f"{user_clients_dir(owner_userid)}/{client_userid}.json"
+
+def ensure_clients_folder(owner_userid: str) -> None:
+    """
+    GitHub doesn't store empty folders.
+    We keep a .keep file so the folder exists uniformly like your register flow.
+    Safe to call repeatedly.
+    """
+    keep_path = f"{user_clients_dir(owner_userid)}/.keep"
+    try:
+        existing = gh_get_json(keep_path)
+        if isinstance(existing, dict) and existing.get("ok") == True:
+            return
+    except Exception:
+        pass
+
+    try:
+        gh_put_json(
+            keep_path,
+            {"ok": True, "ts": int(time.time())},
+            message=f"ensure clients folder {owner_userid}",
+        )
+        print(f"📁 ensured folder: {user_clients_dir(owner_userid)}")
+    except Exception as e:
+        # Not fatal (client save may still create the folder implicitly)
+        print(f"⚠️ ensure_clients_folder failed: {e}")
+
+# -------------------------
+# Resolve logged-in owner userid (uniform)
+# -------------------------
+def resolve_owner_userid(request: Request, user: Optional[dict] = None) -> str:
+    """
+    Prefer JWT identity if you have it (user dict).
+    Else fallback to x-user-id header.
+    Else fallback to query params (userid/user_id).
+    """
+    # 1) from auth dependency
+    if isinstance(user, dict):
+        for k in ("userid", "user_id", "sub", "username"):
+            v = user.get(k)
+            if v:
+                return str(v).strip()
+
+    # 2) headers
+    hdr = request.headers.get("x-user-id") or request.headers.get("X-User-Id")
+    if hdr:
+        return str(hdr).strip()
+
+    # 3) query
+    qp = request.query_params.get("userid") or request.query_params.get("user_id")
+    if qp:
+        return str(qp).strip()
+
+    return ""
+
+# -------------------------
+# Normalize frontend payload into flat client JSON (NO schema change)
+# -------------------------
+def _pick_str(d: dict, *keys: str) -> str:
+    for k in keys:
+        v = d.get(k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s != "":
+            return s
+    return ""
+
+def normalize_motilal_client_payload(payload: dict) -> Dict[str, Any]:
+    """
+    Frontend can send:
+      - flat: {name, userid, password, pan, apikey, totpkey, capital, broker}
+      - OR wrapper: {client_id/userid, display_name/name, creds:{password,pan,apikey,totpkey}, capital, broker}
+      - and it may send BOTH (your current Clients.jsx does)
+    We convert into flat CT_FastAPI style (NO schema change).
+    """
+    payload = payload or {}
+    creds = payload.get("creds") if isinstance(payload.get("creds"), dict) else {}
+
+    name = _pick_str(payload, "name", "display_name")
+    userid = _pick_str(payload, "userid", "client_id", "client_code")  # Motilal client user id
+    password = _pick_str(payload, "password") or _pick_str(creds, "password")
+    pan = _pick_str(payload, "pan") or _pick_str(creds, "pan")
+    apikey = _pick_str(payload, "apikey") or _pick_str(creds, "apikey")
+    totpkey = _pick_str(payload, "totpkey", "totp") or _pick_str(creds, "totpkey", "totp")
+
+    # capital optional
+    capital = payload.get("capital", "")
+
+    out = {
+        "broker": _pick_str(payload, "broker") or "motilal",
+        "name": name,
+        "userid": userid,
+        "password": password,
+        "pan": pan,
+        "apikey": apikey,
+        "totpkey": totpkey,
+        "capital": capital,
+    }
+
+    # keep any extra fields (but do NOT nest schema changes)
+    # (optional: include only if you want to preserve UI fields)
+    for k, v in payload.items():
+        if k in out or k == "creds":
+            continue
+        out[k] = v
+
+    return out
+
+# -------------------------
+# Helper: list all clients from GitHub folder
+# -------------------------
+def list_user_clients(owner_userid: str) -> List[Dict[str, Any]]:
+    folder = user_clients_dir(owner_userid)
+    entries = []
+    try:
+        entries = gh_list_dir(folder) or []
+    except Exception as e:
+        print(f"⚠️ gh_list_dir({folder}) failed: {e}")
+        return []
+
+    files: List[str] = []
+
+    # Support both: list[str] or list[dict] (GitHub contents items)
+    for it in entries:
+        if isinstance(it, str):
+            if it.endswith(".json") and not it.endswith("/.keep"):
+                files.append(f"{folder}/{it.split('/')[-1]}")
+        elif isinstance(it, dict):
+            name = (it.get("name") or "").strip()
+            if name.endswith(".json") and name != ".keep":
+                files.append(f"{folder}/{name}")
+
+    clients: List[Dict[str, Any]] = []
+    for path in files:
+        try:
+            c = gh_get_json(path)
+            if isinstance(c, dict) and c.get("userid"):
+                clients.append(c)
+        except Exception as e:
+            print(f"⚠️ read client failed {path}: {e}")
+            continue
+
+    return clients
+
+# ==========================================================
+# ROUTES (KEEP EXACT PATHS)
+# ==========================================================
+
+# NOTE: replace get_current_user with YOUR dependency if you already have one.
+# If you don't have a dependency, you can set user: dict = None and it still works via x-user-id.
+try:
+    get_current_user  # type: ignore
+except NameError:
+    get_current_user = None  # fallback
+
+def _dep_user():
+    if get_current_user:
+        return Depends(get_current_user)  # type: ignore
+    return None
+
+@app.post("/add_client")
+async def add_client(request: Request, payload: dict = Body(...), user: Optional[dict] = _dep_user()):
+    owner_userid = resolve_owner_userid(request, user)
+    if not owner_userid:
+        raise HTTPException(status_code=401, detail="Missing logged-in user (token/x-user-id)")
+
+    client = normalize_motilal_client_payload(payload)
+
+    if not client.get("userid"):
+        raise HTTPException(status_code=400, detail="Client userid/client_id required")
+    if not client.get("password") or not client.get("apikey"):
+        raise HTTPException(status_code=400, detail="password and apikey required")
+
+    ensure_clients_folder(owner_userid)
+
+    path = user_client_path(owner_userid, client["userid"])
+
+    # Save first (so UI can see it immediately)
+    now = int(time.time())
+    client.setdefault("created_at", now)
+    client["updated_at"] = now
+    client.setdefault("session_active", False)
+    client.setdefault("last_login_ts", 0)
+    client.setdefault("last_login_msg", "Not logged in yet")
+
+    print(f"🧾 [ADD_CLIENT] owner={owner_userid} saving={path} payload_keys={list(payload.keys())}")
+    gh_put_json(path, client, message=f"add client {owner_userid}:{client['userid']}")
+
+    # Now login immediately + persist login result into same file
+    print(f"🔐 [ADD_CLIENT] login start owner={owner_userid} client={client['userid']}")
+    login_status = motilal_login_one_client(client, client_path=path, userid_owner=owner_userid)
+    print(f"🔐 [ADD_CLIENT] login done owner={owner_userid} client={client['userid']} status={login_status}")
+
+    return {
+        "success": True,
+        "message": "Client saved. Login attempted.",
+        "login": login_status,
+    }
+
+@app.post("/edit_client")
+async def edit_client(request: Request, payload: dict = Body(...), user: Optional[dict] = _dep_user()):
+    owner_userid = resolve_owner_userid(request, user)
+    if not owner_userid:
+        raise HTTPException(status_code=401, detail="Missing logged-in user (token/x-user-id)")
+
+    client = normalize_motilal_client_payload(payload)
+    if not client.get("userid"):
+        raise HTTPException(status_code=400, detail="Client userid/client_id required")
+
+    path = user_client_path(owner_userid, client["userid"])
+
+    # Merge with existing (preserve created_at if present)
+    existing = {}
+    try:
+        existing = gh_get_json(path) or {}
+    except Exception:
+        existing = {}
+
+    merged = dict(existing) if isinstance(existing, dict) else {}
+    merged.update(client)
+    merged["updated_at"] = int(time.time())
+    merged.setdefault("created_at", int(time.time()))
+
+    print(f"✏️ [EDIT_CLIENT] owner={owner_userid} saving={path}")
+    gh_put_json(path, merged, message=f"edit client {owner_userid}:{client['userid']}")
+
+    # Attempt re-login after edit (important if password/apikey/totp changed)
+    print(f"🔐 [EDIT_CLIENT] login start owner={owner_userid} client={client['userid']}")
+    login_status = motilal_login_one_client(merged, client_path=path, userid_owner=owner_userid)
+    print(f"🔐 [EDIT_CLIENT] login done owner={owner_userid} client={client['userid']} status={login_status}")
+
+    return {"success": True, "message": "Client updated. Login attempted.", "login": login_status}
+
+@app.post("/delete_client")
+async def delete_client(request: Request, payload: dict = Body(...), user: Optional[dict] = _dep_user()):
+    owner_userid = resolve_owner_userid(request, user)
+    if not owner_userid:
+        raise HTTPException(status_code=401, detail="Missing logged-in user (token/x-user-id)")
+
+    items = payload.get("items") or []
+    if not isinstance(items, list) or not items:
+        raise HTTPException(status_code=400, detail="items[] required")
+
+    deleted = []
+    errors = []
+
+    for it in items:
+        try:
+            if not isinstance(it, dict):
+                continue
+            client_userid = (it.get("userid") or it.get("client_id") or "").strip()
+            if not client_userid:
+                continue
+
+            path = user_client_path(owner_userid, client_userid)
+            print(f"🗑️ [DELETE_CLIENT] owner={owner_userid} deleting={path}")
+            gh_delete_file(path, message=f"delete client {owner_userid}:{client_userid}")
+            deleted.append(client_userid)
+
+            # clear in-memory session too (optional)
+            try:
+                mofsl_sessions.pop(client_userid, None)
+            except Exception:
+                pass
+
+        except Exception as e:
+            errors.append({"client": it, "error": str(e)})
+
+    return {"success": True, "deleted": deleted, "errors": errors}
+
+@app.get("/get_clients")
+def get_clients(request: Request, userid: Optional[str] = None, user: Optional[dict] = _dep_user()):
+    owner_userid = resolve_owner_userid(request, user) or (userid or "").strip()
+    if not owner_userid:
+        return {"clients": []}
+
+    clients = list_user_clients(owner_userid)
+
+    # shape for UI table (same style as CT_FastAPI)
+    out = []
+    for c in clients:
+        out.append({
+            "name": c.get("name", ""),
+            "client_id": c.get("userid", ""),
+            "userid": c.get("userid", ""),
+            "capital": c.get("capital", ""),
+            "session_active": bool(c.get("session_active")),
+            "last_login_ts": c.get("last_login_ts", 0),
+            "last_login_msg": c.get("last_login_msg", ""),
+            "session": "Logged in" if c.get("session_active") else "Logged out",
+        })
+
+    return {"clients": out}
+
+@app.get("/clients")
+def clients_alias(request: Request, userid: Optional[str] = None, user: Optional[dict] = _dep_user()):
+    # alias route since frontend tries /clients first
+    return get_clients(request, userid=userid, user=user)
 
