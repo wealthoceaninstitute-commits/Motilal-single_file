@@ -657,7 +657,9 @@ def get_clients(request: Request, userid: str = None):
                 "name": client.get("name", ""),
                 "client_id": client.get("userid", ""),
                 "capital": client.get("capital", ""),
-                "session": "Logged in" if client.get("session_active") else "Logged out"
+                "session": "Logged in" if session_active else "Logged out",  # keep old
+                "session_active": session_active,                            # NEW for UI
+                "status": status,                                            # optional
             })
 
     except Exception as e:
