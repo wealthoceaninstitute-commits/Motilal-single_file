@@ -632,7 +632,7 @@ async def edit_client(request: Request, payload: dict = Body(...)):
 
     return {"success": True}
 
-@app.get("/clients")
+@app.get("/get_clients")
 def get_clients(request: Request):
 
     owner_userid = request.headers.get("x-user-id") \
