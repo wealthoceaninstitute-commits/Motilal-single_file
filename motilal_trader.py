@@ -32,6 +32,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from MOFSLOPENAPI import MOFSLOPENAPI
+import pyotp
+from typing import Dict, Any
 
 
 # ---------------- JWT (HS256) helpers (no external dependency) ----------------
@@ -477,4 +479,72 @@ def _require_fields(d: Dict[str, Any], keys: List[str]):
     missing = [k for k in keys if not (d.get(k) or "").strip()]
     if missing:
         raise HTTPException(status_code=400, detail=f"Missing required fields: {', '.join(missing)}")
+
+# =========================
+# Motilal LOGIN 
+# =========================
+
+Base_Url = "https://openapi.motilaloswal.com"
+SourceID = "Desktop"
+browsername = "chrome"
+browserversion = "104"
+
+# same structure as CT_FastAPI
+mofsl_sessions: Dict[str, Dict[str, Any]] = {}
+
+
+def motilal_login(client: dict):
+    """
+    EXACT CT_FastAPI login logic
+    No schema change
+    No GitHub write
+    No extra features
+    """
+
+    name = client.get("name", "")
+    userid = client.get("userid", "")
+    password = client.get("password", "")
+    pan = client.get("pan", "")
+    apikey = client.get("apikey", "")
+    totpkey = client.get("totpkey", "")
+
+    try:
+
+        totp = pyotp.TOTP(totpkey).now()
+
+        mofsl = MOFSLOPENAPI(
+            apikey,
+            Base_Url,
+            None,
+            SourceID,
+            browsername,
+            browserversion
+        )
+
+        response = mofsl.login(userid, password, pan, totp, userid)
+
+        if isinstance(response, dict) and response.get("status") == "SUCCESS":
+
+            mofsl_sessions[userid] = {
+                "name": name,
+                "userid": userid,
+                "mofsl": mofsl,
+                "login_ts": int(time.time())
+            }
+
+            print(f"Login successful: {name} ({userid})")
+
+            return True
+
+        else:
+
+            print(f"Login failed: {name} ({userid})")
+
+            return False
+
+    except Exception as e:
+
+        print(f"Login error: {name} ({userid}) :: {e}")
+
+        return False
 
