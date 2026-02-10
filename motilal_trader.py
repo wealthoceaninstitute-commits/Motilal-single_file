@@ -633,46 +633,34 @@ async def edit_client(request: Request, payload: dict = Body(...)):
     return {"success": True}
 
 @app.get("/clients")
-def get_clients(request: Request):
+def get_clients(request: Request, userid: str = None):
 
-    owner_userid = request.headers.get("x-user-id") \
-        or request.query_params.get("userid") \
-        or request.query_params.get("user_id")
-
-    if not owner_userid:
-        return {"clients": []}
-
-    folder = f"data/users/{owner_userid}/clients"
-
-    try:
-        files = gh_list_dir(folder)
-    except:
-        return {"clients": []}
+    userid = request.headers.get("x-user-id") or userid
+    folder = f"data/users/{userid}/clients"
 
     clients = []
 
-    for f in files:
+    try:
+        files = gh_list_dir(folder)
 
-        # GitHub returns dict, not string
-        filename = f["name"] if isinstance(f, dict) else f
+        for f in files:
 
-        if filename.endswith(".json"):
+            if f.get("type") != "file":
+                continue
 
-            path = f"{folder}/{filename}"
+            if not f.get("name", "").endswith(".json"):
+                continue
 
-            client = gh_get_json(path)
+            client, sha = gh_get_json(f["path"])   # ← only difference from local
 
-            if client:
+            clients.append({
+                "name": client.get("name", ""),
+                "client_id": client.get("userid", ""),
+                "capital": client.get("capital", ""),
+                "session": "Logged in" if client.get("session_active") else "Logged out"
+            })
 
-                clients.append({
-                    "name": client.get("name", ""),
-                    "client_id": client.get("userid", ""),
-                    "userid": client.get("userid", ""),
-                    "capital": client.get("capital", ""),
-                    "session_active": client.get("session_active", False),
-                    "last_login_ts": client.get("last_login_ts", 0),
-                    "last_login_msg": client.get("last_login_msg", ""),
-                    "session": "Logged in" if client.get("session_active") else "Logged out"
-                })
+    except Exception as e:
+        print("Error loading clients:", e)
 
     return {"clients": clients}
