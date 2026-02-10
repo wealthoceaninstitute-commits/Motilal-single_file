@@ -839,3 +839,384 @@ def search_symbols(q: str = Query(""), exchange: str = Query("")):
 @app.on_event("startup")
 def _startup_init_symbols():
     _lazy_init_symbol_db()
+
+
+# ==========================================================
+# Groups + CopyTrading + Delete Client (GitHub storage)
+# ==========================================================
+
+def gh_delete_path(path: str, sha: str, message: str = "delete file") -> bool:
+    if not gh_enabled():
+        raise HTTPException(500, "GitHub storage not configured (set GITHUB_OWNER/GITHUB_REPO/GITHUB_TOKEN)")
+    if not sha:
+        # try fetch sha
+        _, sha2 = gh_get_json(path)
+        sha = sha2 or ""
+    if not sha:
+        return False
+    payload = {"message": message, "sha": sha, "branch": GITHUB_BRANCH}
+    r = requests.delete(gh_url(path), headers=gh_headers(), json=payload)
+    if r.status_code == 404:
+        return False
+    r.raise_for_status()
+    return True
+
+def resolve_owner_userid(request: Request, userid: Optional[str] = None, user_id: Optional[str] = None) -> str:
+    # Prefer Bearer token userid (if present), then x-user-id header, then query/body params.
+    token_user = ""
+    try:
+        auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""
+        if auth.lower().startswith("bearer "):
+            token = auth.split(" ", 1)[1].strip()
+            payload = jwt_decode(token, SECRET_KEY)
+            token_user = payload.get("userid") or ""
+    except Exception:
+        token_user = ""
+
+    uid = (
+        token_user
+        or request.headers.get("x-user-id")
+        or request.query_params.get("userid")
+        or request.query_params.get("user_id")
+        or userid
+        or user_id
+    )
+    return normalize_userid(uid or "")
+
+    uid = (
+        token_user
+        or request.headers.get("x-user-id")
+        or request.query_params.get("userid")
+        or request.query_params.get("user_id")
+        or userid
+        or user_id
+    )
+    return normalize_userid(uid or "")
+
+def user_groups_dir(owner_userid: str) -> str:
+    return f"data/users/{owner_userid}/groups"
+
+def user_group_file(owner_userid: str, group_id_or_name: str) -> str:
+    gid = _safe_filename(group_id_or_name or "group")
+    return f"{user_groups_dir(owner_userid)}/{gid}.json"
+
+def user_copy_dir(owner_userid: str) -> str:
+    return f"data/users/{owner_userid}/copytrading"
+
+def user_copy_file(owner_userid: str, setup_id_or_name: str) -> str:
+    sid = _safe_filename(setup_id_or_name or "setup")
+    return f"{user_copy_dir(owner_userid)}/{sid}.json"
+
+
+@app.post("/delete_client")
+async def delete_client(request: Request, payload: dict = Body(...)):
+    owner_userid = resolve_owner_userid(request, userid=payload.get("userid") or payload.get("owner_userid"))
+    if not owner_userid:
+        raise HTTPException(status_code=401, detail="Missing owner userid")
+
+    items = payload.get("items") or []
+    deleted = []
+    missing = []
+    errors = []
+
+    for it in items:
+        try:
+            client_userid = (it or {}).get("userid") or (it or {}).get("client_id") or ""
+            client_userid = str(client_userid).strip()
+            if not client_userid:
+                continue
+            path = f"data/users/{owner_userid}/clients/{client_userid}.json"
+            _obj, sha = gh_get_json(path)
+            if not sha:
+                missing.append(client_userid)
+                continue
+            ok = gh_delete_path(path, sha, message=f"delete client {owner_userid}:{client_userid}")
+            (deleted if ok else missing).append(client_userid)
+        except Exception as e:
+            errors.append(str(e))
+
+    return {"ok": True, "deleted": deleted, "missing": missing, "errors": errors}
+
+
+@app.get("/groups")
+async def get_groups(request: Request, userid: str = None, user_id: str = None):
+    owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
+    if not owner_userid:
+        return {"groups": []}
+
+    folder = user_groups_dir(owner_userid)
+    groups = []
+    try:
+        entries = gh_list_dir(folder)
+        for ent in entries:
+            if not isinstance(ent, dict) or ent.get("type") != "file":
+                continue
+            name = ent.get("name", "")
+            path = ent.get("path", "")
+            if not name.endswith(".json") or not path:
+                continue
+            obj, _sha = gh_get_json(path)
+            if isinstance(obj, dict) and obj:
+                # ensure required fields
+                gid = obj.get("id") or name.replace(".json", "")
+                groups.append({
+                    "id": gid,
+                    "name": obj.get("name", gid),
+                    "multiplier": obj.get("multiplier", 1),
+                    "members": obj.get("members", []),
+                })
+    except Exception:
+        groups = []
+
+    return {"groups": groups}
+
+
+@app.post("/add_group")
+async def add_group(request: Request, payload: dict = Body(...)):
+    owner_userid = resolve_owner_userid(request, userid=payload.get("userid") or payload.get("owner_userid"))
+    if not owner_userid:
+        raise HTTPException(status_code=401, detail="Missing owner userid")
+
+    name = (payload.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Group name required")
+    members = payload.get("members") or []
+    if not isinstance(members, list) or len(members) == 0:
+        raise HTTPException(status_code=400, detail="Group members required")
+    try:
+        multiplier = float(payload.get("multiplier", 1) or 1)
+    except Exception:
+        multiplier = 1.0
+    if multiplier <= 0:
+        multiplier = 1.0
+
+    gid = (payload.get("id") or name).strip()
+    obj = {
+        "id": gid,
+        "name": name,
+        "multiplier": multiplier,
+        "members": members,
+        "created_at": utcnow_iso(),
+        "updated_at": utcnow_iso(),
+    }
+    path = user_group_file(owner_userid, gid)
+    gh_put_json(path, obj, message=f"add group {owner_userid}:{gid}")
+    return {"ok": True, "group": obj}
+
+
+@app.post("/edit_group")
+async def edit_group(request: Request, payload: dict = Body(...)):
+    owner_userid = resolve_owner_userid(request, userid=payload.get("userid") or payload.get("owner_userid"))
+    if not owner_userid:
+        raise HTTPException(status_code=401, detail="Missing owner userid")
+
+    gid = (payload.get("id") or payload.get("name") or "").strip()
+    if not gid:
+        raise HTTPException(status_code=400, detail="Group id/name required")
+
+    name = (payload.get("name") or gid).strip()
+    members = payload.get("members") or []
+    try:
+        multiplier = float(payload.get("multiplier", 1) or 1)
+    except Exception:
+        multiplier = 1.0
+    if multiplier <= 0:
+        multiplier = 1.0
+
+    path = user_group_file(owner_userid, gid)
+    prev, _sha = gh_get_json(path)
+    if not isinstance(prev, dict):
+        prev = {}
+
+    obj = {
+        "id": prev.get("id") or gid,
+        "name": name,
+        "multiplier": multiplier,
+        "members": members,
+        "created_at": prev.get("created_at") or utcnow_iso(),
+        "updated_at": utcnow_iso(),
+    }
+    gh_put_json(path, obj, message=f"edit group {owner_userid}:{gid}")
+    return {"ok": True, "group": obj}
+
+
+@app.post("/delete_group")
+async def delete_group(request: Request, payload: dict = Body(...)):
+    owner_userid = resolve_owner_userid(request, userid=payload.get("userid") or payload.get("owner_userid"))
+    if not owner_userid:
+        raise HTTPException(status_code=401, detail="Missing owner userid")
+
+    ids = payload.get("ids") or payload.get("names") or payload.get("groups") or []
+    if not isinstance(ids, list):
+        ids = [ids]
+
+    deleted, missing, errors = [], [], []
+    for gid in ids:
+        try:
+            gid = str(gid).strip()
+            if not gid:
+                continue
+            path = user_group_file(owner_userid, gid)
+            _obj, sha = gh_get_json(path)
+            if not sha:
+                # try by name without safe transforms in case ids are already safe
+                missing.append(gid)
+                continue
+            ok = gh_delete_path(path, sha, message=f"delete group {owner_userid}:{gid}")
+            (deleted if ok else missing).append(gid)
+        except Exception as e:
+            errors.append(str(e))
+
+    return {"ok": True, "deleted": deleted, "missing": missing, "errors": errors}
+
+
+# ---------------- Copy Trading ----------------
+
+@app.get("/list_copytrading_setups")
+async def list_copytrading_setups(request: Request, userid: str = None, user_id: str = None):
+    owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
+    if not owner_userid:
+        return {"setups": []}
+
+    folder = user_copy_dir(owner_userid)
+    setups = []
+    try:
+        entries = gh_list_dir(folder)
+        for ent in entries:
+            if not isinstance(ent, dict) or ent.get("type") != "file":
+                continue
+            name = ent.get("name", "")
+            path = ent.get("path", "")
+            if not name.endswith(".json") or not path:
+                continue
+            obj, _sha = gh_get_json(path)
+            if not isinstance(obj, dict) or not obj:
+                continue
+            sid = obj.get("id") or obj.get("name") or name.replace(".json", "")
+            setups.append({
+                "id": sid,
+                "name": obj.get("name", sid),
+                "master": obj.get("master", obj.get("master_account", "")),
+                "children": obj.get("children", obj.get("child_accounts", [])) or [],
+                "multipliers": obj.get("multipliers", {}) or {},
+                "enabled": bool(obj.get("enabled", False)),
+            })
+    except Exception:
+        setups = []
+
+    return {"setups": setups}
+
+
+@app.post("/save_copytrading_setup")
+async def save_copytrading_setup(request: Request, payload: dict = Body(...)):
+    owner_userid = resolve_owner_userid(request, userid=payload.get("userid") or payload.get("owner_userid"))
+    if not owner_userid:
+        raise HTTPException(status_code=401, detail="Missing owner userid")
+
+    name = (payload.get("name") or payload.get("setup_name") or "").strip()
+    sid = (payload.get("id") or name).strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="Setup name required")
+
+    master = (payload.get("master") or payload.get("master_account") or "").strip()
+    children = payload.get("children") or payload.get("child_accounts") or []
+    multipliers = payload.get("multipliers") or {}
+
+    if not master or not isinstance(children, list) or len(children) == 0:
+        raise HTTPException(status_code=400, detail="Master + at least one child required")
+
+    path = user_copy_file(owner_userid, sid)
+    prev, _sha = gh_get_json(path)
+    if not isinstance(prev, dict):
+        prev = {}
+
+    enabled = payload.get("enabled")
+    if enabled is None:
+        enabled = prev.get("enabled", False)
+
+    obj = {
+        "id": sid,
+        "name": name or sid,
+        "master": master,
+        "children": children,
+        "multipliers": multipliers if isinstance(multipliers, dict) else {},
+        "enabled": bool(enabled),
+        "created_at": prev.get("created_at") or utcnow_iso(),
+        "updated_at": utcnow_iso(),
+    }
+    gh_put_json(path, obj, message=f"save copy setup {owner_userid}:{sid}")
+    return {"ok": True, "setup": obj}
+
+
+@app.post("/enable_copy")
+async def enable_copy(request: Request, payload: dict = Body(...)):
+    return await _set_copy_enabled(request, payload, True)
+
+
+@app.post("/disable_copy")
+async def disable_copy(request: Request, payload: dict = Body(...)):
+    return await _set_copy_enabled(request, payload, False)
+
+
+async def _set_copy_enabled(request: Request, payload: dict, value: bool):
+    owner_userid = resolve_owner_userid(request, userid=payload.get("userid") or payload.get("owner_userid"))
+    if not owner_userid:
+        raise HTTPException(status_code=401, detail="Missing owner userid")
+    ids = payload.get("ids") or []
+    if not isinstance(ids, list):
+        ids = [ids]
+    updated, missing, errors = [], [], []
+    for sid in ids:
+        try:
+            sid = str(sid).strip()
+            if not sid:
+                continue
+            path = user_copy_file(owner_userid, sid)
+            obj, _sha = gh_get_json(path)
+            if not isinstance(obj, dict) or not obj:
+                missing.append(sid)
+                continue
+            obj["enabled"] = bool(value)
+            obj["updated_at"] = utcnow_iso()
+            gh_put_json(path, obj, message=f"{'enable' if value else 'disable'} copy {owner_userid}:{sid}")
+            updated.append(sid)
+        except Exception as e:
+            errors.append(str(e))
+    return {"ok": True, "updated": updated, "missing": missing, "errors": errors}
+
+
+@app.post("/delete_copy_setup")
+async def delete_copy_setup(request: Request, payload: dict = Body(...)):
+    return await _delete_copy_setup(request, payload)
+
+
+@app.post("/delete_copytrading_setup")
+async def delete_copytrading_setup(request: Request, payload: dict = Body(...)):
+    # compatibility alias
+    return await _delete_copy_setup(request, payload)
+
+
+async def _delete_copy_setup(request: Request, payload: dict):
+    owner_userid = resolve_owner_userid(request, userid=payload.get("userid") or payload.get("owner_userid"))
+    if not owner_userid:
+        raise HTTPException(status_code=401, detail="Missing owner userid")
+    ids = payload.get("ids") or []
+    if not isinstance(ids, list):
+        ids = [ids]
+    deleted, missing, errors = [], [], []
+    for sid in ids:
+        try:
+            sid = str(sid).strip()
+            if not sid:
+                continue
+            path = user_copy_file(owner_userid, sid)
+            _obj, sha = gh_get_json(path)
+            if not sha:
+                missing.append(sid)
+                continue
+            ok = gh_delete_path(path, sha, message=f"delete copy setup {owner_userid}:{sid}")
+            (deleted if ok else missing).append(sid)
+        except Exception as e:
+            errors.append(str(e))
+    return {"ok": True, "deleted": deleted, "missing": missing, "errors": errors}
+
