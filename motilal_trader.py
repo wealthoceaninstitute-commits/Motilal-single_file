@@ -680,34 +680,51 @@ def get_clients(request: Request, userid: str = None, user_id: str = None):
         print("Error loading clients:", e)
 
     return {"clients": clients}
-#///////////////////
-# Symbol DB
-#//////////////////
+# ============================================================
+# SYMBOL SEARCH (SQLite DB creation + typeahead endpoint)
+# ============================================================
 
+import os
+import sqlite3
+import threading
+import requests
+import pandas as pd
+from fastapi import Query
+
+# --- Source CSV (your repo) ---
 GITHUB_CSV_URL = "https://raw.githubusercontent.com/Pramod541988/Stock_List/main/security_id.csv"
-SQLITE_DB = "symbols.db"
-TABLE_NAME = "symbols"
+
+# --- DB config ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SYMBOL_DB_PATH = os.path.join(BASE_DIR, "symbols.db")
+SYMBOL_TABLE = "symbols"
+_symbol_db_lock = threading.Lock()
+
+def _ensure_dirs():
+    os.makedirs(BASE_DIR, exist_ok=True)
+
+def _symbol_db_exists() -> bool:
+    return os.path.exists(SYMBOL_DB_PATH)
 
 def refresh_symbol_db_from_github() -> str:
     """
     Download CSV and rebuild SQLite table 'symbols'.
-    Creates helpful indexes for fast LIKE queries.
-    Forces dtype=str to avoid 10666.0 float artifacts.
+    Keeps dtype=str to avoid float artifacts like 10666.0
+    Adds indexes for faster searching.
     """
     _ensure_dirs()
 
-    # Download -> dataframe
-    r = requests.get(SYMBOL_CSV_URL, timeout=30)
+    r = requests.get(GITHUB_CSV_URL, timeout=30)
     r.raise_for_status()
 
-    csv_path = os.path.join(os.path.dirname(SYMBOL_DB_PATH), "security_id.csv")
+    csv_path = os.path.join(BASE_DIR, "security_id.csv")
     with open(csv_path, "wb") as f:
         f.write(r.content)
 
-    # IMPORTANT: keep all columns as strings (no float .0)
+    # Keep everything as string to avoid .0 issues
     df = pd.read_csv(csv_path, dtype=str).fillna("")
 
-    # Optional: strip trailing ".0" if present in any ID columns
+    # Optional: strip trailing ".0" on ID-like columns if present
     for col in ("Security ID", "Min qty", "Min Qty", "MIN QTY", "MIN_QTY"):
         if col in df.columns:
             df[col] = df[col].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
@@ -717,7 +734,7 @@ def refresh_symbol_db_from_github() -> str:
         try:
             df.to_sql(SYMBOL_TABLE, conn, index=False, if_exists="replace")
 
-            # indexes (ignore failures if columns already indexed / absent)
+            # Indexes (safe if columns exist)
             try:
                 conn.execute(f'CREATE INDEX IF NOT EXISTS idx_sym_symbol ON {SYMBOL_TABLE} ("Stock Symbol");')
             except Exception:
@@ -735,23 +752,20 @@ def refresh_symbol_db_from_github() -> str:
         finally:
             conn.close()
 
+    print("✅ Symbol DB refreshed:", SYMBOL_DB_PATH)
     return "success"
-
-
-def _symbol_db_exists() -> bool:
-    return os.path.exists(SYMBOL_DB_PATH)
 
 def _lazy_init_symbol_db():
     """Build the DB once if it does not exist."""
     if not _symbol_db_exists():
         try:
+            print("ℹ️ Symbol DB not found. Building from GitHub CSV...")
             refresh_symbol_db_from_github()
         except Exception as e:
             print("❌ Symbol DB init failed:", e)
 
-
 @app.post("/refresh_symbols")
-def router_refresh_symbols():
+def refresh_symbols():
     """Force refresh the symbol master from GitHub into SQLite."""
     try:
         msg = refresh_symbol_db_from_github()
@@ -760,20 +774,23 @@ def router_refresh_symbols():
         return {"status": "error", "message": str(e)}
 
 @app.get("/search_symbols")
-def router_search_symbols(q: str = Query(""), exchange: str = Query("")):
+def search_symbols(q: str = Query(""), exchange: str = Query("")):
     """
     Typeahead search with ranking:
-      0 = exact match on whole query
-      1 = symbol startswith whole query
-      2 = symbol contains whole query (anywhere)
+      0 = exact match
+      1 = startswith
+      2 = contains
+    Returns:
+      {"results":[{"id":"EX|SYMBOL|SECID","text":"EX | SYMBOL"}]}
     """
     _lazy_init_symbol_db()
+
     raw = (q or "").strip().lower()
     exch = (exchange or "").strip().upper()
+
     if not raw:
         return {"results": []}
 
-    # split into words for WHERE (AND-of-words)
     words = [w for w in raw.split() if w]
     if not words:
         return {"results": []}
@@ -782,11 +799,12 @@ def router_search_symbols(q: str = Query(""), exchange: str = Query("")):
     for w in words:
         where_sql.append('LOWER([Stock Symbol]) LIKE ?')
         where_params.append(f"%{w}%")
+
     if exch:
         where_sql.append('UPPER(Exchange) = ?')
         where_params.append(exch)
 
-    # ranking based on full raw query (not just first word)
+    # Ranking based on full query
     rank_params = [raw, f"{raw}%", f"%{raw}%"]
 
     sql = f"""
@@ -814,8 +832,10 @@ def router_search_symbols(q: str = Query(""), exchange: str = Query("")):
         finally:
             conn.close()
 
-    results = [
-        {"id": f"{r[0]}|{r[1]}|{r[2]}", "text": f"{r[0]} | {r[1]}"}
-        for r in rows
-    ]
+    results = [{"id": f"{r[0]}|{r[1]}|{r[2]}", "text": f"{r[0]} | {r[1]}"} for r in rows]
     return {"results": results}
+
+# Optional: build once on server start (recommended for Render)
+@app.on_event("startup")
+def _startup_init_symbols():
+    _lazy_init_symbol_db()
