@@ -1402,6 +1402,9 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
     owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
 
     positions_data = {"open": [], "closed": []}
+
+    # MUST exist as a global above this function:
+    # position_meta = {}
     position_meta.clear()
 
     # sessions are keyed by client_id, each session is a dict with mofsl + owner_userid
@@ -1409,14 +1412,16 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
         try:
             if not isinstance(sess, dict):
                 continue
+
+            # per-user filter
             if owner_userid and str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
                 continue
 
             name = sess.get("name", "") or client_id
             mofsl = sess.get("mofsl")
-            userid_ = sess.get("userid", client_id)
+            client_userid = sess.get("userid", client_id)
 
-            if not mofsl or not userid_:
+            if not mofsl or not client_userid:
                 continue
 
             response = mofsl.GetPosition()
@@ -1433,7 +1438,6 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
                 quantity = buy_qty - sell_qty
 
                 booked_profit = float(pos.get("bookedprofitloss", 0) or 0)
-
                 buy_amt = float(pos.get("buyamount", 0) or 0)
                 sell_amt = float(pos.get("sellamount", 0) or 0)
 
@@ -1449,22 +1453,23 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
                 else:
                     net_profit = booked_profit
 
-                symbol = pos.get("symbol", "") or ""
-                exchange = pos.get("exchange", "") or ""
-                symboltoken = pos.get("symboltoken", "") or ""
-                producttype = pos.get("productname", "") or ""
+                symbol = (pos.get("symbol", "") or "").strip()
+                exchange = (pos.get("exchange", "") or "").strip()
+                symboltoken = (pos.get("symboltoken", "") or "").strip()
+                producttype = (pos.get("productname", "") or "").strip()
 
-                if quantity != 0:
-                    position_meta[(name, symbol)] = {
+                # Save meta only for OPEN positions (used by /close_position)
+                if quantity != 0 and symbol:
+                    position_meta[(client_userid, symbol)] = {
                         "exchange": exchange,
                         "symboltoken": symboltoken,
                         "producttype": producttype,
-                        "client_id": userid_
+                        "client_id": client_userid
                     }
 
                 row = {
                     "name": name,
-                    "client_id": userid_,
+                    "client_id": client_userid,
                     "symbol": symbol,
                     "quantity": quantity,
                     "buy_avg": round(buy_avg, 2),
@@ -1481,7 +1486,6 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
             print(f"❌ Error fetching positions for {client_id}: {e}")
 
     return positions_data
-
 
 @app.post("/close_position")
 async def close_position(request: Request, payload: dict = Body(...)):
