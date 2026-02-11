@@ -1604,3 +1604,159 @@ async def close_position(request: Request, payload: dict = Body(...)):
         t.join()
 
     return {"message": messages}
+
+
+#/////////////////////////////////////////////
+#          HOLDINGS AND SUMMARY
+#////////////////////////////////////////////
+
+# ------------------------------------------------------------
+# HOLDINGS + SUMMARY (multi-user, session-based, safe casting)
+# ------------------------------------------------------------
+
+# cache last computed summary for /get_summary
+summary_data_global = {}
+
+@app.get("/get_holdings")
+def get_holdings(request: Request, userid: str = None, user_id: str = None):
+    owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
+
+    holdings_data = []
+    summary_data = {}
+
+    # iterate sessions like orders/positions
+    for client_id, sess in list(mofsl_sessions.items()):
+        try:
+            if not isinstance(sess, dict):
+                continue
+
+            # per-user filter
+            if owner_userid and str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
+                continue
+
+            name = str(sess.get("name", "") or client_id)
+            mofsl = sess.get("mofsl")
+            client_userid = str(sess.get("userid", client_id))
+
+            if not mofsl or not client_userid:
+                continue
+
+            # ---------------------------
+            # Fetch holdings from broker
+            # ---------------------------
+            # Motilal DP holdings call in CT_FastAPI was:
+            # holdings_response = Mofsl.GetDPHolding(userid)
+            # Here we try instance first, then fallback to global class if present.
+            holdings_response = None
+            if hasattr(mofsl, "GetDPHolding"):
+                holdings_response = mofsl.GetDPHolding(client_userid)
+            else:
+                MofslCls = globals().get("Mofsl") or globals().get("MofslAPI") or globals().get("MOFSL")
+                if MofslCls and hasattr(MofslCls, "GetDPHolding"):
+                    holdings_response = MofslCls.GetDPHolding(client_userid)
+
+            if not holdings_response or holdings_response.get("status") != "SUCCESS":
+                continue
+
+            holdings_list = holdings_response.get("data") or []
+            if not isinstance(holdings_list, list):
+                continue
+
+            invested = 0.0
+            total_pnl = 0.0
+
+            for h in holdings_list:
+                try:
+                    # symbol + scripcode
+                    symbol = str(h.get("scripname") or h.get("symbol") or "").strip()
+                    scripcode = h.get("scripcode") or h.get("scripCode") or h.get("token") or 0
+
+                    # qty + avg
+                    quantity = float(h.get("quantity") or 0)
+                    buy_avg = float(h.get("buyavgprice") or h.get("avgprice") or h.get("averageprice") or 0)
+
+                    # LTP (CT used GetLtp and divided by 100)
+                    ltp = 0.0
+                    try:
+                        ltp_request = {"clientcode": client_userid, "exchange": "NSE", "scripcode": int(scripcode)}
+                        ltp_response = None
+
+                        if hasattr(mofsl, "GetLtp"):
+                            ltp_response = mofsl.GetLtp(ltp_request)
+                        else:
+                            MofslCls = globals().get("Mofsl") or globals().get("MofslAPI") or globals().get("MOFSL")
+                            if MofslCls and hasattr(MofslCls, "GetLtp"):
+                                ltp_response = MofslCls.GetLtp(ltp_request)
+
+                        raw_ltp = (ltp_response or {}).get("data", {}).get("ltp", 0) or 0
+                        ltp = float(raw_ltp) / 100.0
+                    except Exception:
+                        ltp = 0.0
+
+                    pnl = round((ltp - buy_avg) * quantity, 2)
+                    invested += quantity * buy_avg
+                    total_pnl += pnl
+
+                    holdings_data.append({
+                        "name": name,
+                        "symbol": symbol,
+                        "quantity": quantity,
+                        "buy_avg": round(buy_avg, 2),
+                        "ltp": round(ltp, 2),
+                        "pnl": pnl
+                    })
+
+                except Exception as e:
+                    print(f"❌ Holding row parse error for {name}: {e}")
+
+            # ---------------------------
+            # Summary (per client)
+            # ---------------------------
+            # capital: prefer session, else fallback to old map if you still have it
+            capital = sess.get("capital", None)
+            if capital is None:
+                cap_map = globals().get("client_capital_map", {}) or {}
+                capital = cap_map.get(name, 0)
+
+            try:
+                capital = float(capital or 0)
+            except Exception:
+                capital = 0.0
+
+            current_value = invested + total_pnl
+
+            # available margin: use existing helper if present
+            available_margin = 0.0
+            try:
+                if "get_available_margin" in globals() and callable(globals()["get_available_margin"]):
+                    available_margin = float(globals()["get_available_margin"](mofsl, client_userid) or 0)
+            except Exception:
+                available_margin = 0.0
+
+            summary_data[name] = {
+                "name": name,
+                "capital": round(capital, 2),
+                "invested": round(invested, 2),
+                "pnl": round(total_pnl, 2),
+                "current_value": round(current_value, 2),
+                "available_margin": round(available_margin, 2),
+            }
+
+        except Exception as e:
+            print(f"❌ Error fetching holdings for {client_id}: {e}")
+
+    # cache for /get_summary
+    global summary_data_global
+    summary_data_global = summary_data
+
+    return {"holdings": holdings_data, "summary": list(summary_data.values())}
+
+
+@app.get("/get_summary")
+def get_summary(request: Request, userid: str = None, user_id: str = None):
+    owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
+
+    # If you want strict isolation per user in-memory, we can store summary per owner_userid.
+    # For now: /get_holdings already filters by owner_userid and refreshes the cache.
+    data = globals().get("summary_data_global", {}) or {}
+    return list(data.values())
