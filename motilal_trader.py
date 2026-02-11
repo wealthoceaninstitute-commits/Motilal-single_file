@@ -1772,30 +1772,29 @@ import time
 from datetime import datetime
 from fastapi import Body, Request, HTTPException
 
-def _safe_int(x, default=0):
+
+def _safe_int(v, default=0):
     try:
-        return int(float(x))
+        return int(float(v))
     except Exception:
         return default
 
-def _safe_float(x, default=0.0):
+def _safe_float(v, default=0.0):
     try:
-        return float(x)
+        return float(v)
     except Exception:
         return default
 
-def _parse_symbol_token(data: dict):
+def _parse_symbol_token(payload: dict):
     """
-    Frontend often sends:
-      symbol = "NSE|SBIN|3045"
-    or sends symboltoken separately.
-    Returns: (exchange, symboltoken)
+    Frontend sends symbol like: "NSE|PNB|XXXX"
+    or can send symboltoken separately.
     """
-    symbol = (data.get("symbol") or "").strip()
-    exchange_val = (data.get("exchange") or "").strip().upper()
+    symbol = (payload.get("symbol") or "").strip()
+    exchange_val = (payload.get("exchange") or "").strip().upper()
 
     exch = exchange_val or "NSE"
-    token = data.get("symboltoken") or data.get("security_id") or data.get("token")
+    token = payload.get("symboltoken") or payload.get("security_id") or payload.get("token")
 
     if symbol and "|" in symbol:
         parts = symbol.split("|")
@@ -1805,51 +1804,55 @@ def _parse_symbol_token(data: dict):
 
     return exch, _safe_int(token, 0)
 
-def _get_group_members_and_multiplier(owner_userid: str, group_id_or_name: str):
+def _resolve_owner_userid_local(request: Request, payload: dict):
+    # Prefer your existing resolve_owner_userid if you already have it
+    if "resolve_owner_userid" in globals():
+        try:
+            return globals()["resolve_owner_userid"](
+                request,
+                userid=payload.get("userid"),
+                user_id=payload.get("user_id"),
+            )
+        except Exception:
+            pass
+    return (request.headers.get("x-user-id") or payload.get("owner_userid") or payload.get("userid") or payload.get("user_id") or "").strip()
+
+def _get_group_members(owner_userid: str, group_name: str):
     """
-    Loads group JSON saved by your /add_group or /edit_group:
-      { id, name, multiplier, members: [...] }
+    Uses your per-user GitHub group file convention (already used in your backend).
+    Expected group JSON:
+      { "members": [...], "multiplier": 1.0 }
     """
     try:
-        path = user_group_file(owner_userid, group_id_or_name)
+        # if you already have a helper, use it
+        if "user_group_file" in globals():
+            path = globals()["user_group_file"](owner_userid, group_name)
+        else:
+            path = f"data/users/{owner_userid}/groups/{group_name}.json"
+
         obj, _sha = gh_get_json(path)
-        if not isinstance(obj, dict) or not obj:
+        if not isinstance(obj, dict):
             return [], 1.0
+
         members = obj.get("members") or []
         if not isinstance(members, list):
             members = []
+        members = [str(m).strip() for m in members if str(m).strip()]
+
         try:
             mult = float(obj.get("multiplier", 1) or 1)
         except Exception:
             mult = 1.0
         if mult <= 0:
             mult = 1.0
-        # members are expected to be client_ids/userids
-        members = [str(m).strip() for m in members if str(m).strip()]
+
         return members, mult
     except Exception:
         return [], 1.0
 
 @app.post("/place_order")
 async def place_order(request: Request, payload: dict = Body(...)):
-    """
-    Expects the same payload style as your frontend TradeForm.
-
-    Key fields used:
-      clients: [...]
-      groupacc: bool
-      groups: [...]
-      quantityinlot: int
-      diffQty: bool
-      perClientQty: {clientid: qty}
-      multiplier: bool  (apply group multiplier when groupacc)
-      price/triggerprice/etc
-    """
-    owner_userid = resolve_owner_userid(
-        request,
-        userid=(payload or {}).get("userid") or (payload or {}).get("user_id") or (payload or {}).get("owner_userid"),
-        user_id=(payload or {}).get("user_id"),
-    )
+    owner_userid = _resolve_owner_userid_local(request, payload or {})
     if not owner_userid:
         raise HTTPException(status_code=401, detail="Missing owner userid")
 
@@ -1858,6 +1861,7 @@ async def place_order(request: Request, payload: dict = Body(...)):
     if not symboltoken:
         raise HTTPException(status_code=400, detail="Missing/invalid symbol token")
 
+    # what frontend sends
     groupacc = bool(data.get("groupacc", False))
     groups = data.get("groups", []) or []
     clients = data.get("clients", []) or []
@@ -1878,19 +1882,15 @@ async def place_order(request: Request, payload: dict = Body(...)):
     disclosedquantity = _safe_int(data.get("disclosedquantity", 0), 0)
     amoorder = (data.get("amoorder") or "N").strip().upper()
 
-    # -------------------------
-    # Build final target list
-    # -------------------------
-    targets = []  # list of tuples: (tag, client_id, qty)
+    # Build targets: list of (tag, client_id, qty)
+    targets = []
 
     if groupacc:
-        # group-based placement
         for g in groups:
             gname = str(g).strip()
             if not gname:
                 continue
-            members, gmult = _get_group_members_and_multiplier(owner_userid, gname)
-
+            members, gmult = _get_group_members(owner_userid, gname)
             for cid in members:
                 base_qty = quantityinlot
                 if diffQty:
@@ -1899,34 +1899,36 @@ async def place_order(request: Request, payload: dict = Body(...)):
                     base_qty = max(1, int(round(base_qty * float(gmult))))
                 targets.append((gname, cid, base_qty))
     else:
-        # direct clients placement
         for cid in clients:
             cid = str(cid).strip()
             if not cid:
                 continue
-            this_qty = quantityinlot
+            q = quantityinlot
             if diffQty:
-                this_qty = _safe_int(perClientQty.get(cid, this_qty), this_qty)
-            targets.append(("", cid, this_qty))
+                q = _safe_int(perClientQty.get(cid, q), q)
+            targets.append(("", cid, q))
 
     if not targets:
         raise HTTPException(status_code=400, detail="No target clients/groups selected")
 
-    # -------------------------
-    # Place orders in parallel
-    # -------------------------
     responses = {}
     lock = threading.Lock()
     threads = []
 
-    def _place_one(tag: str, client_id: str, this_qty: int):
+    def _place_one(tag: str, client_id: str, qty: int):
         key = f"{tag}:{client_id}" if tag else client_id
 
-        sess = mofsl_sessions.get(client_id)
-        # session must belong to this logged-in owner
-        if not isinstance(sess, dict) or str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
+        sess = mofsl_sessions.get(str(client_id))
+        if not isinstance(sess, dict):
             with lock:
-                responses[key] = {"status": "ERROR", "message": "Session not found for this user"}
+                responses[key] = {"status": "ERROR", "message": "Session not found"}
+            return
+
+        # ✅ important multi-user safety: allow only same owner
+        sess_owner = (sess.get("owner_userid") or "").strip()
+        if sess_owner and sess_owner != str(owner_userid).strip():
+            with lock:
+                responses[key] = {"status": "ERROR", "message": "Session belongs to another user"}
             return
 
         mofsl = sess.get("mofsl")
@@ -1946,7 +1948,7 @@ async def place_order(request: Request, payload: dict = Body(...)):
             "orderduration": orderduration,
             "price": float(price),
             "triggerprice": float(triggerprice),
-            "quantityinlot": int(max(1, this_qty)),
+            "quantityinlot": int(max(1, qty)),
             "disclosedquantity": int(disclosedquantity),
             "amoorder": amoorder,
             "algoid": "",
