@@ -1760,3 +1760,525 @@ def get_summary(request: Request, userid: str = None, user_id: str = None):
     # For now: /get_holdings already filters by owner_userid and refreshes the cache.
     data = globals().get("summary_data_global", {}) or {}
     return list(data.values())
+
+
+# ============================================================
+# PLACE ORDER (multi-user, sessions keyed by client_id)
+# ============================================================
+
+import threading
+import time
+from datetime import datetime
+from fastapi import Body, Request, HTTPException
+
+def _safe_int(x, default=0):
+    try:
+        return int(float(x))
+    except Exception:
+        return default
+
+def _safe_float(x, default=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+def _parse_symbol_token(data: dict):
+    """
+    Frontend often sends:
+      symbol = "NSE|SBIN|3045"
+    or sends symboltoken separately.
+    Returns: (exchange, symboltoken)
+    """
+    symbol = (data.get("symbol") or "").strip()
+    exchange_val = (data.get("exchange") or "").strip().upper()
+
+    exch = exchange_val or "NSE"
+    token = data.get("symboltoken") or data.get("security_id") or data.get("token")
+
+    if symbol and "|" in symbol:
+        parts = symbol.split("|")
+        if len(parts) >= 3:
+            exch = (parts[0] or exch).strip().upper()
+            token = parts[2].strip()
+
+    return exch, _safe_int(token, 0)
+
+def _get_group_members_and_multiplier(owner_userid: str, group_id_or_name: str):
+    """
+    Loads group JSON saved by your /add_group or /edit_group:
+      { id, name, multiplier, members: [...] }
+    """
+    try:
+        path = user_group_file(owner_userid, group_id_or_name)
+        obj, _sha = gh_get_json(path)
+        if not isinstance(obj, dict) or not obj:
+            return [], 1.0
+        members = obj.get("members") or []
+        if not isinstance(members, list):
+            members = []
+        try:
+            mult = float(obj.get("multiplier", 1) or 1)
+        except Exception:
+            mult = 1.0
+        if mult <= 0:
+            mult = 1.0
+        # members are expected to be client_ids/userids
+        members = [str(m).strip() for m in members if str(m).strip()]
+        return members, mult
+    except Exception:
+        return [], 1.0
+
+@app.post("/place_order")
+async def place_order(request: Request, payload: dict = Body(...)):
+    """
+    Expects the same payload style as your frontend TradeForm.
+
+    Key fields used:
+      clients: [...]
+      groupacc: bool
+      groups: [...]
+      quantityinlot: int
+      diffQty: bool
+      perClientQty: {clientid: qty}
+      multiplier: bool  (apply group multiplier when groupacc)
+      price/triggerprice/etc
+    """
+    owner_userid = resolve_owner_userid(
+        request,
+        userid=(payload or {}).get("userid") or (payload or {}).get("user_id") or (payload or {}).get("owner_userid"),
+        user_id=(payload or {}).get("user_id"),
+    )
+    if not owner_userid:
+        raise HTTPException(status_code=401, detail="Missing owner userid")
+
+    data = payload or {}
+    exch, symboltoken = _parse_symbol_token(data)
+    if not symboltoken:
+        raise HTTPException(status_code=400, detail="Missing/invalid symbol token")
+
+    groupacc = bool(data.get("groupacc", False))
+    groups = data.get("groups", []) or []
+    clients = data.get("clients", []) or []
+
+    diffQty = bool(data.get("diffQty", False))
+    multiplier_on = bool(data.get("multiplier", False))
+
+    quantityinlot = _safe_int(data.get("quantityinlot", 0), 0)
+    perClientQty = data.get("perClientQty", {}) or {}
+
+    action = (data.get("action") or "").strip().upper()
+    ordertype = (data.get("ordertype") or "").strip().upper()
+    producttype = (data.get("producttype") or "").strip().upper()
+    orderduration = (data.get("orderduration") or "").strip().upper()
+
+    price = _safe_float(data.get("price", 0), 0.0)
+    triggerprice = _safe_float(data.get("triggerprice", 0), 0.0)
+    disclosedquantity = _safe_int(data.get("disclosedquantity", 0), 0)
+    amoorder = (data.get("amoorder") or "N").strip().upper()
+
+    # -------------------------
+    # Build final target list
+    # -------------------------
+    targets = []  # list of tuples: (tag, client_id, qty)
+
+    if groupacc:
+        # group-based placement
+        for g in groups:
+            gname = str(g).strip()
+            if not gname:
+                continue
+            members, gmult = _get_group_members_and_multiplier(owner_userid, gname)
+
+            for cid in members:
+                base_qty = quantityinlot
+                if diffQty:
+                    base_qty = _safe_int(perClientQty.get(cid, base_qty), base_qty)
+                if multiplier_on:
+                    base_qty = max(1, int(round(base_qty * float(gmult))))
+                targets.append((gname, cid, base_qty))
+    else:
+        # direct clients placement
+        for cid in clients:
+            cid = str(cid).strip()
+            if not cid:
+                continue
+            this_qty = quantityinlot
+            if diffQty:
+                this_qty = _safe_int(perClientQty.get(cid, this_qty), this_qty)
+            targets.append(("", cid, this_qty))
+
+    if not targets:
+        raise HTTPException(status_code=400, detail="No target clients/groups selected")
+
+    # -------------------------
+    # Place orders in parallel
+    # -------------------------
+    responses = {}
+    lock = threading.Lock()
+    threads = []
+
+    def _place_one(tag: str, client_id: str, this_qty: int):
+        key = f"{tag}:{client_id}" if tag else client_id
+
+        sess = mofsl_sessions.get(client_id)
+        # session must belong to this logged-in owner
+        if not isinstance(sess, dict) or str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
+            with lock:
+                responses[key] = {"status": "ERROR", "message": "Session not found for this user"}
+            return
+
+        mofsl = sess.get("mofsl")
+        uid = sess.get("userid") or client_id
+        if not mofsl or not uid:
+            with lock:
+                responses[key] = {"status": "ERROR", "message": "Invalid session"}
+            return
+
+        order_payload = {
+            "clientcode": str(uid),
+            "exchange": exch,
+            "symboltoken": int(symboltoken),
+            "buyorsell": action,
+            "ordertype": ordertype,
+            "producttype": producttype,
+            "orderduration": orderduration,
+            "price": float(price),
+            "triggerprice": float(triggerprice),
+            "quantityinlot": int(max(1, this_qty)),
+            "disclosedquantity": int(disclosedquantity),
+            "amoorder": amoorder,
+            "algoid": "",
+            "goodtilldate": "",
+            "tag": (tag or "")
+        }
+
+        try:
+            resp = mofsl.PlaceOrder(order_payload)
+        except Exception as e:
+            resp = {"status": "ERROR", "message": str(e)}
+
+        with lock:
+            responses[key] = resp
+
+    for (tag, cid, q) in targets:
+        t = threading.Thread(target=_place_one, args=(tag, cid, q))
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join()
+
+    return {"success": True, "responses": responses}
+
+
+# ============================================================
+# COPY TRADING ENGINE (multi-user GitHub setups)
+# Order placement + cancel propagation
+# ============================================================
+
+import sqlite3
+
+# maps: {setup_key: {master_order_id: {child_id: child_order_id}}}
+order_mapping = {}
+processed_order_ids_placed = {}     # {setup_key: set()}
+processed_order_ids_canceled = {}   # {setup_key: set()}
+
+def normalize_ordertype_copytrade(s: str) -> str:
+    s = (s or "").upper()
+    collapsed = s.replace("_", "").replace(" ", "").replace("-", "")
+    return "STOPLOSS" if collapsed == "STOPLOSS" else s
+
+def _list_all_owner_userids():
+    """
+    Looks at GitHub folder: data/users
+    and returns directory names (userids).
+    """
+    owners = []
+    try:
+        entries = gh_list_dir("data/users")
+        for ent in entries or []:
+            if isinstance(ent, dict) and ent.get("type") == "dir":
+                nm = (ent.get("name") or "").strip()
+                if nm:
+                    owners.append(nm)
+    except Exception:
+        owners = []
+    return owners
+
+def load_active_copy_setups_all():
+    """
+    Returns list of setups across all users:
+      each setup dict includes: owner_userid, id, name, master, children, multipliers
+    """
+    setups = []
+    for owner in _list_all_owner_userids():
+        folder = user_copy_dir(owner)
+        try:
+            entries = gh_list_dir(folder)
+            for ent in entries or []:
+                if not isinstance(ent, dict) or ent.get("type") != "file":
+                    continue
+                path = ent.get("path") or ""
+                name = ent.get("name") or ""
+                if not path or not str(name).endswith(".json"):
+                    continue
+                obj, _sha = gh_get_json(path)
+                if not isinstance(obj, dict) or not obj:
+                    continue
+                if not bool(obj.get("enabled", False)):
+                    continue
+                sid = (obj.get("id") or obj.get("name") or name.replace(".json", "")).strip()
+                setups.append({
+                    "owner_userid": owner,
+                    "id": sid,
+                    "name": obj.get("name", sid),
+                    "master": (obj.get("master") or obj.get("master_account") or "").strip(),
+                    "children": obj.get("children") or obj.get("child_accounts") or [],
+                    "multipliers": obj.get("multipliers") or {},
+                })
+        except Exception:
+            continue
+    return setups
+
+def get_session_by_clientid(client_id: str):
+    """
+    Sessions are keyed by client_id (userid).
+    Returns (name, mofsl, userid, owner_userid) or (None,...)
+    """
+    sess = mofsl_sessions.get(str(client_id).strip())
+    if not isinstance(sess, dict):
+        return None, None, None, None
+    return sess.get("name"), sess.get("mofsl"), sess.get("userid"), sess.get("owner_userid")
+
+def fetch_master_orders(mofsl_master, master_userid: str):
+    """
+    Match your /get_orders logic: GetOrderBook({clientcode, datetimestamp})
+    """
+    try:
+        today_date = datetime.now().strftime("%d-%b-%Y 09:00:00")
+        order_book_info = {"clientcode": str(master_userid), "datetimestamp": today_date}
+        resp = mofsl_master.GetOrderBook(order_book_info)
+        if not resp or resp.get("status") != "SUCCESS":
+            return []
+        data = resp.get("data") or []
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+def _min_qty_from_symbol_db(symboltoken):
+    """
+    Optional: if your symbols sqlite exists and has Min Qty.
+    Falls back to 1.
+    """
+    try:
+        # These globals exist in CT_FastAPI-style code. If missing, fallback.
+        SQLITE_DB = globals().get("SQLITE_DB")
+        symbol_db_lock = globals().get("symbol_db_lock")
+
+        if not SQLITE_DB:
+            return 1
+
+        conn = None
+        if symbol_db_lock:
+            with symbol_db_lock:
+                conn = sqlite3.connect(SQLITE_DB)
+                cur = conn.cursor()
+                cur.execute("SELECT [Min Qty] FROM symbols WHERE [Security ID]=?", (str(symboltoken),))
+                row = cur.fetchone()
+                conn.close()
+        else:
+            conn = sqlite3.connect(SQLITE_DB)
+            cur = conn.cursor()
+            cur.execute("SELECT [Min Qty] FROM symbols WHERE [Security ID]=?", (str(symboltoken),))
+            row = cur.fetchone()
+            conn.close()
+
+        if row and row[0]:
+            return max(1, int(row[0]))
+    except Exception:
+        pass
+    return 1
+
+def process_copy_order(order: dict, setup: dict):
+    """
+    Copies NEW master orders to children and propagates CANCEL.
+    """
+    owner = setup.get("owner_userid") or ""
+    setup_name = setup.get("name") or setup.get("id") or "setup"
+    setup_key = f"{owner}:{setup.get('id') or setup_name}"
+
+    master_order_id = order.get("uniqueorderid")
+    order_time_str = order.get("recordinserttime")
+
+    if (not master_order_id or str(master_order_id) == "0" or
+        not order_time_str or order_time_str in ("", "0", None)):
+        return
+
+    # parse order time and AMO flag
+    try:
+        order_time_dt = datetime.strptime(order_time_str, "%d-%b-%Y %H:%M:%S")
+        order_time = int(order_time_dt.timestamp())
+        if order_time_dt.time() < datetime.strptime("09:00:00", "%H:%M:%S").time() or \
+           order_time_dt.time() > datetime.strptime("15:30:00", "%H:%M:%S").time():
+            amo_flag = "Y"
+        else:
+            amo_flag = "N"
+    except Exception:
+        return
+
+    order_status = (order.get("orderstatus") or "").upper()
+    order_type = (order.get("ordertype") or "").upper()
+
+    processed_order_ids_placed.setdefault(setup_key, set())
+    processed_order_ids_canceled.setdefault(setup_key, set())
+    order_mapping.setdefault(setup_key, {})
+
+    current_time = int(time.time())
+
+    # -----------------------
+    # Placement copy
+    # -----------------------
+    if order_type == "MARKET" or order_status in ("CONFIRM", "TRADED"):
+        if master_order_id in processed_order_ids_placed[setup_key]:
+            return
+        if (current_time - order_time) > 5:
+            return  # too old, skip copy
+
+        children = setup.get("children") or []
+        multipliers = setup.get("multipliers") or {}
+
+        for child_id in children:
+            child_id = str(child_id).strip()
+            if not child_id:
+                continue
+
+            # child must be logged-in and belong to same owner
+            cname, mofsl_child, uid_child, owner_child = get_session_by_clientid(child_id)
+            if not mofsl_child or str(owner_child).strip() != str(owner).strip():
+                continue
+
+            try:
+                mult = int(multipliers.get(child_id, 1) or 1)
+            except Exception:
+                mult = 1
+            if mult <= 0:
+                mult = 1
+
+            min_qty = _min_qty_from_symbol_db(order.get("symboltoken"))
+            master_qty = _safe_int(order.get("orderqty", 1), 1)
+            total_qty = max(1, master_qty * mult)
+
+            # keep lot alignment like CT logic (simple)
+            adjusted_qty = max(1, int(total_qty // max(1, min_qty)))
+
+            child_order_details = {
+                "clientcode": str(uid_child or child_id),
+                "exchange": (order.get("exchange") or "NSE"),
+                "symboltoken": _safe_int(order.get("symboltoken"), 0),
+                "buyorsell": (order.get("buyorsell") or ""),
+                "ordertype": normalize_ordertype_copytrade(order.get("ordertype", "")),
+                "producttype": (order.get("producttype") or "CNC"),
+                "orderduration": (order.get("validity") or order.get("orderduration") or "DAY"),
+                "price": _safe_float(order.get("price", 0), 0.0),
+                "triggerprice": _safe_float(order.get("triggerprice", 0), 0.0),
+                "quantityinlot": int(adjusted_qty),
+                "disclosedquantity": 0,
+                "amoorder": amo_flag,
+                "algoid": "",
+                "goodtilldate": "",
+                "tag": setup_name
+            }
+
+            try:
+                resp = mofsl_child.PlaceOrder(child_order_details)
+                child_order_id = (resp or {}).get("uniqueorderid")
+                if child_order_id:
+                    order_mapping[setup_key].setdefault(master_order_id, {})[child_id] = child_order_id
+            except Exception:
+                pass
+
+        processed_order_ids_placed[setup_key].add(master_order_id)
+        return
+
+    # -----------------------
+    # Cancel propagation
+    # -----------------------
+    if order_status == "CANCEL":
+        if master_order_id in processed_order_ids_canceled[setup_key]:
+            return
+        if (current_time - order_time) > 5:
+            processed_order_ids_canceled[setup_key].add(master_order_id)
+            return
+
+        child_map = order_mapping.get(setup_key, {}).get(master_order_id, {})
+        if not child_map:
+            processed_order_ids_canceled[setup_key].add(master_order_id)
+            return
+
+        for child_id, child_order_id in (child_map or {}).items():
+            cname, mofsl_child, uid_child, owner_child = get_session_by_clientid(child_id)
+            if not mofsl_child or str(owner_child).strip() != str(owner).strip():
+                continue
+            try:
+                mofsl_child.CancelOrder(child_order_id, str(uid_child or child_id))
+            except Exception:
+                pass
+
+        processed_order_ids_canceled[setup_key].add(master_order_id)
+
+def synchronize_copy_trading():
+    setups = load_active_copy_setups_all()
+    if not setups:
+        return
+
+    threads = []
+
+    def handle_setup(setup):
+        owner = setup.get("owner_userid") or ""
+        master_id = (setup.get("master") or "").strip()
+        if not master_id:
+            return
+
+        mname, mofsl_master, uid_master, owner_master = get_session_by_clientid(master_id)
+        if not mofsl_master or str(owner_master).strip() != str(owner).strip():
+            return
+
+        master_orders = fetch_master_orders(mofsl_master, uid_master or master_id)
+        for order in master_orders or []:
+            try:
+                process_copy_order(order, setup)
+            except Exception:
+                continue
+
+    for setup in setups:
+        t = threading.Thread(target=handle_setup, args=(setup,))
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join()
+
+def motilal_copy_trading_loop():
+    print("✅ Motilal Copy Trading Engine started")
+    while True:
+        try:
+            synchronize_copy_trading()
+        except Exception as e:
+            print("❌ Copy trading sync error:", str(e))
+        time.sleep(1)
+
+# Call this once from your existing startup (or add a startup event below)
+_copy_thread_started = False
+def start_copy_trading_thread():
+    global _copy_thread_started
+    if _copy_thread_started:
+        return
+    _copy_thread_started = True
+    threading.Thread(target=motilal_copy_trading_loop, daemon=True).start()
+
+# If you already have @app.on_event("startup") in your file, do NOT add another.
+# Instead, call start_copy_trading_thread() inside your existing startup.
+@app.on_event("startup")
+def _startup_copy_trading():
+    start_copy_trading_thread()
