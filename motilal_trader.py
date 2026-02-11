@@ -1403,8 +1403,8 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
 
     positions_data = {"open": [], "closed": []}
 
-    # MUST exist as a global above this function:
-    # position_meta = {}
+    # ✅ ensure position_meta exists at runtime (prevents NameError on Render)
+    position_meta = globals().setdefault("position_meta", {})
     position_meta.clear()
 
     # sessions are keyed by client_id, each session is a dict with mofsl + owner_userid
