@@ -1392,3 +1392,203 @@ async def cancel_order(request: Request, payload: dict = Body(...)):
         t.join()
 
     return {"message": response_messages}
+
+#/////////////////////////////////////////////////////////////
+#               POSITION
+#////////////////////////////////////////////////////////////
+
+@app.get("/get_positions")
+def get_positions(request: Request, userid: str = None, user_id: str = None):
+    owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
+
+    positions_data = {"open": [], "closed": []}
+    position_meta.clear()
+
+    # sessions are keyed by client_id, each session is a dict with mofsl + owner_userid
+    for client_id, sess in list(mofsl_sessions.items()):
+        try:
+            if not isinstance(sess, dict):
+                continue
+            if owner_userid and str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
+                continue
+
+            name = sess.get("name", "") or client_id
+            mofsl = sess.get("mofsl")
+            userid_ = sess.get("userid", client_id)
+
+            if not mofsl or not userid_:
+                continue
+
+            response = mofsl.GetPosition()
+            if response and response.get("status") != "SUCCESS":
+                continue
+
+            positions = response.get("data", []) if response else []
+            if not isinstance(positions, list):
+                positions = []
+
+            for pos in positions:
+                buy_qty = float(pos.get("buyquantity", 0) or 0)
+                sell_qty = float(pos.get("sellquantity", 0) or 0)
+                quantity = buy_qty - sell_qty
+
+                booked_profit = float(pos.get("bookedprofitloss", 0) or 0)
+
+                buy_amt = float(pos.get("buyamount", 0) or 0)
+                sell_amt = float(pos.get("sellamount", 0) or 0)
+
+                buy_avg = (buy_amt / buy_qty) if buy_qty > 0 else 0.0
+                sell_avg = (sell_amt / sell_qty) if sell_qty > 0 else 0.0
+
+                ltp = float(pos.get("LTP", 0) or 0)
+
+                if quantity > 0:
+                    net_profit = (ltp - buy_avg) * quantity
+                elif quantity < 0:
+                    net_profit = (sell_avg - buy_avg) * abs(quantity)
+                else:
+                    net_profit = booked_profit
+
+                symbol = pos.get("symbol", "") or ""
+                exchange = pos.get("exchange", "") or ""
+                symboltoken = pos.get("symboltoken", "") or ""
+                producttype = pos.get("productname", "") or ""
+
+                if quantity != 0:
+                    position_meta[(name, symbol)] = {
+                        "exchange": exchange,
+                        "symboltoken": symboltoken,
+                        "producttype": producttype,
+                        "client_id": userid_
+                    }
+
+                row = {
+                    "name": name,
+                    "client_id": userid_,
+                    "symbol": symbol,
+                    "quantity": quantity,
+                    "buy_avg": round(buy_avg, 2),
+                    "sell_avg": round(sell_avg, 2),
+                    "net_profit": round(net_profit, 2)
+                }
+
+                if quantity == 0:
+                    positions_data["closed"].append(row)
+                else:
+                    positions_data["open"].append(row)
+
+        except Exception as e:
+            print(f"❌ Error fetching positions for {client_id}: {e}")
+
+    return positions_data
+
+
+@app.post("/close_position")
+async def close_position(request: Request, payload: dict = Body(...)):
+    owner_userid = resolve_owner_userid(request, userid=payload.get("userid") or payload.get("user_id"))
+
+    positions = (payload or {}).get("positions", [])
+    messages = []
+    threads = []
+    thread_lock = threading.Lock()
+
+    # Load min qty map once from symbols DB
+    min_qty_map = {}
+    try:
+        conn = sqlite3.connect(SYMBOL_DB_PATH)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(f"SELECT [Security ID], [Min Qty] FROM {SYMBOL_TABLE}")
+            for sid, qty in cursor.fetchall():
+                if sid:
+                    try:
+                        min_qty_map[str(sid)] = int(qty) if qty else 1
+                    except Exception:
+                        min_qty_map[str(sid)] = 1
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"❌ Error reading min_qty from DB: {e}")
+
+    def find_session_by_name_and_owner(name: str, client_id_hint: str = ""):
+        # Prefer explicit client_id if provided
+        if client_id_hint:
+            sess = mofsl_sessions.get(client_id_hint)
+            if isinstance(sess, dict) and (not owner_userid or str(sess.get("owner_userid","")).strip() == str(owner_userid).strip()):
+                return client_id_hint, sess
+
+        # Fallback: search by display name
+        for cid, sess in mofsl_sessions.items():
+            if not isinstance(sess, dict):
+                continue
+            if owner_userid and str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
+                continue
+            if (sess.get("name") or "").strip().lower() == (name or "").strip().lower():
+                return cid, sess
+        return "", None
+
+    def close_single_position(pos):
+        name = (pos or {}).get("name") or ""
+        symbol = (pos or {}).get("symbol") or ""
+        quantity = float((pos or {}).get("quantity", 0) or 0)
+        transaction_type = (pos or {}).get("transaction_type") or ""
+
+        meta = position_meta.get((name, symbol)) or {}
+        client_id_hint = (pos or {}).get("client_id") or meta.get("client_id") or ""
+        cid, sess = find_session_by_name_and_owner(name, client_id_hint=client_id_hint)
+
+        if not meta or not sess:
+            with thread_lock:
+                messages.append(f"❌ Missing session/meta for {name} - {symbol}")
+            return
+
+        mofsl = sess.get("mofsl")
+        userid_ = sess.get("userid") or cid
+        if not mofsl or not userid_:
+            with thread_lock:
+                messages.append(f"❌ Invalid session for {name} - {symbol}")
+            return
+
+        symboltoken = meta.get("symboltoken")
+        min_qty = min_qty_map.get(str(symboltoken), 1)
+        lots = max(1, int(abs(quantity) // min_qty)) if min_qty and abs(quantity) >= min_qty else 1
+
+        order = {
+            "clientcode": userid_,
+            "exchange": meta.get("exchange", ""),
+            "symboltoken": symboltoken,
+            "buyorsell": transaction_type.upper(),
+            "ordertype": "MARKET",
+            "producttype": meta.get("producttype", ""),
+            "orderduration": "DAY",
+            "price": 0,
+            "triggerprice": 0,
+            "quantityinlot": lots,
+            "disclosedquantity": 0,
+            "amoorder": "N",
+            "algoid": "",
+            "goodtilldate": "",
+            "tag": ""
+        }
+
+        try:
+            response = mofsl.PlaceOrder(order)
+            if isinstance(response, dict) and response.get("status") == "SUCCESS":
+                with thread_lock:
+                    messages.append(f"✅ Close requested: {name} {symbol}")
+            else:
+                with thread_lock:
+                    messages.append(f"❌ Close failed: {name} {symbol} - {((response or {}).get('message') if isinstance(response, dict) else response)}")
+        except Exception as e:
+            with thread_lock:
+                messages.append(f"❌ Error closing {name} {symbol}: {str(e)}")
+
+    for pos in positions:
+        t = threading.Thread(target=close_single_position, args=(pos,))
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join()
+
+    return {"message": messages}
