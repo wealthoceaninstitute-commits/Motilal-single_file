@@ -663,15 +663,36 @@ def get_clients(request: Request, userid: str = None, user_id: str = None):
                 if not isinstance(client_obj, dict):
                     continue
 
-                sa = bool(client_obj.get("session_active", False))
+                # -------------------------
+                # REQUIRED CHANGE START ✅
+                # -------------------------
+                # Tag the client with the owner, so sessions are per-user
+                client_obj["owner_userid"] = uid
+
+                # Attempt login (same behavior as CT_FastAPI desktop flow)
+                # This populates mofsl_sessions[client_id] in memory if login succeeds
+                try:
+                    motilal_login(client_obj)
+                except Exception as login_err:
+                    print(f"Login attempt failed for client {client_obj.get('userid') or client_obj.get('client_id')}: {login_err}")
+
+                # Determine session based on ACTUAL in-memory session (not stale GitHub json)
+                client_id = str(client_obj.get("userid", client_obj.get("client_id", "")) or "").strip()
+                sess = mofsl_sessions.get(client_id) if client_id else None
+                sa = bool(sess and sess.get("owner_userid") == uid and sess.get("mofsl"))
+                # -------------------------
+                # REQUIRED CHANGE END ✅
+                # -------------------------
+
                 clients.append({
                     "name": client_obj.get("name", ""),
-                    "client_id": client_obj.get("userid", client_obj.get("client_id", "")),
+                    "client_id": client_id,
                     "capital": client_obj.get("capital", ""),
                     "session": "Logged in" if sa else "Logged out",   # keep old
                     "session_active": sa,                              # UI needs this
                     "status": "logged_in" if sa else "logged_out",     # optional
                 })
+
             except Exception as per_file_err:
                 print(f"Error reading client file {ent.get('path')}: {per_file_err}")
 
