@@ -524,11 +524,12 @@ def motilal_login(client: dict):
 
         if isinstance(response, dict) and response.get("status") == "SUCCESS":
 
-            mofsl_sessions[userid] = {
+           mofsl_sessions[userid] = {
                 "name": name,
                 "userid": userid,
                 "mofsl": mofsl,
-                "login_ts": int(time.time())
+                "login_ts": int(time.time()),
+                "owner_userid": client.get("owner_userid", "")  # ✅ REQUIRED for /get_orders filter
             }
 
             print(f"Login successful: {name} ({userid})")
