@@ -1165,6 +1165,11 @@ async def _set_copy_enabled(request: Request, payload: dict, value: bool):
     ids = payload.get("ids") or []
     if not isinstance(ids, list):
         ids = [ids]
+    # Backward/forward compatibility: accept single 'id'/'setup_id'/'name'
+    if not ids:
+        one = payload.get("id") or payload.get("setup_id") or payload.get("name")
+        if one:
+            ids = [one]
     updated, missing, errors = [], [], []
     for sid in ids:
         try:
@@ -1203,6 +1208,11 @@ async def _delete_copy_setup(request: Request, payload: dict):
     ids = payload.get("ids") or []
     if not isinstance(ids, list):
         ids = [ids]
+    # Backward/forward compatibility: accept single 'id'/'setup_id'/'name'
+    if not ids:
+        one = payload.get("id") or payload.get("setup_id") or payload.get("name")
+        if one:
+            ids = [one]
     deleted, missing, errors = [], [], []
     for sid in ids:
         try:
