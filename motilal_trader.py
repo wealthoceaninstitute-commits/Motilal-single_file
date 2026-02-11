@@ -1401,63 +1401,57 @@ async def cancel_order(request: Request, payload: dict = Body(...)):
 def get_positions(request: Request, userid: str = None, user_id: str = None):
     owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
 
-    # --- safe normalize (prevents: 'int' object has no attribute 'strip') ---
-    def _norm(v):
-        if v is None:
-            return ""
-        s = str(v).strip()
-        # handle "pra" / 'pra'
-        if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
-            s = s[1:-1].strip()
-        return s
-
-    req_owner = _norm(owner_userid)
-
     positions_data = {"open": [], "closed": []}
 
-    # ✅ ensure position_meta exists at runtime (prevents NameError on Render)
-    position_meta = globals().setdefault("position_meta", {})
-    position_meta.clear()
+    # Ensure global meta exists (safe for Render multi-worker)
+    global position_meta
+    if "position_meta" not in globals():
+        position_meta = {}
+    else:
+        position_meta.clear()
 
-    # sessions are keyed by client_id, each session is a dict with mofsl + owner_userid
+    # Iterate sessions exactly like orders
     for client_id, sess in list(mofsl_sessions.items()):
         try:
             if not isinstance(sess, dict):
                 continue
 
-            # ✅ per-user filter (SAFE)
-            sess_owner = _norm(sess.get("owner_userid", ""))
-            if req_owner and sess_owner != req_owner:
+            # Filter per logged-in user
+            if owner_userid and str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
                 continue
 
-            name = sess.get("name", "") or client_id
+            name = str(sess.get("name", "") or client_id)
             mofsl = sess.get("mofsl")
-            client_userid = sess.get("userid", client_id)
+            client_userid = str(sess.get("userid", client_id))
 
             if not mofsl or not client_userid:
                 continue
 
             response = mofsl.GetPosition()
-            if response and response.get("status") != "SUCCESS":
+
+            if not response or response.get("status") != "SUCCESS":
                 continue
 
-            positions = response.get("data", []) if response else []
+            positions = response.get("data") or []
+
             if not isinstance(positions, list):
-                positions = []
+                continue
 
             for pos in positions:
-                buy_qty = float(pos.get("buyquantity", 0) or 0)
-                sell_qty = float(pos.get("sellquantity", 0) or 0)
+
+                buy_qty = float(pos.get("buyquantity") or 0)
+                sell_qty = float(pos.get("sellquantity") or 0)
                 quantity = buy_qty - sell_qty
 
-                booked_profit = float(pos.get("bookedprofitloss", 0) or 0)
-                buy_amt = float(pos.get("buyamount", 0) or 0)
-                sell_amt = float(pos.get("sellamount", 0) or 0)
+                booked_profit = float(pos.get("bookedprofitloss") or 0)
 
-                buy_avg = (buy_amt / buy_qty) if buy_qty > 0 else 0.0
-                sell_avg = (sell_amt / sell_qty) if sell_qty > 0 else 0.0
+                buy_amt = float(pos.get("buyamount") or 0)
+                sell_amt = float(pos.get("sellamount") or 0)
 
-                ltp = float(pos.get("LTP", 0) or 0)
+                buy_avg = (buy_amt / buy_qty) if buy_qty else 0.0
+                sell_avg = (sell_amt / sell_qty) if sell_qty else 0.0
+
+                ltp = float(pos.get("LTP") or 0)
 
                 if quantity > 0:
                     net_profit = (ltp - buy_avg) * quantity
@@ -1466,28 +1460,29 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
                 else:
                     net_profit = booked_profit
 
-                symbol = (pos.get("symbol", "") or "").strip()
-                exchange = (pos.get("exchange", "") or "").strip()
-                symboltoken = (pos.get("symboltoken", "") or "").strip()
-                producttype = (pos.get("productname", "") or "").strip()
+                # SAFE string conversion (prevents strip() crash)
+                symbol = str(pos.get("symbol") or "")
+                exchange = str(pos.get("exchange") or "")
+                symboltoken = str(pos.get("symboltoken") or "")
+                producttype = str(pos.get("productname") or "")
 
-                # Save meta only for OPEN positions (used by /close_position)
+                # Save meta for close position
                 if quantity != 0 and symbol:
-                    position_meta[(str(client_userid), symbol)] = {
+                    position_meta[(client_userid, symbol)] = {
                         "exchange": exchange,
                         "symboltoken": symboltoken,
                         "producttype": producttype,
-                        "client_id": str(client_userid),
+                        "client_id": client_userid
                     }
 
                 row = {
                     "name": name,
-                    "client_id": str(client_userid),
+                    "client_id": client_userid,
                     "symbol": symbol,
                     "quantity": quantity,
                     "buy_avg": round(buy_avg, 2),
                     "sell_avg": round(sell_avg, 2),
-                    "net_profit": round(net_profit, 2),
+                    "net_profit": round(net_profit, 2)
                 }
 
                 if quantity == 0:
