@@ -14,6 +14,7 @@ Frontend storage (browser localStorage):
     Authorization: Bearer <token>
 """
 
+
 from __future__ import annotations
 
 import base64
