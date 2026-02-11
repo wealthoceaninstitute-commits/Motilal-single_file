@@ -1269,11 +1269,15 @@ def get_orders(request: Request, userid: str = None, user_id: str = None):
     })
 
     # Only sessions that belong to this owner_userid
-    sessions = [
-        (sess.get("name", ""), (sess.get("mofsl"), sess.get("userid")))
-        for sess in mofsl_sessions.values()
-        if (sess or {}).get("owner_userid", "") == owner_userid
-    ]
+    sessions = []
+
+    for client_id, sess in mofsl_sessions.items():
+        if not isinstance(sess, dict):
+            continue
+    
+        sess_owner = str(sess.get("owner_userid", "")).strip()
+        if sess_owner == owner_userid:
+            sessions.append(sess)
 
     for name, (Mofsl, client_userid) in sessions:
         try:
