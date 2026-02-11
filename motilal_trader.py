@@ -33,7 +33,6 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from MOFSLOPENAPI import MOFSLOPENAPI
 import pyotp
-from typing import Dict, Any, List, Optional
 
 
 # ---------------- JWT (HS256) helpers (no external dependency) ----------------
@@ -1230,3 +1229,193 @@ async def _delete_copy_setup(request: Request, payload: dict):
             errors.append(str(e))
     return {"ok": True, "deleted": deleted, "missing": missing, "errors": errors}
 
+
+# ============================================================
+# ORDERS (per-user)  | frontend: Orders.jsx
+# ============================================================
+from collections import OrderedDict
+
+@app.get("/get_orders")
+async def get_orders(request: Request, userid: str = None, user_id: str = None):
+    owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
+    if not owner_userid:
+        return {"pending": [], "traded": [], "rejected": [], "cancelled": [], "others": []}
+
+    orders_data = OrderedDict({
+        "pending": [],
+        "traded": [],
+        "rejected": [],
+        "cancelled": [],
+        "others": []
+    })
+
+    # only this user's active sessions
+    sessions = [s for s in mofsl_sessions.values() if (s or {}).get("owner_userid") == owner_userid]
+
+    for sess in sessions:
+        try:
+            mofsl = sess.get("mofsl")
+            client_id = sess.get("userid")
+            name = sess.get("name") or client_id
+
+            if not mofsl or not client_id:
+                continue
+
+            today_date = datetime.now().strftime("%d-%b-%Y 09:00:00")
+            order_book_info = {"clientcode": client_id, "datetimestamp": today_date}
+            resp = mofsl.GetOrderBook(order_book_info)
+
+            orders = (resp or {}).get("data", [])
+            if not isinstance(orders, list):
+                orders = []
+
+            for order in orders:
+                order_data = {
+                    "broker": "motilal",
+                    "client_id": client_id,
+                    "name": name,
+                    "symbol": order.get("symbol", ""),
+                    "transaction_type": order.get("buyorsell", ""),
+                    "quantity": order.get("orderqty", ""),
+                    "price": order.get("price", ""),
+                    "status": order.get("orderstatus", ""),
+                    "order_id": order.get("uniqueorderid", "")
+                }
+
+                status = (order.get("orderstatus", "") or "").lower()
+                if "confirm" in status:
+                    orders_data["pending"].append(order_data)
+                elif "traded" in status:
+                    orders_data["traded"].append(order_data)
+                elif "rejected" in status or "error" in status:
+                    orders_data["rejected"].append(order_data)
+                elif "cancel" in status:
+                    orders_data["cancelled"].append(order_data)
+                else:
+                    orders_data["others"].append(order_data)
+
+        except Exception as e:
+            print(f"❌ Error fetching orders for {sess.get('userid')}: {e}")
+
+    return dict(orders_data)
+
+
+@app.post("/cancel_order")
+async def cancel_order(request: Request, payload: dict = Body(...)):
+    owner_userid = resolve_owner_userid(request, userid=payload.get("userid") or payload.get("owner_userid"))
+    if not owner_userid:
+        raise HTTPException(status_code=401, detail="Missing owner userid")
+
+    orders = payload.get("orders", [])
+    if not orders:
+        raise HTTPException(status_code=400, detail="No orders received for cancellation.")
+
+    messages = []
+    threads = []
+    thread_lock = threading.Lock()
+
+    def cancel_one(order: dict):
+        order_id = (order or {}).get("order_id") or ""
+        client_id = (order or {}).get("client_id") or (order or {}).get("userid") or (order or {}).get("clientcode") or ""
+        client_id = str(client_id).strip()
+
+        if not order_id or not client_id:
+            with thread_lock:
+                messages.append(f"❌ Missing order_id/client_id in: {order}")
+            return
+
+        sess = mofsl_sessions.get(client_id)
+        if not sess or sess.get("owner_userid") != owner_userid:
+            with thread_lock:
+                messages.append(f"❌ Session not found for client: {client_id}")
+            return
+
+        mofsl = sess.get("mofsl")
+        name = sess.get("name") or client_id
+        try:
+            cancel_resp = mofsl.CancelOrder(order_id, client_id)
+            msg = ((cancel_resp or {}).get("message", "") or "")
+            if "cancel order request sent" in msg.lower():
+                out = f"✅ Cancelled Order {order_id} for {name}"
+            else:
+                out = f"❌ Failed to cancel Order {order_id} for {name}: {msg}"
+            with thread_lock:
+                messages.append(out)
+        except Exception as e:
+            with thread_lock:
+                messages.append(f"❌ Error cancelling {order_id} for {name}: {e}")
+
+    for o in orders:
+        t = threading.Thread(target=cancel_one, args=(o,))
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+
+    return {"message": messages}
+
+
+@app.post("/modify_order")
+async def modify_order(request: Request, payload: dict = Body(...)):
+    owner_userid = resolve_owner_userid(request, userid=payload.get("userid") or payload.get("owner_userid"))
+    if not owner_userid:
+        raise HTTPException(status_code=401, detail="Missing owner userid")
+
+    order = payload.get("order") or {}
+    order_id = order.get("order_id")
+    client_id = (order.get("client_id") or order.get("userid") or "").strip()
+    if not order_id or not client_id:
+        raise HTTPException(status_code=400, detail="order_id and client_id required")
+
+    sess = mofsl_sessions.get(client_id)
+    if not sess or sess.get("owner_userid") != owner_userid:
+        raise HTTPException(status_code=404, detail="Session not found for client")
+
+    mofsl = sess.get("mofsl")
+
+    # Build a flexible modify payload. Motilal SDK variants differ, so we try a few.
+    mod_payload = {
+        "clientcode": client_id,
+        "uniqueorderid": order_id,
+    }
+    if "ordertype" in order:
+        mod_payload["ordertype"] = order.get("ordertype")
+    if "quantity" in order:
+        mod_payload["quantityinlot"] = order.get("quantity")
+    if "price" in order:
+        mod_payload["price"] = order.get("price")
+    if "triggerprice" in order:
+        mod_payload["triggerprice"] = order.get("triggerprice")
+
+    # Try common method names
+    resp = None
+    last_err = None
+    for fn_name in ["ModifyOrder", "modify_order", "ModifyEquityOrder", "ModifyOrderBook"]:
+        fn = getattr(mofsl, fn_name, None)
+        if callable(fn):
+            try:
+                resp = fn(mod_payload)
+                break
+            except Exception as e:
+                last_err = e
+
+    if resp is None:
+        # As a last fallback, some SDKs take (order_id, client_id, payload)
+        fn = getattr(mofsl, "ModifyOrder", None)
+        if callable(fn):
+            try:
+                resp = fn(order_id, client_id, mod_payload)
+            except Exception as e:
+                last_err = e
+
+    if resp is None and last_err:
+        raise HTTPException(status_code=500, detail=f"Modify failed: {last_err}")
+
+    return {"ok": True, "response": resp}
+
+
+# Optional: Orders.jsx tries /ltp but ignores failures.
+@app.get("/ltp")
+async def ltp(request: Request, symbol: str = "", userid: str = None, user_id: str = None):
+    # Not implemented in this backend yet; kept for frontend compatibility.
+    raise HTTPException(status_code=404, detail="LTP not available")
