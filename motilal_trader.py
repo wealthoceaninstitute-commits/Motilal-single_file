@@ -1255,7 +1255,6 @@ async def _delete_copy_setup(request: Request, payload: dict):
 # Orders (same logic as CT_FastAPI, only per-user client filtering differs)
 # =========================
 from collections import OrderedDict
-
 @app.get("/get_orders")
 def get_orders(request: Request, userid: str = None, user_id: str = None):
     owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
@@ -1268,22 +1267,27 @@ def get_orders(request: Request, userid: str = None, user_id: str = None):
         "others": []
     })
 
-    # Only sessions that belong to this owner_userid
-    sessions = []
-
+    # ✅ sessions are stored as dicts in motilal_login()
     for client_id, sess in mofsl_sessions.items():
-        if not isinstance(sess, dict):
-            continue
-    
-        sess_owner = str(sess.get("owner_userid", "")).strip()
-        if sess_owner == owner_userid:
-            sessions.append(sess)
-
-    for name, (Mofsl, client_userid) in sessions:
         try:
+            if not isinstance(sess, dict):
+                continue
+
+            # multi-user filter
+            if owner_userid and str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
+                continue
+
+            name = sess.get("name", "") or client_id
+            mofsl = sess.get("mofsl")
+            client_userid = sess.get("userid", client_id)
+
+            if not mofsl or not client_userid:
+                continue
+
             today_date = datetime.now().strftime("%d-%b-%Y 09:00:00")
             order_book_info = {"clientcode": client_userid, "datetimestamp": today_date}
-            response = Mofsl.GetOrderBook(order_book_info)
+
+            response = mofsl.GetOrderBook(order_book_info)
             if response and response.get("status") != "SUCCESS":
                 logging.error(f"❌ Error fetching orders for {name}: {response.get('message', 'No message')}")
 
@@ -1302,7 +1306,8 @@ def get_orders(request: Request, userid: str = None, user_id: str = None):
                     "status": order.get("orderstatus", ""),
                     "order_id": order.get("uniqueorderid", "")
                 }
-                status = order.get("orderstatus", "").lower()
+
+                status = (order.get("orderstatus", "") or "").lower()
                 if "confirm" in status:
                     orders_data["pending"].append(order_data)
                 elif "traded" in status:
@@ -1313,8 +1318,9 @@ def get_orders(request: Request, userid: str = None, user_id: str = None):
                     orders_data["cancelled"].append(order_data)
                 else:
                     orders_data["others"].append(order_data)
+
         except Exception as e:
-            print(f"❌ Error fetching orders for {name}: {e}")
+            print(f"❌ Error fetching orders for {client_id}: {e}")
 
     return dict(orders_data)
 
