@@ -96,7 +96,7 @@ elif cors_origins_raw:
     allow_origins = [o.strip().rstrip("/") for o in cors_origins_raw.split(",") if o.strip()]
     allow_credentials = True
 else:
-    allow_origins = ["http://localhost:3000", "http://127.0.0.1:3000", "https://multibroker-trader-multiuser.vercel.app"]
+    allow_origins = ["http://localhost:3000", "http://127.0.0.1:3000", "https://woi-mosl-trader.vercel.app"]
     allow_credentials = True
 
 SECRET_KEY = os.getenv("SECRET_KEY") or "CHANGE_ME_PLEASE_SET_SECRET_KEY"
