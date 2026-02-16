@@ -1779,49 +1779,7 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
         "data": holdings_data,
         "summary": summary_data
 
-            # ---------------------------
-            # Summary (per client)
-            # ---------------------------
-            # capital: prefer session, else fallback to old map if you still have it
-            capital = sess.get("capital", None)
-            if capital is None:
-                cap_map = globals().get("client_capital_map", {}) or {}
-                capital = cap_map.get(name, 0)
-
-            try:
-                capital = float(capital or 0)
-            except Exception:
-                capital = 0.0
-
-            current_value = invested + total_pnl
-
-            # available margin: use existing helper if present
-            available_margin = 0.0
-            try:
-                if "get_available_margin" in globals() and callable(globals()["get_available_margin"]):
-                    available_margin = float(globals()["get_available_margin"](mofsl, client_userid) or 0)
-            except Exception:
-                available_margin = 0.0
-
-            summary_data[name] = {
-                "name": name,
-                "capital": round(capital, 2),
-                "invested": round(invested, 2),
-                "pnl": round(total_pnl, 2),
-                "current_value": round(current_value, 2),
-                "available_margin": round(available_margin, 2),
-            }
-
-        except Exception as e:
-            print(f"❌ Error fetching holdings for {client_id}: {e}")
-
-    # cache for /get_summary
-    global summary_data_global
-    summary_data_global = summary_data
-
-    return {"holdings": holdings_data, "summary": list(summary_data.values())}
-
-
+          
 @app.get("/get_summary")
 def get_summary(request: Request, userid: str = None, user_id: str = None):
     owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
@@ -1830,6 +1788,7 @@ def get_summary(request: Request, userid: str = None, user_id: str = None):
     # For now: /get_holdings already filters by owner_userid and refreshes the cache.
     data = globals().get("summary_data_global", {}) or {}
     return list(data.values())
+
 
 
 # ============================================================
