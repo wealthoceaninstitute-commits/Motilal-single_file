@@ -1607,39 +1607,38 @@ async def close_position(request: Request, payload: dict = Body(...)):
     return {"message": messages}
 
 
-#/////////////////////////////////////////////
-#          HOLDINGS AND SUMMARY
-#////////////////////////////////////////////
+# =========================
+# HOLDINGS + SUMMARY (CT_FastAPI replica)
+# =========================
+# Copy exactly into motilal_trader (9).py by REPLACING your existing
+# "HOLDINGS AND SUMMARY" section with this block.
+#
+# Logic source: CT_FastAPI.py (/get_holdings + /get_summary) :contentReference[oaicite:0]{index=0}
 
-# ------------------------------------------------------------
-# HOLDINGS + SUMMARY (multi-user, session-based, safe casting)
-# ------------------------------------------------------------
-
-# cache last computed summary for /get_summary
+# cache last computed summary for /get_summary (same keyword)
 summary_data_global = {}
+
+def get_available_margin(Mofsl, clientcode):
+    # CT_FastAPI keyword + logic :contentReference[oaicite:1]{index=1}
+    try:
+        margin_response = Mofsl.GetReportMarginSummary(clientcode)
+        if margin_response.get("status") != "SUCCESS":
+            return 0
+        for item in margin_response.get("data", []):
+            if item.get("particulars") == "Total Available Margin for Cash":
+                return float(item.get("amount", 0))
+    except Exception as e:
+        print(f"❌ Error fetching margin for {clientcode}: {e}")
+    return 0
 
 @app.get("/get_holdings")
 def get_holdings(request: Request, userid: str = None, user_id: str = None):
     owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
 
     holdings_data = []
-    summary_data = {
-        "invested": 0.0,
-        "current_value": 0.0,
-        "pnl": 0.0
-    }
+    summary_data = {}
 
-    def _to_float(v, default=0.0):
-        try:
-            if v is None:
-                return default
-            if isinstance(v, str) and not v.strip():
-                return default
-            return float(v)
-        except Exception:
-            return default
-
-    # iterate sessions (same pattern as orders/positions)
+    # sessions are keyed by client_id, each session is a dict with mofsl + owner_userid
     for client_id, sess in list(mofsl_sessions.items()):
         try:
             if not isinstance(sess, dict):
@@ -1649,147 +1648,86 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
             if owner_userid and str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
                 continue
 
-            name = str(sess.get("name", "") or client_id)
-            mofsl = sess.get("mofsl")
-            client_userid = str(sess.get("userid", client_id))
+            name = sess.get("name", "") or client_id
+            Mofsl = sess.get("mofsl")
+            userid_ = sess.get("userid") or client_id
 
-            if not mofsl or not client_userid:
+            if not Mofsl or not userid_:
                 continue
 
-            # ---------------------------
-            # Fetch holdings from broker
-            # ---------------------------
-            holdings_response = None
-
-            if hasattr(mofsl, "GetDPHolding"):
-                holdings_response = mofsl.GetDPHolding(client_userid)
-            else:
-                MofslCls = globals().get("Mofsl") or globals().get("MofslAPI") or globals().get("MOFSL")
-                if MofslCls and hasattr(MofslCls, "GetDPHolding"):
-                    holdings_response = MofslCls.GetDPHolding(client_userid)
-
-            if not holdings_response:
+            response = Mofsl.GetDPHolding(userid_)
+            if not response or response.get("status") != "SUCCESS":
                 continue
 
-            if holdings_response.get("status") != "SUCCESS":
-                continue
+            holdings = response.get("data", [])
+            invested = 0.0
+            total_pnl = 0.0
 
-            holdings_list = holdings_response.get("data") or []
+            for holding in holdings:
+                symbol = (holding.get("scripname") or "").strip()
+                quantity = float(holding.get("dpquantity", 0) or 0)
+                buy_avg = float(holding.get("buyavgprice", 0) or 0)
+                scripcode = holding.get("nsesymboltoken")
 
-            if not isinstance(holdings_list, list):
-                continue
+                if not scripcode or quantity <= 0:
+                    continue
 
-            # ---------------------------
-            # Parse holdings
-            # ---------------------------
-            for h in holdings_list:
-                try:
-                    quantity = _to_float(h.get("dpquantity"), 0.0)
+                ltp_request = {"clientcode": userid_, "exchange": "NSE", "scripcode": int(scripcode)}
+                ltp_response = Mofsl.GetLtp(ltp_request)
 
-                    # ✅ CRITICAL FILTER: only qty > 0
-                    if quantity <= 0:
-                        continue
+                # CT_FastAPI divides by 100 :contentReference[oaicite:2]{index=2}
+                ltp = float((ltp_response or {}).get("data", {}).get("ltp", 0) or 0) / 100
 
-                    symbol = str(
-                        h.get("scripname")
-                        or h.get("symbol")
-                        or h.get("nsesymbol")
-                        or ""
-                    ).strip()
+                pnl = round((ltp - buy_avg) * quantity, 2)
+                invested += quantity * buy_avg
+                total_pnl += pnl
 
-                    scripcode = (
-                        h.get("nsesymboltoken")
-                        or h.get("scripCode")
-                        or h.get("token")
-                        or 0
-                    )
+                holdings_data.append({
+                    "name": name,
+                    "symbol": symbol,
+                    "quantity": quantity,
+                    "buy_avg": round(buy_avg, 2),
+                    "ltp": round(ltp, 2),
+                    "pnl": pnl
+                })
 
-                    buy_avg = _to_float(
-                        h.get("buyavgprice")
-                        or h.get("avgprice")
-                        or h.get("averageprice"),
-                        0.0
-                    )
+            # capital same keyword (prefer session capital, else client_capital_map like desktop)
+            capital = sess.get("capital", None)
+            if capital is None:
+                capital = (globals().get("client_capital_map", {}) or {}).get(name, 0)
 
-                    # ---------------------------
-                    # Fetch LTP
-                    # ---------------------------
-                    ltp = 0.0
+            try:
+                capital = float(capital)
+            except Exception:
+                capital = 0.0
 
-                    try:
-                        ltp_request = {
-                            "clientcode": client_userid,
-                            "exchange": "NSE",
-                            "scripcode": int(scripcode)
-                        }
+            current_value = invested + total_pnl
+            available_margin = get_available_margin(Mofsl, userid_)
+            net_gain = round((current_value + available_margin) - capital, 2)
 
-                        ltp_response = None
-
-                        if hasattr(mofsl, "GetLtp"):
-                            ltp_response = mofsl.GetLtp(ltp_request)
-                        else:
-                            MofslCls = globals().get("Mofsl") or globals().get("MofslAPI") or globals().get("MOFSL")
-                            if MofslCls and hasattr(MofslCls, "GetLtp"):
-                                ltp_response = MofslCls.GetLtp(ltp_request)
-
-                        raw_ltp = (
-                            (ltp_response or {})
-                            .get("data", {})
-                            .get("ltp", 0)
-                        )
-
-                        ltp = _to_float(raw_ltp) / 100.0
-
-                    except Exception:
-                        ltp = 0.0
-
-                    invested = quantity * buy_avg
-                    current_value = quantity * ltp
-                    pnl = round(current_value - invested, 2)
-
-                    summary_data["invested"] += invested
-                    summary_data["current_value"] += current_value
-                    summary_data["pnl"] += pnl
-
-                    holdings_data.append({
-                        "name": name,
-                        "client_id": client_userid,
-                        "symbol": symbol,
-                        "quantity": round(quantity, 4),
-                        "buy_avg": round(buy_avg, 2),
-                        "ltp": round(ltp, 2),
-                        "invested": round(invested, 2),
-                        "current_value": round(current_value, 2),
-                        "pnl": pnl
-                    })
-
-                except Exception as e:
-                    print(f"❌ Holding row parse error for {name}: {e}")
+            summary_data[name] = {
+                "name": name,
+                "capital": round(capital, 2),
+                "invested": round(invested, 2),
+                "pnl": round(total_pnl, 2),
+                "current_value": round(current_value, 2),
+                "available_margin": round(available_margin, 2),
+                "net_gain": net_gain
+            }
 
         except Exception as e:
-            print(f"❌ Holdings fetch error for {client_id}: {e}")
+            print(f"❌ Error fetching holdings for {client_id}: {e}")
 
-    # round summary
-    summary_data["invested"] = round(summary_data["invested"], 2)
-    summary_data["current_value"] = round(summary_data["current_value"], 2)
-    summary_data["pnl"] = round(summary_data["pnl"], 2)
+    global summary_data_global
+    summary_data_global = summary_data
 
-    return {
-        "status": "success",
-        "data": holdings_data,
-        "summary": summary_data
-    }
-
+    # CT_FastAPI response shape :contentReference[oaicite:3]{index=3}
+    return {"holdings": holdings_data, "summary": list(summary_data.values())}
 
 @app.get("/get_summary")
-def get_summary(request: Request, userid: str = None, user_id: str = None):
-    owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
-
-    # If you want strict isolation per user in-memory, we can store summary per owner_userid.
-    # For now: /get_holdings already filters by owner_userid and refreshes the cache.
-    data = globals().get("summary_data_global", {}) or {}
-    return list(data.values())
-
+def get_summary():
+    global summary_data_global
+    return {"summary": list((summary_data_global or {}).values())}
 
 
 # ============================================================
