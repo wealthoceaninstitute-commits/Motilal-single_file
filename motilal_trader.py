@@ -1616,6 +1616,37 @@ async def close_position(request: Request, payload: dict = Body(...)):
 # Logic source: CT_FastAPI.py (/get_holdings + /get_summary) :contentReference[oaicite:0]{index=0}
 
 # cache last computed summary for /get_summary (same keyword)
+# Desktop-style capital cache
+global client_capital_map
+client_capital_map = {}
+
+try:
+    if owner_userid:
+        folder = f"data/users/{owner_userid}/clients"
+        entries = gh_list_dir(folder)
+
+        for ent in entries or []:
+            if not isinstance(ent, dict) or ent.get("type") != "file":
+                continue
+            if not ent.get("path", "").endswith(".json"):
+                continue
+
+            client_obj, _sha = gh_get_json(ent["path"])
+            if not isinstance(client_obj, dict):
+                continue
+
+            cid = str(client_obj.get("userid", client_obj.get("client_id", "")) or "").strip()
+            name = client_obj.get("name", cid)
+
+            capital = client_obj.get("capital", None) or client_obj.get("base_amount", None) or 0
+
+            # store both keys for safety (desktop uses name)
+            client_capital_map[cid] = capital
+            client_capital_map[name] = capital
+
+except Exception as e:
+    print("Capital map build error:", e)
+
 summary_data_global = {}
 
 def get_available_margin(Mofsl, clientcode):
@@ -1693,28 +1724,16 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
 
             # capital same keyword (prefer session capital, else client_capital_map like desktop)
             # capital: pull from GitHub client json (same source as /clients), then fallbacks
-            capital = None
-            
-            # 1) GitHub client file: data/users/{owner_userid}/clients/{client_userid}.json
-            try:
-                if owner_userid and client_userid:
-                    client_obj, _sha = gh_get_json(f"data/users/{owner_userid}/clients/{client_userid}.json")
-                    if isinstance(client_obj, dict):
-                        capital = client_obj.get("capital", None) or client_obj.get("base_amount", None)
-            except Exception:
-                capital = None
-            
-            # 2) fallback: session field (if ever present)
-            if capital is None and isinstance(sess, dict):
-                capital = sess.get("capital", None)
-            
-            # 3) fallback: old in-memory map (desktop style)
-            if capital is None:
-                cap_map = globals().get("client_capital_map", {}) or {}
-                capital = cap_map.get(name, 0)
+                       # Desktop-style capital lookup
+            capital = (
+                client_capital_map.get(userid_) or
+                client_capital_map.get(client_id) or
+                client_capital_map.get(name) or
+                0
+            )
             
             try:
-                capital = float(capital or 0)
+                capital = float(capital)
             except Exception:
                 capital = 0.0
 
