@@ -1778,8 +1778,9 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
         "status": "success",
         "data": holdings_data,
         "summary": summary_data
+    }
 
-          
+
 @app.get("/get_summary")
 def get_summary(request: Request, userid: str = None, user_id: str = None):
     owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
