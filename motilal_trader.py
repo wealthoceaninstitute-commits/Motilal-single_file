@@ -1639,9 +1639,7 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
             mofsl = sess.get("mofsl")
             client_userid = str(sess.get("userid", client_id))
 
-            if not mofsl or not client_userid:
-                continue
-
+          
             # ---------------------------
             # Fetch holdings from broker
             # ---------------------------
