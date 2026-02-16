@@ -1617,35 +1617,6 @@ async def close_position(request: Request, payload: dict = Body(...)):
 
 # cache last computed summary for /get_summary (same keyword)
 # Desktop-style capital cache
-global client_capital_map
-client_capital_map = {}
-
-try:
-    if owner_userid:
-        folder = f"data/users/{owner_userid}/clients"
-        entries = gh_list_dir(folder)
-
-        for ent in entries or []:
-            if not isinstance(ent, dict) or ent.get("type") != "file":
-                continue
-            if not ent.get("path", "").endswith(".json"):
-                continue
-
-            client_obj, _sha = gh_get_json(ent["path"])
-            if not isinstance(client_obj, dict):
-                continue
-
-            cid = str(client_obj.get("userid", client_obj.get("client_id", "")) or "").strip()
-            name = client_obj.get("name", cid)
-
-            capital = client_obj.get("capital", None) or client_obj.get("base_amount", None) or 0
-
-            # store both keys for safety (desktop uses name)
-            client_capital_map[cid] = capital
-            client_capital_map[name] = capital
-
-except Exception as e:
-    print("Capital map build error:", e)
 
 summary_data_global = {}
 
@@ -1669,7 +1640,41 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
     holdings_data = []
     summary_data = {}
 
-    # sessions are keyed by client_id, each session is a dict with mofsl + owner_userid
+    # =========================
+    # Desktop-style capital cache (same source as /clients)
+    # =========================
+    client_capital_map = {}
+    try:
+        if owner_userid:
+            folder = f"data/users/{owner_userid}/clients"
+            entries = gh_list_dir(folder) or []
+
+            for ent in entries:
+                if not isinstance(ent, dict) or ent.get("type") != "file":
+                    continue
+                if not (str(ent.get("name", "")).endswith(".json") and ent.get("path")):
+                    continue
+
+                client_obj, _sha = gh_get_json(ent["path"])
+                if not isinstance(client_obj, dict):
+                    continue
+
+                cid = str(client_obj.get("userid", client_obj.get("client_id", "")) or "").strip()
+                nm = str(client_obj.get("name", "") or cid).strip()
+
+                cap = client_obj.get("capital", None) or client_obj.get("base_amount", None) or 0
+
+                if cid:
+                    client_capital_map[cid] = cap
+                if nm:
+                    client_capital_map[nm] = cap
+
+    except Exception as e:
+        print("Capital map build error:", e)
+
+    # =========================
+    # HOLDINGS LOOP
+    # =========================
     for client_id, sess in list(mofsl_sessions.items()):
         try:
             if not isinstance(sess, dict):
@@ -1703,13 +1708,18 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
                 if not scripcode or quantity <= 0:
                     continue
 
-                ltp_request = {"clientcode": userid_, "exchange": "NSE", "scripcode": int(scripcode)}
+                ltp_request = {
+                    "clientcode": userid_,
+                    "exchange": "NSE",
+                    "scripcode": int(scripcode)
+                }
+
                 ltp_response = Mofsl.GetLtp(ltp_request)
 
-                # CT_FastAPI divides by 100 :contentReference[oaicite:2]{index=2}
                 ltp = float((ltp_response or {}).get("data", {}).get("ltp", 0) or 0) / 100
 
                 pnl = round((ltp - buy_avg) * quantity, 2)
+
                 invested += quantity * buy_avg
                 total_pnl += pnl
 
@@ -1722,16 +1732,16 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
                     "pnl": pnl
                 })
 
-            # capital same keyword (prefer session capital, else client_capital_map like desktop)
-            # capital: pull from GitHub client json (same source as /clients), then fallbacks
-                       # Desktop-style capital lookup
+            # =========================
+            # Desktop-style capital lookup
+            # =========================
             capital = (
                 client_capital_map.get(userid_) or
                 client_capital_map.get(client_id) or
                 client_capital_map.get(name) or
                 0
             )
-            
+
             try:
                 capital = float(capital)
             except Exception:
@@ -1739,6 +1749,7 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
 
             current_value = invested + total_pnl
             available_margin = get_available_margin(Mofsl, userid_)
+
             net_gain = round((current_value + available_margin) - capital, 2)
 
             summary_data[name] = {
@@ -1757,8 +1768,10 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
     global summary_data_global
     summary_data_global = summary_data
 
-    # CT_FastAPI response shape :contentReference[oaicite:3]{index=3}
-    return {"holdings": holdings_data, "summary": list(summary_data.values())}
+    return {
+        "holdings": holdings_data,
+        "summary": list(summary_data.values())
+    }
 
 @app.get("/get_summary")
 def get_summary():
