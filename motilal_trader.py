@@ -1692,12 +1692,29 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
                 })
 
             # capital same keyword (prefer session capital, else client_capital_map like desktop)
-            capital = sess.get("capital", None)
-            if capital is None:
-                capital = (globals().get("client_capital_map", {}) or {}).get(name, 0)
-
+            # capital: pull from GitHub client json (same source as /clients), then fallbacks
+            capital = None
+            
+            # 1) GitHub client file: data/users/{owner_userid}/clients/{client_userid}.json
             try:
-                capital = float(capital)
+                if owner_userid and client_userid:
+                    client_obj, _sha = gh_get_json(f"data/users/{owner_userid}/clients/{client_userid}.json")
+                    if isinstance(client_obj, dict):
+                        capital = client_obj.get("capital", None) or client_obj.get("base_amount", None)
+            except Exception:
+                capital = None
+            
+            # 2) fallback: session field (if ever present)
+            if capital is None and isinstance(sess, dict):
+                capital = sess.get("capital", None)
+            
+            # 3) fallback: old in-memory map (desktop style)
+            if capital is None:
+                cap_map = globals().get("client_capital_map", {}) or {}
+                capital = cap_map.get(name, 0)
+            
+            try:
+                capital = float(capital or 0)
             except Exception:
                 capital = 0.0
 
