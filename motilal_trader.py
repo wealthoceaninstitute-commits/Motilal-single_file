@@ -1670,7 +1670,7 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
                 try:
                     # symbol + scripcode
                     symbol = str(h.get("scripname") or h.get("symbol") or "").strip()
-                    scripcode = h.get("scripcode") or h.get("scripCode") or h.get("token") or 0
+                    scripcode = h.get("nsesymboltoken") or h.get("scripCode") or h.get("token") or 0
 
                     # qty + avg
                     quantity = float(h.get("dpquantity") or 0)
