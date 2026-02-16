@@ -1673,7 +1673,7 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
                     scripcode = h.get("scripcode") or h.get("scripCode") or h.get("token") or 0
 
                     # qty + avg
-                    quantity = float(h.get("quantity") or 0)
+                    quantity = float(h.get("dpquantity") or 0)
                     buy_avg = float(h.get("buyavgprice") or h.get("avgprice") or h.get("averageprice") or 0)
 
                     # LTP (CT used GetLtp and divided by 100)
