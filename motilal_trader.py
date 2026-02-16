@@ -1623,9 +1623,23 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
     owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
 
     holdings_data = []
-    summary_data = {}
+    summary_data = {
+        "invested": 0.0,
+        "current_value": 0.0,
+        "pnl": 0.0
+    }
 
-    # iterate sessions like orders/positions
+    def _to_float(v, default=0.0):
+        try:
+            if v is None:
+                return default
+            if isinstance(v, str) and not v.strip():
+                return default
+            return float(v)
+        except Exception:
+            return default
+
+    # iterate sessions (same pattern as orders/positions)
     for client_id, sess in list(mofsl_sessions.items()):
         try:
             if not isinstance(sess, dict):
@@ -1645,10 +1659,8 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
             # ---------------------------
             # Fetch holdings from broker
             # ---------------------------
-            # Motilal DP holdings call in CT_FastAPI was:
-            # holdings_response = Mofsl.GetDPHolding(userid)
-            # Here we try instance first, then fallback to global class if present.
             holdings_response = None
+
             if hasattr(mofsl, "GetDPHolding"):
                 holdings_response = mofsl.GetDPHolding(client_userid)
             else:
@@ -1656,30 +1668,61 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
                 if MofslCls and hasattr(MofslCls, "GetDPHolding"):
                     holdings_response = MofslCls.GetDPHolding(client_userid)
 
-            if not holdings_response or holdings_response.get("status") != "SUCCESS":
+            if not holdings_response:
+                continue
+
+            if holdings_response.get("status") != "SUCCESS":
                 continue
 
             holdings_list = holdings_response.get("data") or []
+
             if not isinstance(holdings_list, list):
                 continue
 
-            invested = 0.0
-            total_pnl = 0.0
-
+            # ---------------------------
+            # Parse holdings
+            # ---------------------------
             for h in holdings_list:
                 try:
-                    # symbol + scripcode
-                    symbol = str(h.get("scripname") or h.get("symbol") or "").strip()
-                    scripcode = h.get("nsesymboltoken") or h.get("scripCode") or h.get("token") or 0
+                    quantity = _to_float(h.get("dpquantity"), 0.0)
 
-                    # qty + avg
-                    quantity = float(h.get("dpquantity") or 0)
-                    buy_avg = float(h.get("buyavgprice") or h.get("avgprice") or h.get("averageprice") or 0)
+                    # ✅ CRITICAL FILTER: only qty > 0
+                    if quantity <= 0:
+                        continue
 
-                    # LTP (CT used GetLtp and divided by 100)
+                    symbol = str(
+                        h.get("scripname")
+                        or h.get("symbol")
+                        or h.get("nsesymbol")
+                        or ""
+                    ).strip()
+
+                    scripcode = (
+                        h.get("nsesymboltoken")
+                        or h.get("scripCode")
+                        or h.get("token")
+                        or 0
+                    )
+
+                    buy_avg = _to_float(
+                        h.get("buyavgprice")
+                        or h.get("avgprice")
+                        or h.get("averageprice"),
+                        0.0
+                    )
+
+                    # ---------------------------
+                    # Fetch LTP
+                    # ---------------------------
                     ltp = 0.0
+
                     try:
-                        ltp_request = {"clientcode": client_userid, "exchange": "NSE", "scripcode": int(scripcode)}
+                        ltp_request = {
+                            "clientcode": client_userid,
+                            "exchange": "NSE",
+                            "scripcode": int(scripcode)
+                        }
+
                         ltp_response = None
 
                         if hasattr(mofsl, "GetLtp"):
@@ -1689,26 +1732,53 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
                             if MofslCls and hasattr(MofslCls, "GetLtp"):
                                 ltp_response = MofslCls.GetLtp(ltp_request)
 
-                        raw_ltp = (ltp_response or {}).get("data", {}).get("ltp", 0) or 0
-                        ltp = float(raw_ltp) / 100.0
+                        raw_ltp = (
+                            (ltp_response or {})
+                            .get("data", {})
+                            .get("ltp", 0)
+                        )
+
+                        ltp = _to_float(raw_ltp) / 100.0
+
                     except Exception:
                         ltp = 0.0
 
-                    pnl = round((ltp - buy_avg) * quantity, 2)
-                    invested += quantity * buy_avg
-                    total_pnl += pnl
+                    invested = quantity * buy_avg
+                    current_value = quantity * ltp
+                    pnl = round(current_value - invested, 2)
+
+                    summary_data["invested"] += invested
+                    summary_data["current_value"] += current_value
+                    summary_data["pnl"] += pnl
 
                     holdings_data.append({
                         "name": name,
+                        "client_id": client_userid,
                         "symbol": symbol,
-                        "quantity": quantity,
+                        "quantity": round(quantity, 4),
                         "buy_avg": round(buy_avg, 2),
                         "ltp": round(ltp, 2),
+                        "invested": round(invested, 2),
+                        "current_value": round(current_value, 2),
                         "pnl": pnl
                     })
 
                 except Exception as e:
                     print(f"❌ Holding row parse error for {name}: {e}")
+
+        except Exception as e:
+            print(f"❌ Holdings fetch error for {client_id}: {e}")
+
+    # round summary
+    summary_data["invested"] = round(summary_data["invested"], 2)
+    summary_data["current_value"] = round(summary_data["current_value"], 2)
+    summary_data["pnl"] = round(summary_data["pnl"], 2)
+
+    return {
+        "status": "success",
+        "data": holdings_data,
+        "summary": summary_data
+    }
 
             # ---------------------------
             # Summary (per client)
