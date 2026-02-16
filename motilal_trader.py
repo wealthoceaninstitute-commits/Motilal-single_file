@@ -1778,7 +1778,6 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
         "status": "success",
         "data": holdings_data,
         "summary": summary_data
-    }
 
             # ---------------------------
             # Summary (per client)
