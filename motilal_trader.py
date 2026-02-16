@@ -1639,7 +1639,9 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
             mofsl = sess.get("mofsl")
             client_userid = str(sess.get("userid", client_id))
 
-          
+            if not mofsl or not client_userid:
+                continue
+
             # ---------------------------
             # Fetch holdings from broker
             # ---------------------------
@@ -1673,7 +1675,6 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
                     # qty + avg
                     quantity = float(h.get("dpquantity") or 0)
                     buy_avg = float(h.get("buyavgprice") or h.get("avgprice") or h.get("averageprice") or 0)
-                    
 
                     # LTP (CT used GetLtp and divided by 100)
                     ltp = 0.0
