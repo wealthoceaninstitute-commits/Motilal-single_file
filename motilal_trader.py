@@ -2194,6 +2194,61 @@ async def place_order(request: Request, payload: dict = Body(...)):
 # Copies master -> children even after restart by auto-logging sessions
 # ============================================================
 
+def load_active_copy_setups_all():
+    """
+    Loads all enabled copy trading setups from GitHub storage
+    structure:
+    data/users/{owner}/copytrading/{setupid}.json
+    """
+
+    setups = []
+
+    try:
+
+        # list all users
+        users_root = "data/users"
+        users = gh_list_dir(users_root) or []
+
+        for user in users:
+
+            if user.get("type") != "dir":
+                continue
+
+            owner = user.get("name")
+
+            copy_dir = f"data/users/{owner}/copytrading"
+
+            try:
+                files = gh_list_dir(copy_dir) or []
+            except:
+                continue
+
+            for f in files:
+
+                if f.get("type") != "file":
+                    continue
+
+                if not f.get("name", "").endswith(".json"):
+                    continue
+
+                setup, _ = gh_get_json(f.get("path"))
+
+                if not setup:
+                    continue
+
+                if not setup.get("enabled", False):
+                    continue
+
+                setup["owner_userid"] = owner
+
+                setups.append(setup)
+
+    except Exception as e:
+
+        print("❌ load_active_copy_setups_all error:", e)
+
+    return setups
+
 import threading
 import time
 import sqlite3
