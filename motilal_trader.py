@@ -2501,47 +2501,40 @@ def _startup_copy_trading():
     start_copy_trading_thread()
 
 
-from typing import Any, Dict, Optional
-import json
+from typing import Any, Dict, List, Optional
+import json, os, sqlite3
+
 
 @app.post("/modify_order")
-async def modify_order(request: Request, payload: dict = Body(...)):
+def modify_order(request: Request, payload: dict = Body(...)):
     """
-    FRONTEND (Orders.jsx) calls:
+    Frontend sends (Orders.jsx):
       POST /modify_order
-      { userid: "<owner>", order: { name, symbol, order_id, client_id?, broker?, ordertype?, quantity?, price?, triggerprice? } }
+      { userid: "<owner>", order: { name, symbol, order_id, client_id, price, quantity, triggerprice, orderType/ordertype, validity } }
 
-    This route keeps the SAME logic as your single-user modify_orders():
-      - Prefer GetOrderDetails for token/qty/lastmodifiedtime
-      - Fallback to GetOrderBook row
-      - If UI NO_CHANGE (ordertype missing), infer from snapshot
-      - Convert SHARES -> LOTS using symbols.db min qty
-      - Always send newordertype + lastmodifiedtime
+    SAME logic as your single-user modify_orders():
+      • Prefer GetOrderDetails
+      • Fallback GetOrderBook
+      • If NO_CHANGE, infer from snapshot
+      • SHARES -> LOTS using min-qty in SQLite symbols.db
+      • Always include newordertype + lastmodifiedtime
     """
-    import sqlite3
-    from datetime import datetime, timedelta
 
-    data = payload or {}
-    owner_userid = resolve_owner_userid(request, userid=data.get("userid"), user_id=data.get("user_id"))
+    owner_userid = resolve_owner_userid(request, userid=(payload or {}).get("userid"), user_id=(payload or {}).get("user_id"))
     if not owner_userid:
         raise HTTPException(status_code=401, detail="Missing owner userid")
 
-    row = data.get("order") or {}
+    row = (payload or {}).get("order") or {}
     if not isinstance(row, dict):
         raise HTTPException(status_code=400, detail="Missing order object")
 
-    messages = []
+    messages: List[str] = []
 
-    # ---------- small utils (same) ----------
-    def now_ist_str() -> str:
-        ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
-        return ist.strftime("%d-%b-%Y %H:%M:%S")
-
+    # ---------- small utils (UNCHANGED) ----------
     def _num_i(x, default=None):
         try:
             s = str(x).strip()
-            if s == "":
-                return default
+            if s == "": return default
             return int(float(s))
         except Exception:
             return default
@@ -2549,8 +2542,7 @@ async def modify_order(request: Request, payload: dict = Body(...)):
     def _num_f(x, default=None):
         try:
             s = str(x).strip()
-            if s == "":
-                return default
+            if s == "": return default
             return float(s)
         except Exception:
             return default
@@ -2561,8 +2553,8 @@ async def modify_order(request: Request, payload: dict = Body(...)):
         except Exception:
             return False
 
-    # UI radio -> MO enum (same; plus STOPLOSS_MARKET mapping used by your modal canon)
-    def _ui_to_mo(ot: Optional[str]) -> str:
+    # UI radio -> MO enum (UNCHANGED)
+    def _ui_to_mo(ot: str | None) -> str:
         u = (ot or "").strip().upper().replace("-", "_").replace(" ", "_")
         m = {
             "LIMIT": "LIMIT",
@@ -2577,37 +2569,30 @@ async def modify_order(request: Request, payload: dict = Body(...)):
         }
         return m.get(u, "")  # "" => NO_CHANGE/unknown
 
-    # snapshot string -> MO enum (same)
-    def _snap_to_mo(ot: Optional[str]) -> str:
+    # snapshot string -> MO enum (UNCHANGED)
+    def _snap_to_mo(ot: str | None) -> str:
         u = (ot or "").strip().upper().replace("-", "_").replace(" ", "_")
-        if u in ("SL_LIMIT", "SL_L", "STOPLOSS_LIMIT"):
-            return "STOPLOSS"
-        if u in ("SL_MARKET", "SL_M", "STOPLOSS_MARKET"):
-            return "SL-M"
-        if u in ("LIMIT", "MARKET", "STOPLOSS", "SL-M"):
-            return u
+        if u in ("SL_LIMIT", "SL_L", "STOPLOSS_LIMIT"): return "STOPLOSS"
+        if u in ("SL_MARKET", "SL_M", "STOPLOSS_MARKET"): return "SL-M"
+        if u in ("LIMIT", "MARKET", "STOPLOSS", "SL-M"): return u
         return ""
 
-    # infer type if snapshot lacks a clean enum (same)
+    # infer type if snapshot lacks a clean enum (UNCHANGED)
     def _infer_type_from_snapshot(s: dict) -> str:
-        for k in ("newordertype", "ordertype", "orderType", "OrderType"):
+        for k in ("newordertype","ordertype","orderType","OrderType"):
             t = _snap_to_mo(s.get(k))
-            if t:
-                return t
-        price_keys = ("newprice", "orderprice", "price", "Price")
-        trig_keys = ("newtriggerprice", "triggerprice", "triggerPrice", "TrigPrice")
+            if t: return t
+        price_keys = ("newprice","orderprice","price","Price")
+        trig_keys  = ("newtriggerprice","triggerprice","triggerPrice","TrigPrice")
         has_p = any(_pos(_num_f(s.get(k))) for k in price_keys)
         has_t = any(_pos(_num_f(s.get(k))) for k in trig_keys)
-        if has_t and has_p:
-            return "STOPLOSS"
-        if has_t and not has_p:
-            return "SL-M"
-        if has_p and not has_t:
-            return "LIMIT"
+        if has_t and has_p:   return "STOPLOSS"
+        if has_t and not has_p: return "SL-M"
+        if has_p and not has_t: return "LIMIT"
         return "MARKET"
 
-    # ---- data sources for live order (same) ----
-    def _fetch_order_details(sdk, uid: str, oid: str) -> Optional[dict]:
+    # ---- data sources for live order (UNCHANGED) ----
+    def _fetch_order_details(sdk, uid: str, oid: str) -> dict | None:
         try:
             resp = sdk.GetOrderDetails({"clientcode": uid, "uniqueorderid": oid})
             if isinstance(resp, dict) and resp.get("status") == "SUCCESS":
@@ -2620,9 +2605,9 @@ async def modify_order(request: Request, payload: dict = Body(...)):
             pass
         return None
 
-    def _fetch_order_book_row(sdk, uid: str, oid: str) -> Optional[dict]:
+    def _fetch_order_book_row(sdk, uid: str, oid: str) -> dict | None:
         try:
-            ts = now_ist_str().split(" ")[0] + " 09:00:00"  # "DD-MMM-YYYY 09:00:00"
+            ts = now_ist_str().split(" ")[0] + " 09:00:00"
             ob = sdk.GetOrderBook({"clientcode": uid, "datetimestamp": ts})
             rows = ob.get("data", []) if isinstance(ob, dict) else []
             for r in rows or []:
@@ -2634,8 +2619,8 @@ async def modify_order(request: Request, payload: dict = Body(...)):
 
     def _extract_last_mod(s: dict) -> str:
         for k in (
-            "lastmodifiedtime", "lastmodifieddatetime", "LastModifiedTime", "LastModifiedDatetime",
-            "recordinsertime", "recordinserttime", "RecordInsertTime", "modifydatetime", "modificationtime"
+            "lastmodifiedtime","lastmodifieddatetime","LastModifiedTime","LastModifiedDatetime",
+            "recordinsertime","recordinserttime","RecordInsertTime","modifydatetime","modificationtime"
         ):
             v = s.get(k)
             if isinstance(v, str) and v.strip():
@@ -2643,59 +2628,56 @@ async def modify_order(request: Request, payload: dict = Body(...)):
         return now_ist_str()
 
     def _extract_token(s: dict) -> str:
-        for k in ("symboltoken", "scripcode", "token", "SymbolToken", "ScripCode"):
+        for k in ("symboltoken","scripcode","token","SymbolToken","ScripCode"):
             v = s.get(k)
             if v not in (None, "", 0):
                 return str(v)
         return ""
 
-    def _extract_orderqty(s: dict) -> Optional[int]:
-        for k in ("orderqty", "quantity", "Quantity", "OrderQty"):
+    def _extract_orderqty(s: dict) -> int | None:
+        for k in ("orderqty","quantity","Quantity","OrderQty"):
             q = _num_i(s.get(k))
             if _pos(q):
                 return int(q)
         return None
 
-    # --------- build min-qty map once (same idea) ----------
-    min_qty_map: Dict[str, int] = {}
-    SQLITE_DB = globals().get("SQLITE_DB")  # your backend already uses this for symbols
-    try:
-        if SQLITE_DB:
-            conn = sqlite3.connect(SQLITE_DB)
-            cur = conn.cursor()
-            cur.execute('SELECT [Security ID], [Min Qty] FROM symbols')
-            for sid, q in cur.fetchall():
-                if sid:
-                    try:
-                        min_qty_map[str(sid)] = int(q) if q else 1
-                    except Exception:
-                        min_qty_map[str(sid)] = 1
-            conn.close()
-        else:
-            print("[MO][MODIFY] WARNING: SQLITE_DB not set", flush=True)
-    except Exception as e:
-        print(f"[MO][MODIFY] min-qty DB read error: {e}", flush=True)
-
-    # --------- resolve session (multiuser replacement for _load_client + _ensure_session) ----------
+    # --------- MULTIUSER replacement for _load_client + _ensure_session ----------
     def _get_session_for_row(r: dict) -> Optional[dict]:
         cid = str(r.get("client_id") or "").strip()
         if cid:
             s = mofsl_sessions.get(cid)
-            if isinstance(s, dict) and str(s.get("owner_userid", "")).strip() == str(owner_userid).strip():
+            if isinstance(s, dict) and str(s.get("owner_userid","")).strip() == str(owner_userid).strip():
                 return s
 
         needle = (r.get("name") or "").strip().lower()
         for _cid, s in list(mofsl_sessions.items()):
             if not isinstance(s, dict):
                 continue
-            if str(s.get("owner_userid", "")).strip() != str(owner_userid).strip():
+            if str(s.get("owner_userid","")).strip() != str(owner_userid).strip():
                 continue
             nm = (s.get("name") or s.get("display_name") or _cid or "").strip().lower()
             if nm == needle:
                 return s
         return None
 
-    # --------- process exactly one row (because frontend calls per-row) ----------
+    # --------- Build min-qty map once (same as your function) ----------
+    min_qty_map: Dict[str, int] = {}
+    try:
+        if os.path.exists(SQLITE_DB):
+            conn = sqlite3.connect(SQLITE_DB)
+            cur  = conn.cursor()
+            cur.execute('SELECT [Security ID], [Min Qty] FROM symbols')
+            for sid, q in cur.fetchall():
+                if sid:
+                    try: min_qty_map[str(sid)] = int(q) if q else 1
+                    except Exception: min_qty_map[str(sid)] = 1
+            conn.close()
+        else:
+            print(f"[MO][MODIFY] WARNING: SQLITE_DB not found at {SQLITE_DB}", flush=True)
+    except Exception as e:
+        print(f"[MO][MODIFY] min-qty DB read error: {e}", flush=True)
+
+    # --------- process one order row (frontend calls per selected order) ----------
     try:
         print("\n---- [MO][MODIFY] ROW (router) ----", flush=True)
         print(json.dumps(row, indent=2, default=str), flush=True)
@@ -2703,39 +2685,39 @@ async def modify_order(request: Request, payload: dict = Body(...)):
         pass
 
     name = (row.get("name") or "").strip() or "<unknown>"
-    oid = str(row.get("order_id") or row.get("orderId") or "").strip()
+    oid  = str(row.get("order_id") or row.get("orderId") or "").strip()
     if not oid:
-        raise HTTPException(status_code=400, detail="missing order_id")
+        return {"message": [f"ℹ️ {name}: skipped (missing order_id)"]}
 
     sess = _get_session_for_row(row)
     if not sess:
-        raise HTTPException(status_code=404, detail=f"{name} ({oid}): session not available")
+        return {"message": [f"❌ {name} ({oid}): session not available"]}
 
     uid = str(sess.get("userid") or sess.get("client_id") or "").strip()
     sdk = sess.get("mofsl")
     if not (uid and sdk):
-        raise HTTPException(status_code=404, detail=f"{name} ({oid}): session not ready")
+        return {"message": [f"❌ {name} ({oid}): session not available"]}
 
     price_in = row.get("price")
-    trig_in = row.get("triggerPrice", row.get("triggerprice"))
-    qty_shares_in = _num_i(row.get("quantity"))  # frontend sends SHARES
+    trig_in  = row.get("triggerPrice", row.get("triggerprice"))
+    qty_shares_in = _num_i(row.get("quantity"))   # router sends SHARES
 
     # Prefer order details; fallback to order book
     snap = _fetch_order_details(sdk, uid, oid)
     if not snap:
         snap = _fetch_order_book_row(sdk, uid, oid) or {}
 
-    token = _extract_token(snap)
-    min_qty = max(1, int(min_qty_map.get(token, 1))) if token else 1
-    shares = qty_shares_in if _pos(qty_shares_in) else (_extract_orderqty(snap) or 0)
-    lots = int(shares // min_qty) if _pos(shares) else 0
-    last_mod = _extract_last_mod(snap)
+    token     = _extract_token(snap)
+    min_qty   = max(1, int(min_qty_map.get(token, 1))) if token else 1
+    shares    = qty_shares_in if _pos(qty_shares_in) else _extract_orderqty(snap) or 0
+    lots      = int(shares // min_qty) if _pos(shares) else 0
+    last_mod  = _extract_last_mod(snap)
 
     if lots <= 0:
-        return {"status": "FAILED", "message": [f"❌ {name} ({oid}): cannot determine quantity in LOTS (shares={shares}, token={token}, min_qty={min_qty})"]}
+        return {"message": [f"❌ {name} ({oid}): cannot determine quantity in LOTS "
+                            f"(shares={shares}, token={token}, min_qty={min_qty})"]}
 
-    # Decide order type (always include)
-    # Frontend uses 'ordertype' key; your old loop used 'orderType'. We keep same logic, just read either.
+    # Decide order type (always include)  ✅ read BOTH keys used by UI
     ui_type = _ui_to_mo(row.get("orderType") or row.get("ordertype"))
     if not ui_type:  # NO_CHANGE
         ui_type = _infer_type_from_snapshot(snap)
@@ -2746,21 +2728,19 @@ async def modify_order(request: Request, payload: dict = Body(...)):
         "newordertype": ui_type or "MARKET",
         "neworderduration": str(row.get("validity") or "DAY").upper(),
         "newdisclosedquantity": 0,
-        "lastmodifiedtime": last_mod,  # exact echo
-        "newquantityinlot": lots,       # LOTS
+        "lastmodifiedtime": last_mod,
+        "newquantityinlot": lots,
     }
-    if _pos(_num_f(price_in)):
-        out["newprice"] = float(price_in)
-    if _pos(_num_f(trig_in)):
-        out["newtriggerprice"] = float(trig_in)
+    if _pos(_num_f(price_in)): out["newprice"] = float(price_in)
+    if _pos(_num_f(trig_in)):  out["newtriggerprice"] = float(trig_in)
 
-    # Type-specific validations (same)
+    # Type-specific validations (UNCHANGED)
     if out["newordertype"] == "LIMIT" and "newprice" not in out:
-        return {"status": "FAILED", "message": [f"❌ {name} ({oid}): LIMIT requires Price > 0"]}
+        return {"message": [f"❌ {name} ({oid}): LIMIT requires Price > 0"]}
     if out["newordertype"] == "STOPLOSS" and not (("newprice" in out) and ("newtriggerprice" in out)):
-        return {"status": "FAILED", "message": [f"❌ {name} ({oid}): STOPLOSS requires Price & Trigger > 0"]}
+        return {"message": [f"❌ {name} ({oid}): STOPLOSS requires Price & Trigger > 0"]}
     if out["newordertype"] == "SL-M" and "newtriggerprice" not in out:
-        return {"status": "FAILED", "message": [f"❌ {name} ({oid}): SL-M requires Trigger > 0"]}
+        return {"message": [f"❌ {name} ({oid}): SL-M requires Trigger > 0"]}
 
     try:
         print("---- [MO][MODIFY] OUT (payload) ----", flush=True)
@@ -2777,19 +2757,14 @@ async def modify_order(request: Request, payload: dict = Body(...)):
     except Exception:
         pass
 
-    # Normalize result (same)
     ok, msg = False, ""
     if isinstance(resp, dict):
         status = str(resp.get("Status") or resp.get("status") or "").lower()
-        code = str(resp.get("ErrorCode") or resp.get("errorCode") or "")
-        msg = resp.get("Message") or resp.get("message") or resp.get("ErrorMsg") or resp.get("errorMessage") or code
-        ok = ("success" in status) or (resp.get("Success") is True) or code in ("0", "200", "201")
+        code   = str(resp.get("ErrorCode") or resp.get("errorCode") or "")
+        msg    = resp.get("Message") or resp.get("message") or resp.get("ErrorMsg") or resp.get("errorMessage") or code
+        ok     = ("success" in status) or (resp.get("Success") is True) or code in ("0","200","201")
     else:
         ok = bool(resp)
         msg = "" if ok else str(resp)
 
-    return {
-        "status": "SUCCESS" if ok else "FAILED",
-        "message": [f"{'✅' if ok else '❌'} {name} ({oid}): {'Modified' if ok else (msg or 'modify failed')}"],
-        "broker_response": resp
-    }
+    return {"message": [f"{'✅' if ok else '❌'} {name} ({oid}): {'Modified' if ok else (msg or 'modify failed')}"]}
