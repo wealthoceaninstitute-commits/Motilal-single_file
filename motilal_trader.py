@@ -2416,146 +2416,149 @@ def fetch_master_orders(mofsl_master, master_userid: str):
         return []
 
 def process_copy_order(order: dict, setup: dict):
-    """
-    Copies NEW master orders to children and propagates CANCEL.
-    """
+
     owner = str(setup.get("owner_userid") or "").strip()
     setup_name = setup.get("name") or setup.get("id") or "setup"
     setup_key = f"{owner}:{setup.get('id') or setup_name}"
 
-    master_order_id = order.get("uniqueorderid") or order.get("UniqueOrderID")
-    master_order_id = str(master_order_id or "").strip()
+    master_order_id = str(order.get("uniqueorderid") or "").strip()
 
-    dt_obj = _parse_order_dt(order)
-    if not master_order_id or master_order_id == "0" or not dt_obj:
-        # Important: do NOT silently skip
+    if not master_order_id or master_order_id == "0":
+        return
+
+    # Parse time safely
+    dt_obj = None
+    try:
+        dt_obj = datetime.strptime(order.get("recordinserttime"), "%d-%b-%Y %H:%M:%S")
+    except:
+        pass
+
+    if not dt_obj:
         return
 
     order_time = int(dt_obj.timestamp())
-    amo_flag = _infer_amo_flag(dt_obj)
 
-    order_status = str(order.get("orderstatus") or order.get("OrderStatus") or "").upper().strip()
-    order_type = str(order.get("ordertype") or order.get("OrderType") or "").upper().strip()
+    current_time = int(time.time())
+
+    # FIX 1: Increase window from 5 sec → 120 sec
+    if (current_time - order_time) > 120:
+        return
+
+    order_status = str(order.get("orderstatus") or "").upper()
 
     processed_order_ids_placed.setdefault(setup_key, set())
     processed_order_ids_canceled.setdefault(setup_key, set())
     order_mapping.setdefault(setup_key, {})
 
-    current_time = int(time.time())
+    # -------------------------
+    # COPY NEW ORDER
+    # -------------------------
+    if order_status in ("CONFIRM", "TRADED"):
 
-    # If orderbook is delayed, allow wider window
-    if (current_time - order_time) > COPY_WINDOW_SECONDS:
-        return
-
-    # -----------------------
-    # Placement copy
-    # -----------------------
-    if (order_status in ("CONFIRM", "TRADED") or order_type in ("MARKET", "LIMIT", "STOPLOSS", "SL-M", "STOP_LOSS", "STOPLOSS_MARKET")):
         if master_order_id in processed_order_ids_placed[setup_key]:
             return
 
         children = setup.get("children") or []
         multipliers = setup.get("multipliers") or {}
 
-        if not children:
-            processed_order_ids_placed[setup_key].add(master_order_id)
-            return
-
-        print(f"🧬 [COPY] master={setup.get('master')} oid={master_order_id} status={order_status} type={order_type} children={len(children)} setup={setup_name}")
+        print(f"🧬 COPY triggered master={setup.get('master')} order={master_order_id}")
 
         for child_id in children:
-            child_id = str(child_id).strip()
-            if not child_id:
+
+            child_id = str(child_id)
+
+            # FIX 2: Ensure session exists (CRITICAL)
+            sess = mofsl_sessions.get(child_id)
+
+            if not sess or not sess.get("mofsl"):
+
+                print(f"🔁 logging child session {child_id}")
+
+                client_obj = _load_client_from_github(owner, child_id)
+
+                if client_obj:
+                    motilal_login(client_obj)
+                    sess = mofsl_sessions.get(child_id)
+
+            if not sess or not sess.get("mofsl"):
+                print(f"❌ child session still missing {child_id}")
                 continue
 
-            # Ensure child session exists (auto-login)
-            sess_child = _ensure_session_for_copy(owner, child_id)
-            if not isinstance(sess_child, dict) or not sess_child.get("mofsl"):
-                print(f"❌ [COPY] child session missing child={child_id} owner={owner}")
-                continue
+            mofsl_child = sess["mofsl"]
+            uid_child = sess["userid"]
 
-            mofsl_child = sess_child.get("mofsl")
-            uid_child = str(sess_child.get("userid") or child_id).strip()
+            multiplier = int(multipliers.get(child_id, 1))
 
-            try:
-                mult = int(multipliers.get(child_id, 1) or 1)
-            except Exception:
-                mult = 1
-            if mult <= 0:
-                mult = 1
+            master_qty = int(order.get("orderqty", 1))
+            total_qty = max(1, master_qty * multiplier)
 
             min_qty = _min_qty_from_symbol_db(order.get("symboltoken"))
-            master_qty = _safe_int(order.get("orderqty", 1), 1)  # master orderbook qty
-            total_qty = max(1, master_qty * mult)
 
-            # Convert shares -> lots like CT_FastAPI (qtyinlot)
             qty_lot = max(1, int(total_qty // max(1, min_qty)))
 
-            child_order_details = {
+            child_order = {
                 "clientcode": uid_child,
-                "exchange": (order.get("exchange") or "NSE"),
-                "symboltoken": _safe_int(order.get("symboltoken"), 0),
-                "buyorsell": (order.get("buyorsell") or ""),
-                "ordertype": normalize_ordertype_copytrade(order.get("ordertype", "")),
-                "producttype": (order.get("producttype") or "CNC"),
-                "orderduration": (order.get("validity") or order.get("orderduration") or "DAY"),
-                "price": _safe_float(order.get("price", 0), 0.0),
-                "triggerprice": _safe_float(order.get("triggerprice", 0), 0.0),
-                "quantityinlot": int(qty_lot),
-                "disclosedquantity": 0,
-                "amoorder": amo_flag,
+                "exchange": order.get("exchange"),
+                "symboltoken": int(order.get("symboltoken")),
+                "buyorsell": order.get("buyorsell"),
+                "ordertype": order.get("ordertype"),
+                "producttype": order.get("producttype"),
+                "orderduration": order.get("validity"),
+                "price": float(order.get("price", 0)),
+                "triggerprice": float(order.get("triggerprice", 0)),
+                "quantityinlot": qty_lot,
+                "amoorder": "N",
                 "algoid": "",
-                "goodtilldate": "",
                 "tag": setup_name
             }
 
             try:
-                resp = mofsl_child.PlaceOrder(child_order_details)
-                child_order_id = (resp or {}).get("uniqueorderid")
-                print(f"✅ [COPY] child={child_id} mult={mult} lot={qty_lot} resp_unique={child_order_id}")
+
+                resp = mofsl_child.PlaceOrder(child_order)
+
+                child_order_id = resp.get("uniqueorderid")
+
+                print(f"✅ child placed {child_id} order={child_order_id}")
+
                 if child_order_id:
                     order_mapping[setup_key].setdefault(master_order_id, {})[child_id] = child_order_id
+
             except Exception as e:
-                print(f"❌ [COPY] PlaceOrder exception child={child_id}: {e}")
+                print("❌ child place error:", e)
 
         processed_order_ids_placed[setup_key].add(master_order_id)
+
         return
 
-    # -----------------------
-    # Cancel propagation
-    # -----------------------
+
+    # -------------------------
+    # CANCEL PROPAGATION
+    # -------------------------
     if "CANCEL" in order_status:
+
         if master_order_id in processed_order_ids_canceled[setup_key]:
             return
 
-        child_map = order_mapping.get(setup_key, {}).get(master_order_id, {}) or {}
-        if not child_map:
-            processed_order_ids_canceled[setup_key].add(master_order_id)
-            return
-
-        print(f"🧨 [COPY] master CANCEL oid={master_order_id} -> children={len(child_map)} setup={setup_name}")
+        child_map = order_mapping.get(setup_key, {}).get(master_order_id, {})
 
         for child_id, child_order_id in child_map.items():
-            child_id = str(child_id).strip()
-            if not child_id or not child_order_id:
-                continue
 
-            sess_child = _ensure_session_for_copy(owner, child_id)
-            if not isinstance(sess_child, dict) or not sess_child.get("mofsl"):
-                print(f"❌ [COPY] child session missing for cancel child={child_id}")
-                continue
+            sess = mofsl_sessions.get(child_id)
 
-            mofsl_child = sess_child.get("mofsl")
-            uid_child = str(sess_child.get("userid") or child_id).strip()
+            if not sess or not sess.get("mofsl"):
+                continue
 
             try:
-                mofsl_child.CancelOrder(child_order_id, uid_child)
-                print(f"✅ [COPY] cancel propagated child={child_id} child_oid={child_order_id}")
+
+                sess["mofsl"].CancelOrder(child_order_id, sess["userid"])
+
+                print(f"✅ cancel propagated {child_id}")
+
             except Exception as e:
-                print(f"❌ [COPY] CancelOrder exception child={child_id}: {e}")
+
+                print("❌ cancel error:", e)
 
         processed_order_ids_canceled[setup_key].add(master_order_id)
-
 def synchronize_copy_trading():
     setups = load_active_copy_setups_all()
     if not setups:
