@@ -2552,30 +2552,36 @@ def process_copy_order(order: dict, setup: dict):
             qty_lot = max(1, int(total_qty // max(1, min_qty)))
 
            # --- build child order (CT_FastAPI style, robust keys) ---
+        ordertype = str(order.get("ordertype") or "").upper().strip()
+        orderduration = str(order.get("orderduration") or order.get("validity") or "DAY").upper().strip()
+        producttype = str(order.get("producttype") or "CNC").upper().strip()
+        amoorder = str(order.get("amoorder") or "N").upper().strip()
+        
+        # normalize common variants (safety)
+        if ordertype == "SL":
+            ordertype = "STOPLOSS"
+        if orderduration in ("DAY", "NORMAL"):
+            orderduration = "DAY"
+        if amoorder not in ("Y", "N"):
+            amoorder = "N"
+        
         child_order = {
             "clientcode": uid_child,
             "exchange": (order.get("exchange") or "NSE"),
             "symboltoken": int(order.get("symboltoken") or 0),
-            "buyorsell": (order.get("buyorsell") or ""),
-            "ordertype": (order.get("ordertype") or ""),
-            "producttype": (order.get("producttype") or "CNC"),
-        
-            # ✅ IMPORTANT: use orderduration first, fallback to validity, else DAY
-            "orderduration": (order.get("orderduration") or order.get("validity") or "DAY"),
-        
+            "buyorsell": str(order.get("buyorsell") or "").upper().strip(),
+            "ordertype": ordertype,
+            "producttype": producttype,
+            "orderduration": orderduration,
             "price": float(order.get("price") or 0),
             "triggerprice": float(order.get("triggerprice") or 0),
-        
             "quantityinlot": int(qty_lot),
-        
-            # ✅ add missing fields (Motilal expects these often)
             "disclosedquantity": 0,
-            "amoorder" : str(order.get("amoorder") or "N").upper().strip()
+            "amoorder": amoorder,
             "algoid": "",
             "goodtilldate": "",
             "tag": setup_name,
-        }
-        
+        }        
         try:
             print(f"📦 [COPY] child payload {child_id}: {child_order}")
             resp = mofsl_child.PlaceOrder(child_order)
