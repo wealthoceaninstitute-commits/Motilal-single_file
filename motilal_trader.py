@@ -2190,79 +2190,211 @@ async def place_order(request: Request, payload: dict = Body(...)):
 
 
 # ============================================================
-# COPY TRADING ENGINE (multi-user GitHub setups)
-# Order placement + cancel propagation
+# COPY TRADING ENGINE (FIXED) - multi-user GitHub setups
+# Copies master -> children even after restart by auto-logging sessions
 # ============================================================
 
+import threading
+import time
 import sqlite3
+from datetime import datetime
 
 # maps: {setup_key: {master_order_id: {child_id: child_order_id}}}
 order_mapping = {}
 processed_order_ids_placed = {}     # {setup_key: set()}
 processed_order_ids_canceled = {}   # {setup_key: set()}
 
+# Copy window (seconds): cloud orderbook updates can lag; 5s is too tight.
+COPY_WINDOW_SECONDS = 90
+
 def normalize_ordertype_copytrade(s: str) -> str:
     s = (s or "").upper()
     collapsed = s.replace("_", "").replace(" ", "").replace("-", "")
     return "STOPLOSS" if collapsed == "STOPLOSS" else s
 
-def _list_all_owner_userids():
-    """
-    Looks at GitHub folder: data/users
-    and returns directory names (userids).
-    """
-    owners = []
+def _safe_int(x, default=0):
     try:
-        entries = gh_list_dir("data/users")
-        for ent in entries or []:
-            if isinstance(ent, dict) and ent.get("type") == "dir":
-                nm = (ent.get("name") or "").strip()
-                if nm:
-                    owners.append(nm)
+        if x is None:
+            return default
+        s = str(x).strip()
+        if s == "":
+            return default
+        return int(float(s))
     except Exception:
-        owners = []
-    return owners
+        return default
 
-def load_active_copy_setups_all():
+def _safe_float(x, default=0.0):
+    try:
+        if x is None:
+            return default
+        s = str(x).strip()
+        if s == "":
+            return default
+        return float(s)
+    except Exception:
+        return default
+
+def _parse_order_dt(order: dict) -> datetime | None:
     """
-    Returns list of setups across all users:
-      each setup dict includes: owner_userid, id, name, master, children, multipliers
+    Motilal payloads vary. Try the common keys.
     """
-    setups = []
-    for owner in _list_all_owner_userids():
-        folder = user_copy_dir(owner)
+    for k in (
+        "recordinserttime",
+        "recordinsertime",      # seen in some payloads
+        "exchangetime",
+        "orderentrytime",
+        "lastmodifiedtime",
+        "lastmodifieddatetime",
+    ):
+        v = order.get(k)
+        if not v:
+            continue
         try:
-            entries = gh_list_dir(folder)
-            for ent in entries or []:
-                if not isinstance(ent, dict) or ent.get("type") != "file":
-                    continue
-                path = ent.get("path") or ""
-                name = ent.get("name") or ""
-                if not path or not str(name).endswith(".json"):
-                    continue
-                obj, _sha = gh_get_json(path)
-                if not isinstance(obj, dict) or not obj:
-                    continue
-                if not bool(obj.get("enabled", False)):
-                    continue
-                sid = (obj.get("id") or obj.get("name") or name.replace(".json", "")).strip()
-                setups.append({
-                    "owner_userid": owner,
-                    "id": sid,
-                    "name": obj.get("name", sid),
-                    "master": (obj.get("master") or obj.get("master_account") or "").strip(),
-                    "children": obj.get("children") or obj.get("child_accounts") or [],
-                    "multipliers": obj.get("multipliers") or {},
-                })
+            # typical: 17-Feb-2026 14:33:01
+            return datetime.strptime(str(v), "%d-%b-%Y %H:%M:%S")
+        except Exception:
+            pass
+    return None
+
+def _infer_amo_flag(dt_obj: datetime | None) -> str:
+    try:
+        if not dt_obj:
+            return "N"
+        t = dt_obj.time()
+        if t < datetime.strptime("09:00:00", "%H:%M:%S").time() or t > datetime.strptime("15:30:00", "%H:%M:%S").time():
+            return "Y"
+        return "N"
+    except Exception:
+        return "N"
+
+def _min_qty_from_symbol_db(symboltoken) -> int:
+    """
+    Use your existing symbols DB if present; otherwise fallback to 1.
+    Works with either SQLITE_DB or SYMBOL_DB_PATH globals.
+    """
+    try:
+        token = str(symboltoken).strip()
+        if not token:
+            return 1
+
+        db_path = globals().get("SQLITE_DB") or globals().get("SYMBOL_DB_PATH")
+        if not db_path:
+            return 1
+
+        table = globals().get("TABLE_NAME") or globals().get("SYMBOL_TABLE") or "symbols"
+        lock = globals().get("symbol_db_lock") or globals().get("_symbol_db_lock")
+
+        def _query():
+            conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
+            # CT_FastAPI schema uses [Min Qty] and [Security ID]
+            try:
+                cur.execute(f"SELECT [Min Qty] FROM {table} WHERE [Security ID]=?", (token,))
+            except Exception:
+                # fallback if table name differs
+                cur.execute("SELECT [Min Qty] FROM symbols WHERE [Security ID]=?", (token,))
+            row = cur.fetchone()
+            conn.close()
+            if row and row[0]:
+                return max(1, int(row[0]))
+            return 1
+
+        if lock:
+            with lock:
+                return _query()
+        return _query()
+    except Exception:
+        return 1
+
+def _client_dir(owner: str) -> str:
+    # your repo uses data/users/{owner}/clients
+    return f"data/users/{owner}/clients"
+
+def _load_client_from_github(owner: str, client_id: str) -> dict | None:
+    """
+    Loads the client json from GitHub and injects owner_userid for session binding.
+    Supports both {client_id}.json and any json containing matching userid.
+    """
+    owner = str(owner or "").strip()
+    client_id = str(client_id or "").strip()
+    if not owner or not client_id:
+        return None
+
+    folder = _client_dir(owner)
+    try:
+        entries = gh_list_dir(folder) or []
+    except Exception:
+        entries = []
+
+    # Prefer exact filename match first
+    preferred = f"{client_id}.json"
+    candidates = []
+
+    for ent in entries:
+        if not isinstance(ent, dict) or ent.get("type") != "file":
+            continue
+        nm = (ent.get("name") or "").strip()
+        path = (ent.get("path") or "").strip()
+        if not nm.endswith(".json") or not path:
+            continue
+        if nm == preferred:
+            candidates = [path]
+            break
+        candidates.append(path)
+
+    for path in candidates:
+        try:
+            obj, _sha = gh_get_json(path)
+            if not isinstance(obj, dict) or not obj:
+                continue
+            uid = str(obj.get("userid") or obj.get("client_id") or "").strip()
+            if uid == client_id or path.endswith(f"/{preferred}"):
+                obj = dict(obj)
+                obj["owner_userid"] = owner
+                return obj
         except Exception:
             continue
-    return setups
+
+    return None
+
+def _ensure_session_for_copy(owner: str, client_id: str):
+    """
+    Ensures mofsl_sessions[client_id] exists and is fresh for this owner.
+    Uses motilal_login() with GitHub client json when needed.
+    """
+    owner = str(owner or "").strip()
+    client_id = str(client_id or "").strip()
+    if not owner or not client_id:
+        return None
+
+    sess = mofsl_sessions.get(client_id)
+    if isinstance(sess, dict) and _session_fresh(sess) and str(sess.get("owner_userid") or "").strip() == owner and sess.get("mofsl"):
+        return sess
+
+    client_obj = _load_client_from_github(owner, client_id)
+    if not client_obj:
+        print(f"❌ [COPY] Client file not found for owner={owner} client_id={client_id}")
+        return None
+
+    ok = False
+    try:
+        ok = bool(motilal_login(client_obj))
+    except Exception as e:
+        print(f"❌ [COPY] motilal_login exception owner={owner} client_id={client_id}: {e}")
+        ok = False
+
+    if not ok:
+        print(f"❌ [COPY] Login failed owner={owner} client_id={client_id}")
+        return None
+
+    sess = mofsl_sessions.get(client_id)
+    if isinstance(sess, dict) and sess.get("mofsl"):
+        return sess
+
+    print(f"❌ [COPY] Session missing after login owner={owner} client_id={client_id}")
+    return None
 
 def get_session_by_clientid(client_id: str):
-    """
-    Sessions are keyed by client_id (userid).
-    Returns (name, mofsl, userid, owner_userid) or (None,...)
-    """
     sess = mofsl_sessions.get(str(client_id).strip())
     if not isinstance(sess, dict):
         return None, None, None, None
@@ -2283,69 +2415,27 @@ def fetch_master_orders(mofsl_master, master_userid: str):
     except Exception:
         return []
 
-def _min_qty_from_symbol_db(symboltoken):
-    """
-    Optional: if your symbols sqlite exists and has Min Qty.
-    Falls back to 1.
-    """
-    try:
-        # These globals exist in CT_FastAPI-style code. If missing, fallback.
-        SQLITE_DB = globals().get("SQLITE_DB")
-        symbol_db_lock = globals().get("symbol_db_lock")
-
-        if not SQLITE_DB:
-            return 1
-
-        conn = None
-        if symbol_db_lock:
-            with symbol_db_lock:
-                conn = sqlite3.connect(SQLITE_DB)
-                cur = conn.cursor()
-                cur.execute("SELECT [Min Qty] FROM symbols WHERE [Security ID]=?", (str(symboltoken),))
-                row = cur.fetchone()
-                conn.close()
-        else:
-            conn = sqlite3.connect(SQLITE_DB)
-            cur = conn.cursor()
-            cur.execute("SELECT [Min Qty] FROM symbols WHERE [Security ID]=?", (str(symboltoken),))
-            row = cur.fetchone()
-            conn.close()
-
-        if row and row[0]:
-            return max(1, int(row[0]))
-    except Exception:
-        pass
-    return 1
-
 def process_copy_order(order: dict, setup: dict):
     """
     Copies NEW master orders to children and propagates CANCEL.
     """
-    owner = setup.get("owner_userid") or ""
+    owner = str(setup.get("owner_userid") or "").strip()
     setup_name = setup.get("name") or setup.get("id") or "setup"
     setup_key = f"{owner}:{setup.get('id') or setup_name}"
 
-    master_order_id = order.get("uniqueorderid")
-    order_time_str = order.get("recordinserttime")
+    master_order_id = order.get("uniqueorderid") or order.get("UniqueOrderID")
+    master_order_id = str(master_order_id or "").strip()
 
-    if (not master_order_id or str(master_order_id) == "0" or
-        not order_time_str or order_time_str in ("", "0", None)):
+    dt_obj = _parse_order_dt(order)
+    if not master_order_id or master_order_id == "0" or not dt_obj:
+        # Important: do NOT silently skip
         return
 
-    # parse order time and AMO flag
-    try:
-        order_time_dt = datetime.strptime(order_time_str, "%d-%b-%Y %H:%M:%S")
-        order_time = int(order_time_dt.timestamp())
-        if order_time_dt.time() < datetime.strptime("09:00:00", "%H:%M:%S").time() or \
-           order_time_dt.time() > datetime.strptime("15:30:00", "%H:%M:%S").time():
-            amo_flag = "Y"
-        else:
-            amo_flag = "N"
-    except Exception:
-        return
+    order_time = int(dt_obj.timestamp())
+    amo_flag = _infer_amo_flag(dt_obj)
 
-    order_status = (order.get("orderstatus") or "").upper()
-    order_type = (order.get("ordertype") or "").upper()
+    order_status = str(order.get("orderstatus") or order.get("OrderStatus") or "").upper().strip()
+    order_type = str(order.get("ordertype") or order.get("OrderType") or "").upper().strip()
 
     processed_order_ids_placed.setdefault(setup_key, set())
     processed_order_ids_canceled.setdefault(setup_key, set())
@@ -2353,27 +2443,39 @@ def process_copy_order(order: dict, setup: dict):
 
     current_time = int(time.time())
 
+    # If orderbook is delayed, allow wider window
+    if (current_time - order_time) > COPY_WINDOW_SECONDS:
+        return
+
     # -----------------------
     # Placement copy
     # -----------------------
-    if order_type == "MARKET" or order_status in ("CONFIRM", "TRADED"):
+    if (order_status in ("CONFIRM", "TRADED") or order_type in ("MARKET", "LIMIT", "STOPLOSS", "SL-M", "STOP_LOSS", "STOPLOSS_MARKET")):
         if master_order_id in processed_order_ids_placed[setup_key]:
             return
-        if (current_time - order_time) > 5:
-            return  # too old, skip copy
 
         children = setup.get("children") or []
         multipliers = setup.get("multipliers") or {}
+
+        if not children:
+            processed_order_ids_placed[setup_key].add(master_order_id)
+            return
+
+        print(f"🧬 [COPY] master={setup.get('master')} oid={master_order_id} status={order_status} type={order_type} children={len(children)} setup={setup_name}")
 
         for child_id in children:
             child_id = str(child_id).strip()
             if not child_id:
                 continue
 
-            # child must be logged-in and belong to same owner
-            cname, mofsl_child, uid_child, owner_child = get_session_by_clientid(child_id)
-            if not mofsl_child or str(owner_child).strip() != str(owner).strip():
+            # Ensure child session exists (auto-login)
+            sess_child = _ensure_session_for_copy(owner, child_id)
+            if not isinstance(sess_child, dict) or not sess_child.get("mofsl"):
+                print(f"❌ [COPY] child session missing child={child_id} owner={owner}")
                 continue
+
+            mofsl_child = sess_child.get("mofsl")
+            uid_child = str(sess_child.get("userid") or child_id).strip()
 
             try:
                 mult = int(multipliers.get(child_id, 1) or 1)
@@ -2383,14 +2485,14 @@ def process_copy_order(order: dict, setup: dict):
                 mult = 1
 
             min_qty = _min_qty_from_symbol_db(order.get("symboltoken"))
-            master_qty = _safe_int(order.get("orderqty", 1), 1)
+            master_qty = _safe_int(order.get("orderqty", 1), 1)  # master orderbook qty
             total_qty = max(1, master_qty * mult)
 
-            # keep lot alignment like CT logic (simple)
-            adjusted_qty = max(1, int(total_qty // max(1, min_qty)))
+            # Convert shares -> lots like CT_FastAPI (qtyinlot)
+            qty_lot = max(1, int(total_qty // max(1, min_qty)))
 
             child_order_details = {
-                "clientcode": str(uid_child or child_id),
+                "clientcode": uid_child,
                 "exchange": (order.get("exchange") or "NSE"),
                 "symboltoken": _safe_int(order.get("symboltoken"), 0),
                 "buyorsell": (order.get("buyorsell") or ""),
@@ -2399,7 +2501,7 @@ def process_copy_order(order: dict, setup: dict):
                 "orderduration": (order.get("validity") or order.get("orderduration") or "DAY"),
                 "price": _safe_float(order.get("price", 0), 0.0),
                 "triggerprice": _safe_float(order.get("triggerprice", 0), 0.0),
-                "quantityinlot": int(adjusted_qty),
+                "quantityinlot": int(qty_lot),
                 "disclosedquantity": 0,
                 "amoorder": amo_flag,
                 "algoid": "",
@@ -2410,10 +2512,11 @@ def process_copy_order(order: dict, setup: dict):
             try:
                 resp = mofsl_child.PlaceOrder(child_order_details)
                 child_order_id = (resp or {}).get("uniqueorderid")
+                print(f"✅ [COPY] child={child_id} mult={mult} lot={qty_lot} resp_unique={child_order_id}")
                 if child_order_id:
                     order_mapping[setup_key].setdefault(master_order_id, {})[child_id] = child_order_id
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"❌ [COPY] PlaceOrder exception child={child_id}: {e}")
 
         processed_order_ids_placed[setup_key].add(master_order_id)
         return
@@ -2421,26 +2524,35 @@ def process_copy_order(order: dict, setup: dict):
     # -----------------------
     # Cancel propagation
     # -----------------------
-    if order_status == "CANCEL":
+    if "CANCEL" in order_status:
         if master_order_id in processed_order_ids_canceled[setup_key]:
             return
-        if (current_time - order_time) > 5:
-            processed_order_ids_canceled[setup_key].add(master_order_id)
-            return
 
-        child_map = order_mapping.get(setup_key, {}).get(master_order_id, {})
+        child_map = order_mapping.get(setup_key, {}).get(master_order_id, {}) or {}
         if not child_map:
             processed_order_ids_canceled[setup_key].add(master_order_id)
             return
 
-        for child_id, child_order_id in (child_map or {}).items():
-            cname, mofsl_child, uid_child, owner_child = get_session_by_clientid(child_id)
-            if not mofsl_child or str(owner_child).strip() != str(owner).strip():
+        print(f"🧨 [COPY] master CANCEL oid={master_order_id} -> children={len(child_map)} setup={setup_name}")
+
+        for child_id, child_order_id in child_map.items():
+            child_id = str(child_id).strip()
+            if not child_id or not child_order_id:
                 continue
+
+            sess_child = _ensure_session_for_copy(owner, child_id)
+            if not isinstance(sess_child, dict) or not sess_child.get("mofsl"):
+                print(f"❌ [COPY] child session missing for cancel child={child_id}")
+                continue
+
+            mofsl_child = sess_child.get("mofsl")
+            uid_child = str(sess_child.get("userid") or child_id).strip()
+
             try:
-                mofsl_child.CancelOrder(child_order_id, str(uid_child or child_id))
-            except Exception:
-                pass
+                mofsl_child.CancelOrder(child_order_id, uid_child)
+                print(f"✅ [COPY] cancel propagated child={child_id} child_oid={child_order_id}")
+            except Exception as e:
+                print(f"❌ [COPY] CancelOrder exception child={child_id}: {e}")
 
         processed_order_ids_canceled[setup_key].add(master_order_id)
 
@@ -2449,35 +2561,38 @@ def synchronize_copy_trading():
     if not setups:
         return
 
-    threads = []
-
     def handle_setup(setup):
-        owner = setup.get("owner_userid") or ""
-        master_id = (setup.get("master") or "").strip()
-        if not master_id:
+        owner = str(setup.get("owner_userid") or "").strip()
+        master_id = str(setup.get("master") or "").strip()
+        if not owner or not master_id:
             return
 
-        mname, mofsl_master, uid_master, owner_master = get_session_by_clientid(master_id)
-        if not mofsl_master or str(owner_master).strip() != str(owner).strip():
+        # Ensure master session exists (auto-login)
+        sess_master = _ensure_session_for_copy(owner, master_id)
+        if not isinstance(sess_master, dict) or not sess_master.get("mofsl"):
+            print(f"❌ [COPY] master session missing master={master_id} owner={owner}")
             return
 
-        master_orders = fetch_master_orders(mofsl_master, uid_master or master_id)
-        for order in master_orders or []:
+        mofsl_master = sess_master.get("mofsl")
+        uid_master = str(sess_master.get("userid") or master_id).strip()
+
+        master_orders = fetch_master_orders(mofsl_master, uid_master) or []
+        for order in master_orders:
             try:
                 process_copy_order(order, setup)
-            except Exception:
-                continue
+            except Exception as e:
+                print(f"❌ [COPY] process_copy_order error: {e}")
 
+    threads = []
     for setup in setups:
         t = threading.Thread(target=handle_setup, args=(setup,))
         t.start()
         threads.append(t)
-
     for t in threads:
         t.join()
 
 def motilal_copy_trading_loop():
-    print("✅ Motilal Copy Trading Engine started")
+    print("✅ Motilal Copy Trading Engine started (FIXED)")
     while True:
         try:
             synchronize_copy_trading()
@@ -2485,7 +2600,6 @@ def motilal_copy_trading_loop():
             print("❌ Copy trading sync error:", str(e))
         time.sleep(1)
 
-# Call this once from your existing startup (or add a startup event below)
 _copy_thread_started = False
 def start_copy_trading_thread():
     global _copy_thread_started
@@ -2494,12 +2608,9 @@ def start_copy_trading_thread():
     _copy_thread_started = True
     threading.Thread(target=motilal_copy_trading_loop, daemon=True).start()
 
-# If you already have @app.on_event("startup") in your file, do NOT add another.
-# Instead, call start_copy_trading_thread() inside your existing startup.
 @app.on_event("startup")
 def _startup_copy_trading():
     start_copy_trading_thread()
-
 
 from typing import Any, Dict, List, Optional
 import json
