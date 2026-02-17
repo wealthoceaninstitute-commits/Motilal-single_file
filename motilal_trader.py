@@ -2570,7 +2570,7 @@ def process_copy_order(order: dict, setup: dict):
         
             # ✅ add missing fields (Motilal expects these often)
             "disclosedquantity": 0,
-            "amoorder": (order.get("amoorder") or "N"),
+            "amoorder" : str(order.get("amoorder") or "N").upper().strip()
             "algoid": "",
             "goodtilldate": "",
             "tag": setup_name,
