@@ -1946,25 +1946,37 @@ def _get_group_members(owner_userid: str, group_name: str):
 
 @app.post("/place_order")
 async def place_order(request: Request, payload: dict = Body(...)):
+    import json
+    import threading
+
     owner_userid = _resolve_owner_userid_local(request, payload or {})
     if not owner_userid:
         raise HTTPException(status_code=401, detail="Missing owner userid")
 
     data = payload or {}
+
+    # =========================
+    # DEBUG: print raw payload
+    # =========================
+    try:
+        print("📨 /place_order RAW =", json.dumps(data, ensure_ascii=False, default=str))
+    except Exception:
+        print("📨 /place_order RAW (non-jsonable) =", data)
+
     exch, symboltoken = _parse_symbol_token(data)
     if not symboltoken:
         raise HTTPException(status_code=400, detail="Missing/invalid symbol token")
 
     # what frontend sends
     groupacc = bool(data.get("groupacc", False))
-    groups = data.get("groups", []) or []
-    clients = data.get("clients", []) or []
+    groups_raw = data.get("groups", []) or []
+    clients_raw = data.get("clients", []) or []
 
     diffQty = bool(data.get("diffQty", False))
     multiplier_on = bool(data.get("multiplier", False))
 
     quantityinlot = _safe_int(data.get("quantityinlot", 0), 0)
-    perClientQty = data.get("perClientQty", {}) or {}
+    perClientQty_raw = data.get("perClientQty", {}) or {}
 
     action = (data.get("action") or "").strip().upper()
     ordertype = (data.get("ordertype") or "").strip().upper()
@@ -1976,22 +1988,128 @@ async def place_order(request: Request, payload: dict = Body(...)):
     disclosedquantity = _safe_int(data.get("disclosedquantity", 0), 0)
     amoorder = (data.get("amoorder") or "N").strip().upper()
 
+    # =========================
+    # DEBUG: show shapes
+    # =========================
+    try:
+        print("🔎 groupacc:", groupacc, "diffQty:", diffQty, "multiplier_on:", multiplier_on)
+        print("🔎 clients_raw type:", type(clients_raw), "len:", (len(clients_raw) if isinstance(clients_raw, list) else "NA"))
+        if isinstance(clients_raw, list) and clients_raw:
+            print("🔎 clients_raw[0] type:", type(clients_raw[0]), "value:", clients_raw[0])
+
+        print("🔎 groups_raw type:", type(groups_raw), "len:", (len(groups_raw) if isinstance(groups_raw, list) else "NA"))
+        if isinstance(groups_raw, list) and groups_raw:
+            print("🔎 groups_raw[0] type:", type(groups_raw[0]), "value:", groups_raw[0])
+
+        print("🔎 perClientQty_raw type:", type(perClientQty_raw), "sample keys:",
+              (list(perClientQty_raw.keys())[:3] if isinstance(perClientQty_raw, dict) else "NA"))
+    except Exception as _e:
+        print("🔎 shape debug error:", _e)
+
+    # =========================
+    # NORMALIZATION HELPERS
+    # =========================
+    def _to_client_id(x):
+        # frontend may send "WOIE123" OR {userid/client_id/client_code}
+        if isinstance(x, str):
+            return x.strip()
+        if isinstance(x, dict):
+            return str(x.get("userid") or x.get("client_id") or x.get("client_code") or x.get("id") or "").strip()
+        return str(x).strip()
+
+    def _to_group_name(x):
+        # frontend may send "All" OR {name/group/group_name/label}
+        if isinstance(x, str):
+            return x.strip()
+        if isinstance(x, dict):
+            return str(x.get("name") or x.get("group") or x.get("group_name") or x.get("label") or "").strip()
+        return str(x).strip()
+
+    def _normalize_per_client_qty(d):
+        """
+        perClientQty keys might be:
+        - "WOIE123": 2
+        - OR "{broker:'motilal',userid:'WOIE123'}": 2  (object turned into string)
+        - OR nested objects
+        We normalize keys to actual client_id.
+        """
+        out = {}
+        if not isinstance(d, dict):
+            return out
+        for k, v in d.items():
+            cid = ""
+            if isinstance(k, str):
+                cid = k.strip()
+                # attempt to parse stringified dict-ish keys
+                # e.g. "{'broker': 'motilal', 'userid': 'WOIE1229'}"
+                if ("userid" in cid or "client_id" in cid or "client_code" in cid) and ("{" in cid and "}" in cid):
+                    # very tolerant extraction without eval
+                    import re
+                    m = re.search(r"(?:userid|client_id|client_code)'\s*:\s*'([^']+)'", cid)
+                    if not m:
+                        m = re.search(r'(?:userid|client_id|client_code)"\s*:\s*"([^"]+)"', cid)
+                    if m:
+                        cid = m.group(1).strip()
+            elif isinstance(k, dict):
+                cid = _to_client_id(k)
+            else:
+                cid = str(k).strip()
+
+            if not cid:
+                continue
+
+            out[cid] = _safe_int(v, _safe_int(quantityinlot, 1))
+        return out
+
+    # normalize lists
+    clients = []
+    if isinstance(clients_raw, list):
+        for c in clients_raw:
+            cid = _to_client_id(c)
+            if cid:
+                clients.append(cid)
+
+    groups = []
+    if isinstance(groups_raw, list):
+        for g in groups_raw:
+            gn = _to_group_name(g)
+            if gn:
+                groups.append(gn)
+
+    perClientQty = _normalize_per_client_qty(perClientQty_raw)
+
+    print("✅ Normalized clients:", clients)
+    print("✅ Normalized groups:", groups)
+    print("✅ Normalized perClientQty keys:", list(perClientQty.keys())[:10])
+
+    # =========================
     # Build targets: list of (tag, client_id, qty)
+    # =========================
     targets = []
 
     if groupacc:
-        for g in groups:
-            gname = str(g).strip()
+        for gname in groups:
+            gname = str(gname).strip()
             if not gname:
                 continue
             members, gmult = _get_group_members(owner_userid, gname)
-            for cid in members:
+            # normalize members too (safety)
+            norm_members = []
+            for m in (members or []):
+                mid = _to_client_id(m)
+                if mid:
+                    norm_members.append(mid)
+
+            for cid in norm_members:
                 base_qty = quantityinlot
                 if diffQty:
                     base_qty = _safe_int(perClientQty.get(cid, base_qty), base_qty)
                 if multiplier_on:
-                    base_qty = max(1, int(round(base_qty * float(gmult))))
-                targets.append((gname, cid, base_qty))
+                    try:
+                        base_qty = max(1, int(round(float(base_qty) * float(gmult))))
+                    except Exception:
+                        base_qty = max(1, int(base_qty))
+                targets.append((gname, cid, int(max(1, base_qty))))
     else:
         for cid in clients:
             cid = str(cid).strip()
@@ -2000,20 +2118,56 @@ async def place_order(request: Request, payload: dict = Body(...)):
             q = quantityinlot
             if diffQty:
                 q = _safe_int(perClientQty.get(cid, q), q)
-            targets.append(("", cid, q))
+            targets.append(("", cid, int(max(1, q))))
 
     if not targets:
         raise HTTPException(status_code=400, detail="No target clients/groups selected")
 
+    # =========================
+    # Place orders (threaded)
+    # =========================
     responses = {}
     lock = threading.Lock()
     threads = []
 
+    # OPTIONAL: attempt auto-login if session missing (useful after Railway restart)
+    AUTO_LOGIN_ON_MISSING_SESSION = True
+
+    def _try_restore_session(client_id: str):
+        """
+        Restore session by loading client json from GitHub and calling motilal_login.
+        NO schema change, no extra inputs.
+        """
+        try:
+            path = f"data/users/{owner_userid}/clients/{client_id}.json"
+            client_obj, _sha = gh_get_json(path)
+            if not isinstance(client_obj, dict):
+                return False
+            # tag owner only at runtime
+            client_obj["owner_userid"] = str(owner_userid).strip()
+            return bool(motilal_login(client_obj))
+        except Exception as e:
+            print(f"⚠️ restore_session failed for {client_id}: {e}")
+            return False
+
     def _place_one(tag: str, client_id: str, qty: int):
         key = f"{tag}:{client_id}" if tag else client_id
 
-        sess = mofsl_sessions.get(str(client_id))
-        if not isinstance(sess, dict):
+        # IMPORTANT: client_id must be a string id now
+        cid = str(client_id or "").strip()
+        if not cid:
+            with lock:
+                responses[key] = {"status": "ERROR", "message": "Invalid client id"}
+            return
+
+        sess = mofsl_sessions.get(cid)
+        if not isinstance(sess, dict) or not sess.get("mofsl"):
+            if AUTO_LOGIN_ON_MISSING_SESSION:
+                ok = _try_restore_session(cid)
+                if ok:
+                    sess = mofsl_sessions.get(cid)
+
+        if not isinstance(sess, dict) or not sess.get("mofsl"):
             with lock:
                 responses[key] = {"status": "ERROR", "message": "Session not found"}
             return
@@ -2026,7 +2180,7 @@ async def place_order(request: Request, payload: dict = Body(...)):
             return
 
         mofsl = sess.get("mofsl")
-        uid = sess.get("userid") or client_id
+        uid = sess.get("userid") or cid
         if not mofsl or not uid:
             with lock:
                 responses[key] = {"status": "ERROR", "message": "Invalid session"}
@@ -2042,7 +2196,7 @@ async def place_order(request: Request, payload: dict = Body(...)):
             "orderduration": orderduration,
             "price": float(price),
             "triggerprice": float(triggerprice),
-            "quantityinlot": int(max(1, qty)),
+            "quantityinlot": int(max(1, int(qty))),
             "disclosedquantity": int(disclosedquantity),
             "amoorder": amoorder,
             "algoid": "",
@@ -2051,6 +2205,8 @@ async def place_order(request: Request, payload: dict = Body(...)):
         }
 
         try:
+            # DEBUG: print what we send to broker for this client
+            print(f"🧾 PlaceOrder -> {key} payload:", order_payload)
             resp = mofsl.PlaceOrder(order_payload)
         except Exception as e:
             resp = {"status": "ERROR", "message": str(e)}
