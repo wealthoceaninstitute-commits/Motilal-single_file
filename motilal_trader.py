@@ -1608,20 +1608,17 @@ async def close_position(request: Request, payload: dict = Body(...)):
 
 
 # =========================
-# HOLDINGS + SUMMARY (CT_FastAPI replica)
+# HOLDINGS + SUMMARY (CT_FastAPI replica)  ✅ FIXED: per-user summary cache
 # =========================
-# Copy exactly into motilal_trader (9).py by REPLACING your existing
-# "HOLDINGS AND SUMMARY" section with this block.
-#
-# Logic source: CT_FastAPI.py (/get_holdings + /get_summary) :contentReference[oaicite:0]{index=0}
+# Replace your existing "HOLDINGS AND SUMMARY" section with this block.
 
-# cache last computed summary for /get_summary (same keyword)
-# Desktop-style capital cache
+from fastapi import Request
 
+# ✅ Per-user cache: summary_data_global[owner_userid] = { name: {...summary...}, ... }
 summary_data_global = {}
 
+
 def get_available_margin(Mofsl, clientcode):
-    # CT_FastAPI keyword + logic :contentReference[oaicite:1]{index=1}
     try:
         margin_response = Mofsl.GetReportMarginSummary(clientcode)
         if margin_response.get("status") != "SUCCESS":
@@ -1633,9 +1630,14 @@ def get_available_margin(Mofsl, clientcode):
         print(f"❌ Error fetching margin for {clientcode}: {e}")
     return 0
 
+
 @app.get("/get_holdings")
 def get_holdings(request: Request, userid: str = None, user_id: str = None):
     owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
+
+    # 🚫 CRITICAL: without userid we must not mix users
+    if not owner_userid:
+        return {"ok": False, "error": "userid missing for get_holdings"}
 
     holdings_data = []
     summary_data = {}
@@ -1645,29 +1647,28 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
     # =========================
     client_capital_map = {}
     try:
-        if owner_userid:
-            folder = f"data/users/{owner_userid}/clients"
-            entries = gh_list_dir(folder) or []
+        folder = f"data/users/{owner_userid}/clients"
+        entries = gh_list_dir(folder) or []
 
-            for ent in entries:
-                if not isinstance(ent, dict) or ent.get("type") != "file":
-                    continue
-                if not (str(ent.get("name", "")).endswith(".json") and ent.get("path")):
-                    continue
+        for ent in entries:
+            if not isinstance(ent, dict) or ent.get("type") != "file":
+                continue
+            if not (str(ent.get("name", "")).endswith(".json") and ent.get("path")):
+                continue
 
-                client_obj, _sha = gh_get_json(ent["path"])
-                if not isinstance(client_obj, dict):
-                    continue
+            client_obj, _sha = gh_get_json(ent["path"])
+            if not isinstance(client_obj, dict):
+                continue
 
-                cid = str(client_obj.get("userid", client_obj.get("client_id", "")) or "").strip()
-                nm = str(client_obj.get("name", "") or cid).strip()
+            cid = str(client_obj.get("userid", client_obj.get("client_id", "")) or "").strip()
+            nm = str(client_obj.get("name", "") or cid).strip()
 
-                cap = client_obj.get("capital", None) or client_obj.get("base_amount", None) or 0
+            cap = client_obj.get("capital", None) or client_obj.get("base_amount", None) or 0
 
-                if cid:
-                    client_capital_map[cid] = cap
-                if nm:
-                    client_capital_map[nm] = cap
+            if cid:
+                client_capital_map[cid] = cap
+            if nm:
+                client_capital_map[nm] = cap
 
     except Exception as e:
         print("Capital map build error:", e)
@@ -1680,8 +1681,8 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
             if not isinstance(sess, dict):
                 continue
 
-            # per-user filter
-            if owner_userid and str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
+            # ✅ hard per-user filter (prevents pra seeing mah sessions)
+            if str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
                 continue
 
             name = sess.get("name", "") or client_id
@@ -1705,6 +1706,7 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
                 buy_avg = float(holding.get("buyavgprice", 0) or 0)
                 scripcode = holding.get("nsesymboltoken")
 
+                # ✅ filter holdings with qty > 0
                 if not scripcode or quantity <= 0:
                     continue
 
@@ -1765,19 +1767,27 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
         except Exception as e:
             print(f"❌ Error fetching holdings for {client_id}: {e}")
 
+    # ✅ store summary per user (NOT global overwrite)
     global summary_data_global
-    summary_data_global = summary_data
+    summary_data_global[str(owner_userid).strip()] = summary_data
 
     return {
         "holdings": holdings_data,
         "summary": list(summary_data.values())
     }
 
-@app.get("/get_summary")
-def get_summary():
-    global summary_data_global
-    return {"summary": list((summary_data_global or {}).values())}
 
+@app.get("/get_summary")
+def get_summary(request: Request, userid: str = None, user_id: str = None):
+    owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
+
+    # 🚫 CRITICAL: without userid we must not return cross-user summary
+    if not owner_userid:
+        return {"ok": False, "error": "userid missing for get_summary", "summary": []}
+
+    global summary_data_global
+    data = (summary_data_global or {}).get(str(owner_userid).strip(), {}) or {}
+    return {"summary": list(data.values())}
 
 # ============================================================
 # PLACE ORDER (multi-user, sessions keyed by client_id)
