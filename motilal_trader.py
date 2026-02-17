@@ -481,34 +481,38 @@ def _require_fields(d: Dict[str, Any], keys: List[str]):
         raise HTTPException(status_code=400, detail=f"Missing required fields: {', '.join(missing)}")
 
 # =========================
-# Motilal LOGIN (Optimized Session Reuse like CT_FastAPI)
+# Motilal LOGIN + CLIENT ROUTES (Session reuse, no schema change)
 # =========================
 
+import os
+import time
 import threading
+from typing import Any, Dict
+from fastapi import Body, HTTPException, Request
 
 Base_Url = "https://openapi.motilaloswal.com"
 SourceID = "Desktop"
 browsername = "chrome"
 browserversion = "104"
 
-# CT_FastAPI style sessions in memory
+# same structure as CT_FastAPI
 mofsl_sessions: Dict[str, Dict[str, Any]] = {}
 
-# Session TTL to decide "freshness" (seconds). 6 hours default.
-SESSION_TTL_SECONDS = int(os.getenv("MO_SESSION_TTL_SECONDS", "21600"))
+# Session TTL for reuse (default 6 hours)
+_SESSION_TTL_SECONDS = int(os.getenv("MO_SESSION_TTL_SECONDS", "21600"))
 
-# Per-client lock so parallel requests don't trigger parallel logins
-_session_locks: Dict[str, threading.Lock] = {}
-
-
-def _get_lock(client_id: str) -> threading.Lock:
-    client_id = str(client_id or "").strip()
-    if client_id not in _session_locks:
-        _session_locks[client_id] = threading.Lock()
-    return _session_locks[client_id]
+# Per-client lock to prevent login storms
+_login_locks: Dict[str, threading.Lock] = {}
 
 
-def _norm_owner(uid: str) -> str:
+def _lock_for(userid: str) -> threading.Lock:
+    u = str(userid or "").strip()
+    if u not in _login_locks:
+        _login_locks[u] = threading.Lock()
+    return _login_locks[u]
+
+
+def _norm_uid(uid: str) -> str:
     uid = str(uid or "").strip()
     # handle %22pra%22 and "pra"
     if (uid.startswith('"') and uid.endswith('"')) or (uid.startswith("'") and uid.endswith("'")):
@@ -516,7 +520,7 @@ def _norm_owner(uid: str) -> str:
     return uid
 
 
-def _session_is_fresh(sess: dict) -> bool:
+def _session_fresh(sess: dict) -> bool:
     try:
         if not isinstance(sess, dict):
             return False
@@ -525,42 +529,45 @@ def _session_is_fresh(sess: dict) -> bool:
         ts = int(sess.get("login_ts") or 0)
         if ts <= 0:
             return False
-        return (int(time.time()) - ts) < SESSION_TTL_SECONDS
+        return (int(time.time()) - ts) < _SESSION_TTL_SECONDS
     except Exception:
         return False
 
 
-def motilal_login(client: dict, force: bool = False) -> bool:
+def motilal_login(client: dict) -> bool:
     """
-    CT_FastAPI-like login:
-    - Stores mofsl instance in mofsl_sessions[userid]
-    - Reuses existing session if fresh unless force=True
-    - NO GitHub write here
+    EXACT CT_FastAPI login logic + reuse:
+    - No schema change to stored client JSON
+    - No GitHub writes here
+    - Stores session in mofsl_sessions and reuses it if fresh
     """
 
-    name = (client.get("name") or "").strip()
-    userid = (client.get("userid") or client.get("client_id") or "").strip()
-    password = (client.get("password") or "").strip()
-    pan = (client.get("pan") or "").strip()
-    apikey = (client.get("apikey") or "").strip()
-    totpkey = (client.get("totpkey") or "").strip()
+    name = client.get("name", "")
+    userid = client.get("userid", "") or client.get("client_id", "")
+    userid = str(userid or "").strip()
 
-    owner_userid = _norm_owner(client.get("owner_userid") or "")
+    password = client.get("password", "")
+    pan = client.get("pan", "")
+    apikey = client.get("apikey", "")
+    totpkey = client.get("totpkey", "")
+
+    # owner_userid used only for session filtering, NOT saved to GitHub client JSON
+    owner_userid = _norm_uid(client.get("owner_userid", "") or "")
 
     if not userid:
         print("Login skipped: missing userid")
         return False
 
-    # quick reuse if already fresh (unless force)
+    # ✅ reuse if already logged in and fresh (prevents repeated login on /clients polling)
     existing = mofsl_sessions.get(userid)
-    if (not force) and existing and (existing.get("owner_userid") or "").strip() == owner_userid and _session_is_fresh(existing):
+    if existing and _session_fresh(existing) and _norm_uid(existing.get("owner_userid", "")) == owner_userid:
         return True
 
-    lk = _get_lock(userid)
+    lk = _lock_for(userid)
     with lk:
         # re-check inside lock
         existing = mofsl_sessions.get(userid)
-        if (not force) and existing and (existing.get("owner_userid") or "").strip() == owner_userid and _session_is_fresh(existing):
+        if existing and _session_fresh(existing) and _norm_uid(existing.get("owner_userid", "")) == owner_userid:
             return True
 
         try:
@@ -583,115 +590,110 @@ def motilal_login(client: dict, force: bool = False) -> bool:
                     "userid": userid,
                     "mofsl": mofsl,
                     "login_ts": int(time.time()),
-                    "owner_userid": owner_userid,  # ✅ REQUIRED for per-user filters
+                    "owner_userid": owner_userid  # ✅ REQUIRED for /get_orders filter
                 }
-                print(f"✅ Login successful: {name} ({userid}) owner={owner_userid}")
+                print(f"Login successful: {name} ({userid})")
                 return True
 
-            print(f"❌ Login failed: {name} ({userid}) owner={owner_userid} resp={response}")
+            print(f"Login failed: {name} ({userid})")
             return False
 
         except Exception as e:
-            print(f"⚠️ Login error: {name} ({userid}) owner={owner_userid} :: {e}")
+            print(f"Login error: {name} ({userid}) :: {e}")
             return False
-
-
-def ensure_client_session(owner_userid: str, client_id: str, force: bool = False) -> Dict[str, Any]:
-    """
-    Ensure a client session exists in memory.
-    - If fresh session exists: reuse
-    - Else loads client from GitHub and logs in once
-    """
-    owner_userid = _norm_owner(owner_userid)
-    client_id = str(client_id or "").strip()
-
-    if not owner_userid or not client_id:
-        return {}
-
-    # reuse
-    sess = mofsl_sessions.get(client_id)
-    if (not force) and sess and (sess.get("owner_userid") or "").strip() == owner_userid and _session_is_fresh(sess):
-        return sess
-
-    # load client json from GitHub
-    path = f"data/users/{owner_userid}/clients/{client_id}.json"
-    client_obj, _sha = gh_get_json(path)  # ✅ always expect (dict, sha)
-    if not isinstance(client_obj, dict):
-        return {}
-
-    client_obj["owner_userid"] = owner_userid
-    ok = motilal_login(client_obj, force=force)
-    return mofsl_sessions.get(client_id) if ok else {}
 
 
 @app.post("/add_client")
 async def add_client(request: Request, payload: dict = Body(...)):
 
-    owner_userid = _norm_owner(request.headers.get("x-user-id") or payload.get("owner_userid") or payload.get("userid") or "")
+    owner_userid = _norm_uid(request.headers.get("x-user-id") or payload.get("owner_userid") or payload.get("userid") or "")
     if not owner_userid:
         raise HTTPException(status_code=401, detail="Missing owner userid")
 
-    client_userid = (payload.get("userid") or payload.get("client_id") or payload.get("client_code") or "").strip()
+    # normalize exactly like frontend sends
+    client_userid = (
+        payload.get("userid")
+        or payload.get("client_id")
+        or payload.get("client_code")
+        or ""
+    )
+    client_userid = str(client_userid).strip()
+
     if not client_userid:
         raise HTTPException(status_code=400, detail="Client userid required")
 
+    # IMPORTANT: keep schema exactly same as your current storage (no extra keys)
     client = {
         "broker": "motilal",
         "name": payload.get("name") or payload.get("display_name") or "",
         "userid": client_userid,
-        "password": payload.get("password") or (payload.get("creds", {}) or {}).get("password", ""),
-        "pan": payload.get("pan") or (payload.get("creds", {}) or {}).get("pan", ""),
-        "apikey": payload.get("apikey") or (payload.get("creds", {}) or {}).get("apikey", ""),
-        "totpkey": payload.get("totpkey") or (payload.get("creds", {}) or {}).get("totpkey", ""),
+        "password": payload.get("password") or payload.get("creds", {}).get("password", ""),
+        "pan": payload.get("pan") or payload.get("creds", {}).get("pan", ""),
+        "apikey": payload.get("apikey") or payload.get("creds", {}).get("apikey", ""),
+        "totpkey": payload.get("totpkey") or payload.get("creds", {}).get("totpkey", ""),
         "capital": payload.get("capital", ""),
         "session_active": False,
         "last_login_ts": 0,
-        "last_login_msg": "Not logged in",
-        "owner_userid": owner_userid,  # ✅ keep it in json also
+        "last_login_msg": "Not logged in"
     }
 
     path = f"data/users/{owner_userid}/clients/{client_userid}.json"
     print(f"Saving client -> {path}")
     gh_put_json(path, client, message=f"add client {owner_userid}:{client_userid}")
 
+    # LOGIN (session stored in memory)
     print(f"Login start -> {client_userid}")
-    ok = motilal_login(client, force=True)
 
+    login_client = dict(client)
+    login_client["owner_userid"] = owner_userid  # NOT persisted, only for session filter
+
+    ok = motilal_login(login_client)
+
+    # update stored client status (same as your current logic)
     client["session_active"] = ok
     client["last_login_ts"] = int(time.time())
     client["last_login_msg"] = "Login successful" if ok else "Login failed"
 
     gh_put_json(path, client, message=f"update login status {owner_userid}:{client_userid}")
+
     print(f"Login done -> {client_userid} success={ok}")
 
-    return {"success": True, "session_active": ok}
+    return {"success": True}
 
 
 @app.post("/edit_client")
 async def edit_client(request: Request, payload: dict = Body(...)):
 
-    owner_userid = _norm_owner(request.headers.get("x-user-id") or payload.get("owner_userid") or "")
-    client_userid = (payload.get("userid") or payload.get("client_id") or "").strip()
+    owner_userid = _norm_uid(request.headers.get("x-user-id") or payload.get("owner_userid") or "")
+    client_userid = (payload.get("userid") or payload.get("client_id") or "")
+    client_userid = str(client_userid).strip()
 
     if not owner_userid or not client_userid:
         raise HTTPException(status_code=400, detail="Missing owner_userid or client_userid")
 
     path = f"data/users/{owner_userid}/clients/{client_userid}.json"
-    client, _sha = gh_get_json(path)  # ✅ tuple
-    if not isinstance(client, dict):
+
+    # ✅ gh_get_json returns (dict, sha) in your working routes, so unpack safely
+    client, _sha = gh_get_json(path)
+
+    if not isinstance(client, dict) or not client:
         raise HTTPException(status_code=404, detail="Client not found")
 
+    # keep same schema fields
     client["name"] = payload.get("name", client.get("name"))
     client["password"] = payload.get("password", client.get("password"))
     client["pan"] = payload.get("pan", client.get("pan"))
     client["apikey"] = payload.get("apikey", client.get("apikey"))
     client["totpkey"] = payload.get("totpkey", client.get("totpkey"))
     client["capital"] = payload.get("capital", client.get("capital"))
-    client["owner_userid"] = owner_userid  # ✅ ensure owner tag
 
     gh_put_json(path, client, message="edit client")
 
-    ok = motilal_login(client, force=True)
+    # login again after edit, stores session in memory (reused later)
+    login_client = dict(client)
+    login_client["owner_userid"] = owner_userid  # not persisted
+
+    ok = motilal_login(login_client)
 
     client["session_active"] = ok
     client["last_login_ts"] = int(time.time())
@@ -699,24 +701,14 @@ async def edit_client(request: Request, payload: dict = Body(...)):
 
     gh_put_json(path, client, message="update login")
 
-    return {"success": True, "session_active": ok}
+    return {"success": True}
 
 
 @app.get("/clients")
 def get_clients(request: Request, userid: str = None, user_id: str = None):
-    """
-    IMPORTANT:
-    - Do NOT login here.
-    - Only return status using in-memory mofsl_sessions + TTL freshness.
-    """
-    uid = _norm_owner(
-        request.headers.get("x-user-id")
-        or userid
-        or user_id
-        or request.query_params.get("userid")
-        or request.query_params.get("user_id")
-        or ""
-    )
+    # 1) pick userid from header or query
+    uid = request.headers.get("x-user-id") or userid or user_id or request.query_params.get("userid") or request.query_params.get("user_id") or ""
+    uid = _norm_uid(uid)
 
     if not uid:
         return {"clients": []}
@@ -728,26 +720,38 @@ def get_clients(request: Request, userid: str = None, user_id: str = None):
         entries = gh_list_dir(folder) or []
 
         for ent in entries:
-            if not isinstance(ent, dict) or ent.get("type") != "file":
+            if not isinstance(ent, dict):
+                continue
+            if ent.get("type") != "file":
                 continue
             if not (ent.get("name", "").endswith(".json") and ent.get("path")):
                 continue
 
             try:
-                client_obj, _sha = gh_get_json(ent["path"])  # ✅ tuple
+                client_obj, _sha = gh_get_json(ent["path"])  # (dict, sha)
                 if not isinstance(client_obj, dict):
                     continue
 
-                client_id = str(client_obj.get("userid") or client_obj.get("client_id") or "").strip()
-                if not client_id:
-                    continue
+                # Tag owner only for login/session filter (NOT persisted)
+                client_obj_local = dict(client_obj)
+                client_obj_local["owner_userid"] = uid
 
-                # status from memory only
-                sess = mofsl_sessions.get(client_id)
+                # Keep your current behavior: attempt login here,
+                # BUT motilal_login now REUSES session if already fresh (no repeated logins).
+                try:
+                    motilal_login(client_obj_local)
+                except Exception as login_err:
+                    print(f"Login attempt failed for client {client_obj.get('userid') or client_obj.get('client_id')}: {login_err}")
+
+                client_id = str(client_obj.get("userid", client_obj.get("client_id", "")) or "").strip()
+                sess = mofsl_sessions.get(client_id) if client_id else None
+
+                # session active only if owner matches + fresh + mofsl present
                 sa = bool(
-                    isinstance(sess, dict)
-                    and (sess.get("owner_userid") or "").strip() == uid
-                    and _session_is_fresh(sess)
+                    sess
+                    and _norm_uid(sess.get("owner_userid", "")) == uid
+                    and _session_fresh(sess)
+                    and sess.get("mofsl")
                 )
 
                 clients.append({
