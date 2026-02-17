@@ -1946,9 +1946,7 @@ def _get_group_members(owner_userid: str, group_name: str):
 
 @app.post("/place_order")
 async def place_order(request: Request, payload: dict = Body(...)):
-    import json
-    import re
-    import threading
+    import json, re, threading
 
     owner_userid = _resolve_owner_userid_local(request, payload or {})
     if not owner_userid:
@@ -1956,7 +1954,7 @@ async def place_order(request: Request, payload: dict = Body(...)):
 
     data = payload or {}
 
-    # ✅ PRINT what we receive from frontend (raw)
+    # ✅ print exactly what we got
     try:
         print("📦 /place_order RAW =", json.dumps(data, ensure_ascii=False, default=str))
     except Exception:
@@ -1966,7 +1964,6 @@ async def place_order(request: Request, payload: dict = Body(...)):
     if not symboltoken:
         raise HTTPException(status_code=400, detail="Missing/invalid symbol token")
 
-    # what frontend sends
     groupacc = bool(data.get("groupacc", False))
     groups_raw = data.get("groups", []) or []
     clients_raw = data.get("clients", []) or []
@@ -1987,110 +1984,65 @@ async def place_order(request: Request, payload: dict = Body(...)):
     disclosedquantity = _safe_int(data.get("disclosedquantity", 0), 0)
     amoorder = (data.get("amoorder") or "N").strip().upper()
 
-    # ✅ PRINT shapes (helps immediately)
-    try:
-        print(f"🔎 groupacc={groupacc} diffQty={diffQty} multiplier_on={multiplier_on}")
-        print("🔎 groups_raw:", groups_raw)
-        print("🔎 clients_raw:", clients_raw)
-        if isinstance(perClientQty_raw, dict):
-            print("🔎 perClientQty_raw keys sample:", list(perClientQty_raw.keys())[:5])
-        else:
-            print("🔎 perClientQty_raw type:", type(perClientQty_raw))
-    except Exception as _e:
-        print("🔎 shape print error:", _e)
+    # =========================
+    # ✅ NORMALIZERS (KEY FIX)
+    # =========================
+    _re_uid1 = re.compile(r"(?:userid|client_id|client_code)'\s*:\s*'([^']+)'")
+    _re_uid2 = re.compile(r'(?:userid|client_id|client_code)"\s*:\s*"([^"]+)"')
 
-    # ----------------------------
-    # Normalize helpers (NO schema changes)
-    # ----------------------------
-    def _to_client_id(x):
-        # frontend may send "WOIE123" OR {userid/client_id/client_code}
-        if isinstance(x, str):
-            return x.strip()
+    def _extract_client_id(x) -> str:
+        # case 1: dict
         if isinstance(x, dict):
-            return str(x.get("userid") or x.get("client_id") or x.get("client_code") or x.get("id") or "").strip()
-        return str(x).strip()
+            return str(x.get("userid") or x.get("client_id") or x.get("client_code") or "").strip()
 
-    def _to_group_name(x):
-        # frontend may send "All" OR {name/group/group_name/label}
+        # case 2: string already a userid
         if isinstance(x, str):
-            return x.strip()
+            s = x.strip()
+            # case 3: stringified dict like "{'broker':'motilal','userid':'WOIE1229'}"
+            if "{" in s and "}" in s and ("userid" in s or "client_id" in s or "client_code" in s):
+                m = _re_uid1.search(s) or _re_uid2.search(s)
+                if m:
+                    return m.group(1).strip()
+            return s
+
+        # fallback
+        return str(x or "").strip()
+
+    def _extract_group_name(x) -> str:
         if isinstance(x, dict):
             return str(x.get("name") or x.get("group") or x.get("group_name") or x.get("label") or "").strip()
-        return str(x).strip()
+        return str(x or "").strip()
 
-    def _normalize_per_client_qty(d):
-        """
-        perClientQty keys might be:
-        - "WOIE123": 2
-        - OR "{'broker': 'motilal', 'userid': 'WOIE1229'}": 2  (stringified object)
-        """
+    def _normalize_per_client_qty(d: dict) -> dict:
         out = {}
         if not isinstance(d, dict):
             return out
-
         for k, v in d.items():
-            cid = ""
-
-            if isinstance(k, str):
-                cid = k.strip()
-
-                # Extract userid/client_id from stringified dict keys safely (no eval)
-                if ("{" in cid and "}" in cid) and ("userid" in cid or "client_id" in cid or "client_code" in cid):
-                    m = re.search(r"(?:userid|client_id|client_code)'\s*:\s*'([^']+)'", cid)
-                    if not m:
-                        m = re.search(r'(?:userid|client_id|client_code)"\s*:\s*"([^"]+)"', cid)
-                    if m:
-                        cid = m.group(1).strip()
-
-            elif isinstance(k, dict):
-                cid = _to_client_id(k)
-            else:
-                cid = str(k).strip()
-
-            if not cid:
-                continue
-
-            out[cid] = _safe_int(v, _safe_int(quantityinlot, 1))
-
+            cid = _extract_client_id(k)
+            if cid:
+                out[cid] = _safe_int(v, quantityinlot)
         return out
 
-    groups = []
-    if isinstance(groups_raw, list):
-        for g in groups_raw:
-            gn = _to_group_name(g)
-            if gn:
-                groups.append(gn)
-
-    clients = []
-    if isinstance(clients_raw, list):
-        for c in clients_raw:
-            cid = _to_client_id(c)
-            if cid:
-                clients.append(cid)
-
+    groups = [_extract_group_name(g) for g in (groups_raw if isinstance(groups_raw, list) else []) if _extract_group_name(g)]
+    clients = [_extract_client_id(c) for c in (clients_raw if isinstance(clients_raw, list) else []) if _extract_client_id(c)]
     perClientQty = _normalize_per_client_qty(perClientQty_raw)
 
     print("✅ Normalized groups:", groups)
     print("✅ Normalized clients:", clients)
-    print("✅ Normalized perClientQty keys:", list(perClientQty.keys())[:10])
 
-    # ----------------------------
-    # Session ensure (uses your existing session storage + motilal_login reuse)
-    # ----------------------------
+    # =========================
+    # ✅ Session ensure (uses your existing session storage)
+    # =========================
     def _load_client_from_github(owner: str, client_id: str) -> dict:
-        """
-        Try direct path: data/users/{owner}/clients/{client_id}.json
-        If not found, scan and match by obj['userid'].
-        """
         owner = str(owner or "").strip()
         cid = str(client_id or "").strip()
         if not owner or not cid:
             return {}
 
-        # direct
-        direct_path = f"data/users/{owner}/clients/{cid}.json"
+        # direct path
+        path = f"data/users/{owner}/clients/{cid}.json"
         try:
-            obj, _sha = gh_get_json(direct_path)
+            obj, _sha = gh_get_json(path)
             if isinstance(obj, dict) and obj:
                 return obj
         except Exception:
@@ -2113,53 +2065,41 @@ async def place_order(request: Request, payload: dict = Body(...)):
         return {}
 
     def _ensure_session(client_id: str) -> dict:
-        """
-        1) If session exists and fresh: reuse
-        2) Else load client json and call motilal_login() (which reuses if valid)
-        """
         cid = str(client_id or "").strip()
         if not cid:
             return {}
 
+        # 1) reuse existing session
         sess = mofsl_sessions.get(cid)
         if isinstance(sess, dict) and sess.get("mofsl"):
-            # if you have TTL freshness helper in file, use it
-            try:
-                if _session_fresh(sess):
-                    return sess
-            except Exception:
-                return sess
+            return sess
 
-        # restore by logging in using stored client creds
+        # 2) restore by login (Railway restarts clear RAM)
         cobj = _load_client_from_github(owner_userid, cid)
         if not isinstance(cobj, dict) or not cobj:
             return {}
 
         local_client = dict(cobj)
-        local_client["owner_userid"] = str(owner_userid).strip()  # runtime tag only
+        local_client["owner_userid"] = str(owner_userid).strip()  # runtime only
         ok = motilal_login(local_client)
         if not ok:
             return {}
 
         return mofsl_sessions.get(cid) or {}
 
-    # ----------------------------
-    # Build targets: list of (tag, client_id, qty)
-    # ----------------------------
+    # =========================
+    # Build targets (group expands here)
+    # =========================
     targets = []
 
     if groupacc:
-        for g in groups:
-            gname = str(g).strip()
-            if not gname:
-                continue
-
+        for gname in groups:
             members, gmult = _get_group_members(owner_userid, gname)
 
-            # ✅ normalize members to ids (important)
+            # ✅ THIS is the real fix: normalize members to pure client ids
             members_norm = []
             for m in (members or []):
-                mid = _to_client_id(m)
+                mid = _extract_client_id(m)
                 if mid:
                     members_norm.append(mid)
 
@@ -2177,9 +2117,6 @@ async def place_order(request: Request, payload: dict = Body(...)):
                 targets.append((gname, cid, int(max(1, base_qty))))
     else:
         for cid in clients:
-            cid = str(cid).strip()
-            if not cid:
-                continue
             q = quantityinlot
             if diffQty:
                 q = _safe_int(perClientQty.get(cid, q), q)
@@ -2190,18 +2127,14 @@ async def place_order(request: Request, payload: dict = Body(...)):
     if not targets:
         raise HTTPException(status_code=400, detail="No target clients/groups selected")
 
-    # ----------------------------
-    # Place orders (threaded)
-    # ----------------------------
     responses = {}
     lock = threading.Lock()
     threads = []
 
     def _place_one(tag: str, client_id: str, qty: int):
         key = f"{tag}:{client_id}" if tag else client_id
-        cid = str(client_id or "").strip()
 
-        sess = _ensure_session(cid)
+        sess = _ensure_session(client_id)
         if not isinstance(sess, dict) or not sess.get("mofsl"):
             with lock:
                 responses[key] = {"status": "ERROR", "message": "Session not found"}
@@ -2215,11 +2148,7 @@ async def place_order(request: Request, payload: dict = Body(...)):
             return
 
         mofsl = sess.get("mofsl")
-        uid = sess.get("userid") or cid
-        if not mofsl or not uid:
-            with lock:
-                responses[key] = {"status": "ERROR", "message": "Invalid session"}
-            return
+        uid = sess.get("userid") or client_id
 
         order_payload = {
             "clientcode": str(uid),
@@ -2231,7 +2160,7 @@ async def place_order(request: Request, payload: dict = Body(...)):
             "orderduration": orderduration,
             "price": float(price),
             "triggerprice": float(triggerprice),
-            "quantityinlot": int(max(1, int(qty))),
+            "quantityinlot": int(max(1, qty)),
             "disclosedquantity": int(disclosedquantity),
             "amoorder": amoorder,
             "algoid": "",
