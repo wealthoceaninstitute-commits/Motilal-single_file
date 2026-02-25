@@ -863,11 +863,44 @@ def user_copy_file(owner_userid: str, setup_id_or_name: str) -> str:
     return f"{user_copy_dir(owner_userid)}/{sid}.json"
 
 
+import re as _re
+
+def _extract_uid_from_member(m) -> str:
+    """
+    Robustly extract the client userid from a group member entry.
+    Members can be stored as:
+      - plain string:           "WOIE1255"
+      - dict:                   {"userid": "WOIE1255", "name": "Kiran"}
+      - stringified dict:       "{'userid': 'WOIE1255', 'name': 'Kiran'}"
+      - JSON string:            '{"userid": "WOIE1255"}'
+    """
+    if isinstance(m, dict):
+        return str(m.get("userid") or m.get("client_id") or m.get("client_code") or "").strip()
+    if isinstance(m, str):
+        s = m.strip()
+        # Try JSON parse first
+        if s.startswith("{"):
+            try:
+                import json as _json
+                d = _json.loads(s)
+                return str(d.get("userid") or d.get("client_id") or d.get("client_code") or "").strip()
+            except Exception:
+                pass
+            # Try single-quoted stringified dict
+            m1 = _re.search(r"(?:userid|client_id|client_code)['\"]?\s*:\s*['\"]([^'\"]+)['\"]", s)
+            if m1:
+                return m1.group(1).strip()
+        return s
+    return str(m or "").strip()
+
+
 def _remove_client_from_all_groups(owner_userid: str, client_userid: str) -> None:
     """
     After a client is deleted, scan all group files for that owner and
     remove the client_userid from the members list. Also removes the client
     from any copy-trading setups (master or children).
+
+    Handles members stored as plain strings, dicts, or stringified dicts.
     """
     # --- Update groups ---
     try:
@@ -883,13 +916,20 @@ def _remove_client_from_all_groups(owner_userid: str, client_userid: str) -> Non
                 if not isinstance(obj, dict) or not obj:
                     continue
                 members = obj.get("members") or []
-                # Normalize and filter out the deleted client
-                new_members = [m for m in members if str(m).strip() != client_userid]
+                # Filter using robust extraction - handles dict/stringified dict/plain string
+                new_members = [
+                    m for m in members
+                    if _extract_uid_from_member(m) != client_userid
+                ]
+                print(f"🔍 Group {path}: {len(members)} members → {len(new_members)} after removing {client_userid}")
+                print(f"   Raw members: {members}")
                 if len(new_members) != len(members):
                     obj["members"] = new_members
                     obj["updated_at"] = utcnow_iso()
                     gh_put_json(path, obj, message=f"remove client {client_userid} from group", sha=sha)
                     print(f"✅ Removed {client_userid} from group {path}")
+                else:
+                    print(f"⚠️ {client_userid} NOT found in group {path} members (check format above)")
             except Exception as e:
                 print(f"❌ Error updating group {path}: {e}")
     except Exception as e:
@@ -909,18 +949,22 @@ def _remove_client_from_all_groups(owner_userid: str, client_userid: str) -> Non
                 if not isinstance(obj, dict) or not obj:
                     continue
                 changed = False
-                # Remove from children list
+                # Remove from children list (also handles dict members)
                 children = obj.get("children") or []
-                new_children = [c for c in children if str(c).strip() != client_userid]
+                new_children = [
+                    c for c in children
+                    if _extract_uid_from_member(c) != client_userid
+                ]
                 if len(new_children) != len(children):
                     obj["children"] = new_children
                     changed = True
                 # Clear master if it matches
-                if str(obj.get("master") or "").strip() == client_userid:
+                master_val = str(obj.get("master") or "").strip()
+                if master_val == client_userid or _extract_uid_from_member(obj.get("master", "")) == client_userid:
                     obj["master"] = ""
                     obj["enabled"] = False  # disable setup if master is gone
                     changed = True
-                # Remove from multipliers dict
+                # Remove from multipliers dict (key may be client_userid)
                 multipliers = obj.get("multipliers") or {}
                 if client_userid in multipliers:
                     del multipliers[client_userid]
