@@ -268,8 +268,41 @@ def user_client_file(userid: str, name: str, client_id: str) -> str:
 
 
 # -----------------------------
-# Auth dependency
+# In-memory cache for GitHub reads
+# Avoids hitting GitHub API on every request (huge speedup for /clients, /groups, etc.)
 # -----------------------------
+_gh_cache: Dict[str, Any] = {}
+_gh_cache_ts: Dict[str, float] = {}
+_gh_cache_lock = threading.Lock()
+GH_CACHE_TTL = 30  # seconds — clients/groups change rarely
+
+def gh_get_json_cached(path: str, ttl: int = GH_CACHE_TTL) -> Tuple[Optional[Any], Optional[str]]:
+    """Cached version of gh_get_json. Returns same (obj, sha) tuple."""
+    now = time.time()
+    with _gh_cache_lock:
+        if path in _gh_cache and (now - _gh_cache_ts.get(path, 0)) < ttl:
+            return _gh_cache[path]
+    result = gh_get_json(path)
+    with _gh_cache_lock:
+        _gh_cache[path] = result
+        _gh_cache_ts[path] = time.time()
+    return result
+
+def gh_cache_invalidate(path: str):
+    """Call after any write to a path to clear its cache entry."""
+    with _gh_cache_lock:
+        _gh_cache.pop(path, None)
+        _gh_cache_ts.pop(path, None)
+
+def gh_put_json_and_invalidate(path: str, obj: Any, message: str, sha: Optional[str] = None) -> None:
+    """Writes to GitHub and clears the cache for that path."""
+    gh_put_json(path, obj, message, sha)
+    gh_cache_invalidate(path)
+
+# Cache for copy-trading setups (expensive full-tree scan)
+_copy_setups_cache: list = []
+_copy_setups_cache_ts: float = 0.0
+COPY_SETUPS_CACHE_TTL = 60  # seconds
 def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> str:
     require_secret()
     if credentials is None or not credentials.credentials:
@@ -420,6 +453,7 @@ browserversion = "104"
 # same structure as CT_FastAPI
 mofsl_sessions: Dict[str, Dict[str, Any]] = {}
 position_meta: Dict = {}  # keyed by (client_userid, symbol)
+_position_meta_lock = threading.Lock()  # protects position_meta from race between /get_positions and /close_position
 
 # Session TTL for reuse (default 6 hours)
 _SESSION_TTL_SECONDS = int(os.getenv("MO_SESSION_TTL_SECONDS", "21600"))
@@ -430,8 +464,8 @@ _login_locks: Dict[str, threading.Lock] = {}
 
 def _lock_for(userid: str) -> threading.Lock:
     u = str(userid or "").strip()
-    if u not in _login_locks:
-        _login_locks[u] = threading.Lock()
+    # setdefault is atomic in CPython — avoids race condition between threads
+    _login_locks.setdefault(u, threading.Lock())
     return _login_locks[u]
 
 
@@ -564,6 +598,7 @@ async def add_client(request: Request, payload: dict = Body(...)):
     print(f"Saving client -> {path}")
     try:
         gh_put_json(path, client, message=f"add client {owner_userid}:{client_userid}")
+        gh_cache_invalidate(path)
     except GitHubStorageError as e:
         logging.error(f"GitHub error saving client {client_userid}: {e}")
         raise HTTPException(status_code=503, detail=f"Storage unavailable: {e}. Check GITHUB_TOKEN.")
@@ -582,6 +617,7 @@ async def add_client(request: Request, payload: dict = Body(...)):
     client["last_login_msg"] = "Login successful" if ok else "Login failed"
 
     gh_put_json(path, client, message=f"update login status {owner_userid}:{client_userid}")
+    gh_cache_invalidate(path)
 
     print(f"Login done -> {client_userid} success={ok}")
 
@@ -615,6 +651,7 @@ async def edit_client(request: Request, payload: dict = Body(...)):
     client["capital"] = payload.get("capital", client.get("capital"))
 
     gh_put_json(path, client, message="edit client")
+    gh_cache_invalidate(path)
 
     # login again after edit, stores session in memory (reused later)
     login_client = dict(client)
@@ -627,6 +664,7 @@ async def edit_client(request: Request, payload: dict = Body(...)):
     client["last_login_msg"] = "Login successful" if ok else "Login failed"
 
     gh_put_json(path, client, message="update login")
+    gh_cache_invalidate(path)
 
     return {"success": True}
 
@@ -659,7 +697,7 @@ def get_clients(request: Request, userid: str = None, user_id: str = None):
                 continue
 
             try:
-                client_obj, _sha = gh_get_json(ent["path"])  # (dict, sha)
+                client_obj, _sha = gh_get_json_cached(ent["path"])  # (dict, sha) — cached for 30s
                 if not isinstance(client_obj, dict):
                     continue
 
@@ -851,9 +889,7 @@ def search_symbols(q: str = Query(""), exchange: str = Query("")):
     return {"results": results}
 
 # Optional: build once on server start (recommended for Render)
-@app.on_event("startup")
-def _startup_init_symbols():
-    _lazy_init_symbol_db()
+# (called from lifespan below)
 
 
 # ==========================================================
@@ -1287,6 +1323,10 @@ async def save_copytrading_setup(request: Request, payload: dict = Body(...)):
         "updated_at": utcnow_iso(),
     }
     gh_put_json(path, obj, message=f"save copy setup {owner_userid}:{sid}")
+    gh_cache_invalidate(path)
+    # Invalidate the setups list cache so copy engine picks up changes immediately
+    global _copy_setups_cache_ts
+    _copy_setups_cache_ts = 0.0
     return {"ok": True, "setup": obj}
 
 
@@ -1326,6 +1366,8 @@ async def _set_copy_enabled(request: Request, payload: dict, value: bool):
             obj["enabled"] = bool(value)
             obj["updated_at"] = utcnow_iso()
             gh_put_json(path, obj, message=f"{'enable' if value else 'disable'} copy {owner_userid}:{sid}")
+            gh_cache_invalidate(path)
+            _copy_setups_cache_ts = 0.0  # force reload on next sync cycle
             updated.append(sid)
         except Exception as e:
             errors.append(str(e))
@@ -1523,9 +1565,10 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
 
     positions_data = {"open": [], "closed": []}
 
-    # Ensure global meta exists (safe for Render multi-worker)
+    # Build a fresh meta dict locally, then swap atomically to avoid
+    # race with /close_position which reads position_meta concurrently
+    new_position_meta: Dict = {}
     global position_meta
-    position_meta = {}
 
     # Iterate sessions exactly like orders
     for client_id, sess in list(mofsl_sessions.items()):
@@ -1583,9 +1626,9 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
                 symboltoken = str(pos.get("symboltoken") or "")
                 producttype = str(pos.get("productname") or "")
 
-                # Save meta for close position
+                # Save meta for close position (write to local dict, not global yet)
                 if quantity != 0 and symbol:
-                    position_meta[(client_userid, symbol)] = {
+                    new_position_meta[(client_userid, symbol)] = {
                         "exchange": exchange,
                         "symboltoken": symboltoken,
                         "producttype": producttype,
@@ -1609,6 +1652,10 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
 
         except Exception as e:
             print(f"❌ Error fetching positions for {client_id}: {e}")
+
+    # Atomic swap — close_position reads position_meta, so we replace it all at once
+    with _position_meta_lock:
+        position_meta = new_position_meta
 
     return positions_data
 
@@ -1663,7 +1710,11 @@ async def close_position(request: Request, payload: dict = Body(...)):
         transaction_type = (pos or {}).get("transaction_type") or ""
 
         meta = position_meta.get((name, symbol)) or {}
+        # Also try keyed by client_id for reliability
         client_id_hint = (pos or {}).get("client_id") or meta.get("client_id") or ""
+        if not meta and client_id_hint:
+            with _position_meta_lock:
+                meta = position_meta.get((client_id_hint, symbol)) or position_meta.get((name, symbol)) or {}
         cid, sess = find_session_by_name_and_owner(name, client_id_hint=client_id_hint)
 
         if not meta or not sess:
@@ -1771,7 +1822,7 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
             if not (str(ent.get("name", "")).endswith(".json") and ent.get("path")):
                 continue
 
-            client_obj, _sha = gh_get_json(ent["path"])
+            client_obj, _sha = gh_get_json_cached(ent["path"])  # cached — avoids repeated GitHub calls
             if not isinstance(client_obj, dict):
                 continue
 
@@ -2225,14 +2276,18 @@ _copy_setups_403_until: float = 0.0
 def load_active_copy_setups_all():
     """
     Loads all enabled copy trading setups from GitHub storage.
-    Structure: data/users/{owner}/copytrading/{setupid}.json
-    If GitHub returns 403 (rate limit / token issue), backs off for 60s to avoid log spam.
+    Results are cached for COPY_SETUPS_CACHE_TTL seconds to avoid
+    hammering the GitHub API every 5 seconds.
     """
-    global _copy_setups_403_until
+    global _copy_setups_403_until, _copy_setups_cache, _copy_setups_cache_ts
 
     # Back-off: if we got a 403 recently, skip until cooldown expires
     if time.time() < _copy_setups_403_until:
-        return []
+        return _copy_setups_cache  # return last good result during backoff
+
+    # Return cached result if still fresh
+    if _copy_setups_cache and (time.time() - _copy_setups_cache_ts) < COPY_SETUPS_CACHE_TTL:
+        return _copy_setups_cache
 
     setups = []
 
@@ -2287,6 +2342,11 @@ def load_active_copy_setups_all():
             logging.error(f"load_active_copy_setups_all error: {e}")
     except Exception as e:
         logging.error(f"load_active_copy_setups_all error: {e}")
+
+    # Store in cache for next call
+    if setups:
+        _copy_setups_cache = setups
+        _copy_setups_cache_ts = time.time()
 
     return setups
 
@@ -2588,52 +2648,53 @@ def process_copy_order(order: dict, setup: dict):
 
             qty_lot = max(1, int(total_qty // max(1, min_qty)))
 
-           # --- build child order (CT_FastAPI style, robust keys) ---
-        ordertype = str(order.get("ordertype") or "").upper().strip()
-        orderduration = str(order.get("orderduration") or order.get("validity") or "DAY").upper().strip()
-        producttype = str(order.get("producttype") or "CNC").upper().strip()
-        amoorder = str(order.get("amoorder") or "N").upper().strip()
-        
-        # normalize common variants (safety)
-        if ordertype == "SL":
-            ordertype = "STOPLOSS"
-        if orderduration in ("DAY", "NORMAL"):
-            orderduration = "DAY"
-        if amoorder not in ("Y", "N"):
-            amoorder = "N"
-        
-        child_order = {
-            "clientcode": uid_child,
-            "exchange": (order.get("exchange") or "NSE"),
-            "symboltoken": int(order.get("symboltoken") or 0),
-            "buyorsell": str(order.get("buyorsell") or "").upper().strip(),
-            "ordertype": ordertype,
-            "producttype": producttype,
-            "orderduration": orderduration,
-            "price": float(order.get("price") or 0),
-            "triggerprice": float(order.get("triggerprice") or 0),
-            "quantityinlot": int(qty_lot),
-            "disclosedquantity": 0,
-            "amoorder": amoorder,
-            "algoid": "",
-            "goodtilldate": "",
-            "tag": setup_name,
-        }        
-        try:
-            print(f"📦 [COPY] child payload {child_id}: {child_order}")
-            resp = mofsl_child.PlaceOrder(child_order)
-            print(f"📨 [COPY] child resp {child_id}: {resp}")
-        
-            child_order_id = (resp or {}).get("uniqueorderid")
-            if child_order_id:
-                print(f"✅ child placed {child_id} order={child_order_id}")
-                order_mapping[setup_key].setdefault(master_order_id, {})[child_id] = child_order_id
-            else:
-                print(f"❌ child place FAILED {child_id} (no uniqueorderid). resp={resp}")
-        
-        except Exception as e:
-            print(f"❌ child place error {child_id}: {e}")
+            # --- build child order (INSIDE the for child_id loop) ---
+            ordertype = str(order.get("ordertype") or "").upper().strip()
+            orderduration = str(order.get("orderduration") or order.get("validity") or "DAY").upper().strip()
+            producttype = str(order.get("producttype") or "CNC").upper().strip()
+            amoorder = str(order.get("amoorder") or "N").upper().strip()
 
+            # normalize common variants (safety)
+            if ordertype == "SL":
+                ordertype = "STOPLOSS"
+            if orderduration in ("DAY", "NORMAL"):
+                orderduration = "DAY"
+            if amoorder not in ("Y", "N"):
+                amoorder = "N"
+
+            child_order = {
+                "clientcode": uid_child,
+                "exchange": (order.get("exchange") or "NSE"),
+                "symboltoken": int(order.get("symboltoken") or 0),
+                "buyorsell": str(order.get("buyorsell") or "").upper().strip(),
+                "ordertype": ordertype,
+                "producttype": producttype,
+                "orderduration": orderduration,
+                "price": float(order.get("price") or 0),
+                "triggerprice": float(order.get("triggerprice") or 0),
+                "quantityinlot": int(qty_lot),
+                "disclosedquantity": 0,
+                "amoorder": amoorder,
+                "algoid": "",
+                "goodtilldate": "",
+                "tag": setup_name,
+            }
+            try:
+                print(f"📦 [COPY] child payload {child_id}: {child_order}")
+                resp = mofsl_child.PlaceOrder(child_order)
+                print(f"📨 [COPY] child resp {child_id}: {resp}")
+
+                child_order_id = (resp or {}).get("uniqueorderid")
+                if child_order_id:
+                    print(f"✅ child placed {child_id} order={child_order_id}")
+                    order_mapping[setup_key].setdefault(master_order_id, {})[child_id] = child_order_id
+                else:
+                    print(f"❌ child place FAILED {child_id} (no uniqueorderid). resp={resp}")
+
+            except Exception as e:
+                print(f"❌ child place error {child_id}: {e}")
+
+        # Mark as processed AFTER all children have been attempted
         processed_order_ids_placed[setup_key].add(master_order_id)
 
         return
@@ -2709,7 +2770,7 @@ def motilal_copy_trading_loop():
             synchronize_copy_trading()
         except Exception as e:
             print("❌ Copy trading sync error:", str(e))
-        time.sleep(5)  # 5s avoids GitHub API rate limits
+        time.sleep(10)  # 10s: setups are cached 60s, master orders checked every 10s — balanced
 
 _copy_thread_started = False
 def start_copy_trading_thread():
@@ -2721,7 +2782,8 @@ def start_copy_trading_thread():
 
 @app.on_event("startup")
 def _startup_copy_trading():
-    start_copy_trading_thread()
+    _lazy_init_symbol_db()        # build symbol DB once on start
+    start_copy_trading_thread()   # start copy trading engine
 
 
 # -------------------------
