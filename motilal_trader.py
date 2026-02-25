@@ -28,7 +28,7 @@ import sqlite3
 import threading
 import time
 from collections import OrderedDict
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -36,7 +36,6 @@ from fastapi import Depends, FastAPI, HTTPException, Request,Body,Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-import logging
 from MOFSLOPENAPI import MOFSLOPENAPI
 import pyotp
 
@@ -864,6 +863,87 @@ def user_copy_file(owner_userid: str, setup_id_or_name: str) -> str:
     return f"{user_copy_dir(owner_userid)}/{sid}.json"
 
 
+def _remove_client_from_all_groups(owner_userid: str, client_userid: str) -> None:
+    """
+    After a client is deleted, scan all group files for that owner and
+    remove the client_userid from the members list. Also removes the client
+    from any copy-trading setups (master or children).
+    """
+    # --- Update groups ---
+    try:
+        group_entries = gh_list_dir(user_groups_dir(owner_userid)) or []
+        for ent in group_entries:
+            if not isinstance(ent, dict) or ent.get("type") != "file":
+                continue
+            path = ent.get("path", "")
+            if not path or not path.endswith(".json"):
+                continue
+            try:
+                obj, sha = gh_get_json(path)
+                if not isinstance(obj, dict) or not obj:
+                    continue
+                members = obj.get("members") or []
+                # Normalize and filter out the deleted client
+                new_members = [m for m in members if str(m).strip() != client_userid]
+                if len(new_members) != len(members):
+                    obj["members"] = new_members
+                    obj["updated_at"] = utcnow_iso()
+                    gh_put_json(path, obj, message=f"remove client {client_userid} from group", sha=sha)
+                    print(f"✅ Removed {client_userid} from group {path}")
+            except Exception as e:
+                print(f"❌ Error updating group {path}: {e}")
+    except Exception as e:
+        print(f"❌ Error scanning groups for client removal: {e}")
+
+    # --- Update copy-trading setups ---
+    try:
+        copy_entries = gh_list_dir(user_copy_dir(owner_userid)) or []
+        for ent in copy_entries:
+            if not isinstance(ent, dict) or ent.get("type") != "file":
+                continue
+            path = ent.get("path", "")
+            if not path or not path.endswith(".json"):
+                continue
+            try:
+                obj, sha = gh_get_json(path)
+                if not isinstance(obj, dict) or not obj:
+                    continue
+                changed = False
+                # Remove from children list
+                children = obj.get("children") or []
+                new_children = [c for c in children if str(c).strip() != client_userid]
+                if len(new_children) != len(children):
+                    obj["children"] = new_children
+                    changed = True
+                # Clear master if it matches
+                if str(obj.get("master") or "").strip() == client_userid:
+                    obj["master"] = ""
+                    obj["enabled"] = False  # disable setup if master is gone
+                    changed = True
+                # Remove from multipliers dict
+                multipliers = obj.get("multipliers") or {}
+                if client_userid in multipliers:
+                    del multipliers[client_userid]
+                    obj["multipliers"] = multipliers
+                    changed = True
+                if changed:
+                    obj["updated_at"] = utcnow_iso()
+                    gh_put_json(path, obj, message=f"remove client {client_userid} from copy setup", sha=sha)
+                    print(f"✅ Removed {client_userid} from copy setup {path}")
+            except Exception as e:
+                print(f"❌ Error updating copy setup {path}: {e}")
+    except Exception as e:
+        print(f"❌ Error scanning copy setups for client removal: {e}")
+
+    # --- Remove from in-memory session ---
+    if client_userid in mofsl_sessions:
+        sess = mofsl_sessions.get(client_userid, {})
+        # Only remove if session belongs to this owner
+        if str(sess.get("owner_userid", "")).strip() == str(owner_userid).strip():
+            mofsl_sessions.pop(client_userid, None)
+            print(f"✅ Cleared in-memory session for {client_userid}")
+
+
 @app.post("/delete_client")
 async def delete_client(request: Request, payload: dict = Body(...)):
     owner_userid = resolve_owner_userid(request, userid=payload.get("userid") or payload.get("owner_userid"))
@@ -887,7 +967,15 @@ async def delete_client(request: Request, payload: dict = Body(...)):
                 missing.append(client_userid)
                 continue
             ok = gh_delete_path(path, sha, message=f"delete client {owner_userid}:{client_userid}")
-            (deleted if ok else missing).append(client_userid)
+            if ok:
+                deleted.append(client_userid)
+                # ✅ Clean up: remove from all groups, copy setups, and memory session
+                try:
+                    _remove_client_from_all_groups(owner_userid, client_userid)
+                except Exception as e:
+                    print(f"❌ Group cleanup error for {client_userid}: {e}")
+            else:
+                missing.append(client_userid)
         except Exception as e:
             errors.append(str(e))
 
