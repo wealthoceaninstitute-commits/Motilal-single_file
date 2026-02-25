@@ -30,6 +30,7 @@ import time
 from collections import OrderedDict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+import pandas as pd
 
 import requests
 from fastapi import Depends, FastAPI, HTTPException, Request,Body,Query
