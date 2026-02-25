@@ -30,6 +30,7 @@ import time
 from collections import OrderedDict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+
 import pandas as pd
 
 import requests
@@ -184,17 +185,31 @@ def b64encode_str(s: str) -> str:
 def b64decode_to_str(s: str) -> str:
     return base64.b64decode(s.encode("utf-8")).decode("utf-8")
 
+class GitHubStorageError(Exception):
+    """Raised when GitHub API returns a non-recoverable error (401, 403, 5xx)."""
+    def __init__(self, status_code: int, message: str):
+        self.status_code = status_code
+        super().__init__(f"GitHub API {status_code}: {message}")
+
 def gh_get_json(path: str) -> Tuple[Optional[Any], Optional[str]]:
     """
     Returns (json_obj_or_None, sha_or_None).
-    If file doesn't exist => (None, None)
+    - 404 => (None, None)
+    - 401/403 => raises GitHubStorageError (token invalid/expired/rate-limited)
+    - Other errors => raises GitHubStorageError
     """
     if not gh_enabled():
         return None, None
     r = requests.get(gh_url(path), headers=gh_headers(), params={"ref": GITHUB_BRANCH})
     if r.status_code == 404:
         return None, None
-    r.raise_for_status()
+    if r.status_code == 401:
+        raise GitHubStorageError(401, "GitHub token is invalid or missing. Check GITHUB_TOKEN env var.")
+    if r.status_code == 403:
+        deny_reason = r.headers.get("x-deny-reason", "")
+        raise GitHubStorageError(403, f"GitHub token forbidden (rate-limited or expired). {deny_reason}".strip())
+    if not r.ok:
+        raise GitHubStorageError(r.status_code, r.text[:200])
     data = r.json()
     if isinstance(data, dict) and data.get("type") == "file":
         content = (data.get("content") or "").replace("\n", "")
@@ -221,7 +236,12 @@ def gh_put_json(path: str, obj: Any, message: str, sha: Optional[str] = None) ->
     if sha:
         payload["sha"] = sha
     r = requests.put(gh_url(path), headers=gh_headers(), json=payload)
-    r.raise_for_status()
+    if r.status_code == 401:
+        raise GitHubStorageError(401, "GitHub token is invalid or missing. Check GITHUB_TOKEN env var.")
+    if r.status_code == 403:
+        raise GitHubStorageError(403, "GitHub token forbidden (rate-limited or expired).")
+    if not r.ok:
+        raise GitHubStorageError(r.status_code, r.text[:200])
 
 
 # -----------------------------
@@ -270,13 +290,20 @@ def gh_list_dir(path: str):
     """
     Lists a directory via GitHub Contents API.
     Returns list entries (type/file/dir, name, path, sha, etc.)
+    Returns [] on 404 (directory doesn't exist yet).
+    Raises GitHubStorageError on 401/403/5xx.
     """
     if not gh_enabled():
         raise HTTPException(500, "GitHub storage not configured (set GITHUB_OWNER/GITHUB_REPO/GITHUB_TOKEN)")
     r = requests.get(gh_url(path), headers=gh_headers(), params={"ref": GITHUB_BRANCH})
     if r.status_code == 404:
         return []
-    r.raise_for_status()
+    if r.status_code == 401:
+        raise GitHubStorageError(401, "GitHub token is invalid or missing. Check GITHUB_TOKEN env var.")
+    if r.status_code == 403:
+        raise GitHubStorageError(403, "GitHub token forbidden (rate-limited or expired).")
+    if not r.ok:
+        raise GitHubStorageError(r.status_code, r.text[:200])
     data = r.json()
     return data if isinstance(data, list) else []
 
@@ -311,7 +338,12 @@ def auth_register(payload: dict = Body(...)):
     if confirm and password != confirm:
         return {"success": False, "error": "Passwords do not match"}
 
-    existing, _ = gh_get_json(user_profile_path(userid))
+    try:
+        existing, _ = gh_get_json(user_profile_path(userid))
+    except GitHubStorageError as e:
+        logging.error(f"GitHub error during register for {userid}: {e}")
+        return {"success": False, "error": "Storage unavailable. GitHub token may be expired or rate-limited."}
+
     if existing:
         return {"success": False, "error": "User already exists"}
 
@@ -324,7 +356,11 @@ def auth_register(payload: dict = Body(...)):
         "created_at": utcnow_iso(),
         "updated_at": utcnow_iso(),
     }
-    gh_put_json(user_profile_path(userid), profile, message=f"register {userid}")
+    try:
+        gh_put_json(user_profile_path(userid), profile, message=f"register {userid}")
+    except GitHubStorageError as e:
+        logging.error(f"GitHub error saving profile for {userid}: {e}")
+        return {"success": False, "error": "Storage unavailable. GitHub token may be expired or rate-limited."}
     return {"success": True, "userid": userid}
 
 @app.post("/auth/login")
@@ -341,7 +377,12 @@ def auth_login(payload: dict = Body(...)):
     if not userid or not password:
         return {"success": False}
 
-    profile, _ = gh_get_json(user_profile_path(userid))
+    try:
+        profile, _ = gh_get_json(user_profile_path(userid))
+    except GitHubStorageError as e:
+        logging.error(f"GitHub error during login for {userid}: {e}")
+        return {"success": False, "error": "Storage unavailable. GitHub token may be expired or rate-limited."}
+
     if not profile or not isinstance(profile, dict):
         return {"success": False}
 
@@ -521,7 +562,11 @@ async def add_client(request: Request, payload: dict = Body(...)):
 
     path = f"data/users/{owner_userid}/clients/{client_userid}.json"
     print(f"Saving client -> {path}")
-    gh_put_json(path, client, message=f"add client {owner_userid}:{client_userid}")
+    try:
+        gh_put_json(path, client, message=f"add client {owner_userid}:{client_userid}")
+    except GitHubStorageError as e:
+        logging.error(f"GitHub error saving client {client_userid}: {e}")
+        raise HTTPException(status_code=503, detail=f"Storage unavailable: {e}. Check GITHUB_TOKEN.")
 
     # LOGIN (session stored in memory)
     print(f"Login start -> {client_userid}")
@@ -599,7 +644,11 @@ def get_clients(request: Request, userid: str = None, user_id: str = None):
     clients = []
 
     try:
-        entries = gh_list_dir(folder) or []
+        try:
+            entries = gh_list_dir(folder) or []
+        except GitHubStorageError as e:
+            logging.error(f"GitHub error listing clients for {uid}: {e}")
+            return {"clients": [], "error": "Storage unavailable. GitHub token may be expired or rate-limited."}
 
         for ent in entries:
             if not isinstance(ent, dict):
@@ -649,7 +698,7 @@ def get_clients(request: Request, userid: str = None, user_id: str = None):
                 print(f"Error reading client file {ent.get('path')}: {per_file_err}")
 
     except Exception as e:
-        print("Error loading clients:", e)
+        logging.error(f"Error loading clients for {uid}: {e}")
 
     return {"clients": clients}
 # ============================================================
@@ -815,7 +864,6 @@ def gh_delete_path(path: str, sha: str, message: str = "delete file") -> bool:
     if not gh_enabled():
         raise HTTPException(500, "GitHub storage not configured (set GITHUB_OWNER/GITHUB_REPO/GITHUB_TOKEN)")
     if not sha:
-        # try fetch sha
         _, sha2 = gh_get_json(path)
         sha = sha2 or ""
     if not sha:
@@ -824,7 +872,12 @@ def gh_delete_path(path: str, sha: str, message: str = "delete file") -> bool:
     r = requests.delete(gh_url(path), headers=gh_headers(), json=payload)
     if r.status_code == 404:
         return False
-    r.raise_for_status()
+    if r.status_code == 401:
+        raise GitHubStorageError(401, "GitHub token is invalid or missing.")
+    if r.status_code == 403:
+        raise GitHubStorageError(403, "GitHub token forbidden (rate-limited or expired).")
+    if not r.ok:
+        raise GitHubStorageError(r.status_code, r.text[:200])
     return True
 
 def resolve_owner_userid(request: Request, userid: Optional[str] = None, user_id: Optional[str] = None) -> str:
@@ -2166,58 +2219,74 @@ async def place_order(request: Request, payload: dict = Body(...)):
 # Copies master -> children even after restart by auto-logging sessions
 # ============================================================
 
+# Track last 403 time to avoid log spam
+_copy_setups_403_until: float = 0.0
+
 def load_active_copy_setups_all():
     """
-    Loads all enabled copy trading setups from GitHub storage
-    structure:
-    data/users/{owner}/copytrading/{setupid}.json
+    Loads all enabled copy trading setups from GitHub storage.
+    Structure: data/users/{owner}/copytrading/{setupid}.json
+    If GitHub returns 403 (rate limit / token issue), backs off for 60s to avoid log spam.
     """
+    global _copy_setups_403_until
+
+    # Back-off: if we got a 403 recently, skip until cooldown expires
+    if time.time() < _copy_setups_403_until:
+        return []
 
     setups = []
 
     try:
-
-        # list all users
         users_root = "data/users"
         users = gh_list_dir(users_root) or []
 
         for user in users:
-
             if user.get("type") != "dir":
                 continue
 
             owner = user.get("name")
-
             copy_dir = f"data/users/{owner}/copytrading"
 
             try:
                 files = gh_list_dir(copy_dir) or []
+            except GitHubStorageError as e:
+                if e.status_code == 403:
+                    _copy_setups_403_until = time.time() + 60
+                    logging.warning(f"GitHub 403 in copy setups scan for {owner}, backing off 60s: {e}")
+                continue
             except Exception:
                 continue
 
             for f in files:
-
                 if f.get("type") != "file":
                     continue
-
                 if not f.get("name", "").endswith(".json"):
                     continue
 
-                setup, _ = gh_get_json(f.get("path"))
-
-                if not setup:
+                try:
+                    setup, _ = gh_get_json(f.get("path"))
+                except GitHubStorageError as e:
+                    if e.status_code == 403:
+                        _copy_setups_403_until = time.time() + 60
+                        logging.warning(f"GitHub 403 reading copy setup, backing off 60s: {e}")
+                    continue
+                except Exception:
                     continue
 
-                if not setup.get("enabled", False):
+                if not setup or not setup.get("enabled", False):
                     continue
 
                 setup["owner_userid"] = owner
-
                 setups.append(setup)
 
+    except GitHubStorageError as e:
+        if e.status_code == 403:
+            _copy_setups_403_until = time.time() + 60
+            logging.warning(f"GitHub 403 listing users for copy trading, backing off 60s: {e}")
+        else:
+            logging.error(f"load_active_copy_setups_all error: {e}")
     except Exception as e:
-
-        print("❌ load_active_copy_setups_all error:", e)
+        logging.error(f"load_active_copy_setups_all error: {e}")
 
     return setups
 
