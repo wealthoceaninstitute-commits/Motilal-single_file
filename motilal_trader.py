@@ -24,14 +24,16 @@ import json
 import os
 import time
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import re
+from collections import OrderedDict
 
 import requests
 from fastapi import Depends, FastAPI, HTTPException, Request,Body,Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+import logging
 from MOFSLOPENAPI import MOFSLOPENAPI
 import pyotp
 
@@ -203,11 +205,11 @@ def gh_get_json(path: str) -> Tuple[Optional[Any], Optional[str]]:
             return {"_raw": text}, sha
     return data, data.get("sha")
 
-def gh_put_json(path: str, obj: Any, message: str) -> None:
+def gh_put_json(path: str, obj: Any, message: str, sha: Optional[str] = None) -> None:
     if not gh_enabled():
-        # For local testing without GitHub, just error clearly
         raise HTTPException(500, "GitHub storage not configured (set GITHUB_OWNER/GITHUB_REPO/GITHUB_TOKEN)")
-    _, sha = gh_get_json(path)
+    if sha is None:
+        _, sha = gh_get_json(path)
     payload = {
         "message": message,
         "content": b64encode_str(json.dumps(obj, indent=2, ensure_ascii=False)),
@@ -220,125 +222,6 @@ def gh_put_json(path: str, obj: Any, message: str) -> None:
 
 
 # -----------------------------
-# Per-user storage paths
-# -----------------------------
-def user_root(userid: str) -> str:
-    return f"data/users/{userid}"
-
-def user_profile_path(userid: str) -> str:
-    return f"{user_root(userid)}/profile.json"
-
-
-# -----------------------------
-# Auth dependency
-# -----------------------------
-def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> str:
-    require_secret()
-    if credentials is None or not credentials.credentials:
-        raise HTTPException(status_code=401, detail="Missing token")
-    try:
-        payload = jwt_decode(credentials.credentials, SECRET_KEY)
-        userid = (payload.get("userid") or "").strip()
-        if not userid:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        return userid
-    except JWTError as e:
-        msg = str(e) or "Invalid token"
-        if "expired" in msg.lower():
-            raise HTTPException(status_code=401, detail="Token expired")
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-def get_current_user_optional(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Optional[str]:
-    if not credentials:
-        return None
-    token = (credentials.credentials or "").strip()
-    if not token:
-        return None
-    try:
-        payload = jwt_decode(token, SECRET_KEY)
-        userid = payload.get("userid") or ""
-        return normalize_userid(userid) or None
-    except Exception:
-        return None
-
-# -----------------------------
-# Routes
-# -----------------------------
-@app.get("/")
-def root():
-    return {"ok": True, "name": APP_NAME, "version": API_VERSION}
-
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-@app.post("/auth/register")
-def auth_register(payload: dict):
-    """
-    Payload:
-      { "userid": "...", "email": "...", "password": "...", "confirm_password": "..." }
-    Stores:
-      data/users/{userid}/profile.json  (GitHub)
-    """
-    userid = normalize_userid(payload.get("userid"))
-    email = (payload.get("email") or "").strip()
-    password = (payload.get("password") or "").strip()
-    confirm = (payload.get("confirm_password") or payload.get("confirmPassword") or "").strip()
-
-    if not userid or not email or not password:
-        return {"success": False, "error": "Missing userid/email/password"}
-    if confirm and password != confirm:
-        return {"success": False, "error": "Passwords do not match"}
-
-    existing, _ = gh_get_json(user_profile_path(userid))
-    if existing:
-        return {"success": False, "error": "User already exists"}
-
-    salt = base64.b64encode(os.urandom(12)).decode("utf-8")
-    profile = {
-        "userid": userid,
-        "email": email,
-        "salt": salt,
-        "password_hash": password_hash(password, salt),
-        "created_at": utcnow_iso(),
-        "updated_at": utcnow_iso(),
-    }
-    gh_put_json(user_profile_path(userid), profile, message=f"register {userid}")
-    return {"success": True, "userid": userid}
-
-@app.post("/auth/login")
-def auth_login(payload: dict):
-    """
-    Payload:
-      { "userid": "...", "password": "..." }
-    Returns:
-      { "success": True, "userid": "...", "access_token": "<JWT>" }
-    """
-    userid = normalize_userid(payload.get("userid"))
-    password = (payload.get("password") or "").strip()
-
-    if not userid or not password:
-        return {"success": False}
-
-    profile, _ = gh_get_json(user_profile_path(userid))
-    if not profile or not isinstance(profile, dict):
-        return {"success": False}
-
-    salt = profile.get("salt", "")
-    ph = profile.get("password_hash", "")
-    if not salt or not ph:
-        return {"success": False}
-
-    if password_hash(password, salt) != ph:
-        return {"success": False}
-
-    token = create_token(userid)
-    return {"success": True, "userid": userid, "access_token": token}
-
-@app.get("/me")
-def me(userid: str = Depends(get_current_user)):
-    return {"success": True, "userid": userid}
-
 # -----------------------------
 # Per-user storage paths
 # -----------------------------
@@ -484,11 +367,6 @@ def _require_fields(d: Dict[str, Any], keys: List[str]):
 # Motilal LOGIN + CLIENT ROUTES (Session reuse, no schema change)
 # =========================
 
-import os
-import time
-import threading
-from typing import Any, Dict
-from fastapi import Body, HTTPException, Request
 
 Base_Url = "https://openapi.motilaloswal.com"
 SourceID = "Desktop"
@@ -497,6 +375,7 @@ browserversion = "104"
 
 # same structure as CT_FastAPI
 mofsl_sessions: Dict[str, Dict[str, Any]] = {}
+position_meta: Dict = {}  # keyed by (client_userid, symbol)
 
 # Session TTL for reuse (default 6 hours)
 _SESSION_TTL_SECONDS = int(os.getenv("MO_SESSION_TTL_SECONDS", "21600"))
@@ -774,12 +653,6 @@ def get_clients(request: Request, userid: str = None, user_id: str = None):
 # SYMBOL SEARCH (SQLite DB creation + typeahead endpoint)
 # ============================================================
 
-import os
-import sqlite3
-import threading
-import requests
-import pandas as pd
-from fastapi import Query
 
 # --- Source CSV (your repo) ---
 GITHUB_CSV_URL = "https://raw.githubusercontent.com/Pramod541988/Stock_List/main/security_id.csv"
@@ -962,16 +835,6 @@ def resolve_owner_userid(request: Request, userid: Optional[str] = None, user_id
             token_user = payload.get("userid") or ""
     except Exception:
         token_user = ""
-
-    uid = (
-        token_user
-        or request.headers.get("x-user-id")
-        or request.query_params.get("userid")
-        or request.query_params.get("user_id")
-        or userid
-        or user_id
-    )
-    return normalize_userid(uid or "")
 
     uid = (
         token_user
@@ -1324,7 +1187,6 @@ async def _delete_copy_setup(request: Request, payload: dict):
 # =========================
 # Orders (same logic as CT_FastAPI, only per-user client filtering differs)
 # =========================
-from collections import OrderedDict
 @app.get("/get_orders")
 def get_orders(request: Request, userid: str = None, user_id: str = None):
     owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
@@ -1474,10 +1336,7 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
 
     # Ensure global meta exists (safe for Render multi-worker)
     global position_meta
-    if "position_meta" not in globals():
-        position_meta = {}
-    else:
-        position_meta.clear()
+    position_meta = {}
 
     # Iterate sessions exactly like orders
     for client_id, sess in list(mofsl_sessions.items()):
@@ -1680,7 +1539,6 @@ async def close_position(request: Request, payload: dict = Body(...)):
 # =========================
 # Replace your existing "HOLDINGS AND SUMMARY" section with this block.
 
-from fastapi import Request
 
 # ✅ Per-user cache: summary_data_global[owner_userid] = { name: {...summary...}, ... }
 summary_data_global = {}
@@ -1861,23 +1719,9 @@ def get_summary(request: Request, userid: str = None, user_id: str = None):
 # PLACE ORDER (multi-user, sessions keyed by client_id)
 # ============================================================
 
-import threading
-import time
-from datetime import datetime
-from fastapi import Body, Request, HTTPException
 
 
-def _safe_int(v, default=0):
-    try:
-        return int(float(v))
-    except Exception:
-        return default
 
-def _safe_float(v, default=0.0):
-    try:
-        return float(v)
-    except Exception:
-        return default
 
 def _parse_symbol_token(payload: dict):
     """
@@ -1899,17 +1743,11 @@ def _parse_symbol_token(payload: dict):
     return exch, _safe_int(token, 0)
 
 def _resolve_owner_userid_local(request: Request, payload: dict):
-    # Prefer your existing resolve_owner_userid if you already have it
-    if "resolve_owner_userid" in globals():
-        try:
-            return globals()["resolve_owner_userid"](
-                request,
-                userid=payload.get("userid"),
-                user_id=payload.get("user_id"),
-            )
-        except Exception:
-            pass
-    return (request.headers.get("x-user-id") or payload.get("owner_userid") or payload.get("userid") or payload.get("user_id") or "").strip()
+    return resolve_owner_userid(
+        request,
+        userid=payload.get("userid"),
+        user_id=payload.get("user_id"),
+    )
 
 def _get_group_members(owner_userid: str, group_name: str):
     """
@@ -1918,10 +1756,8 @@ def _get_group_members(owner_userid: str, group_name: str):
       { "members": [...], "multiplier": 1.0 }
     """
     try:
-        # if you already have a helper, use it
-        if "user_group_file" in globals():
-            path = globals()["user_group_file"](owner_userid, group_name)
-        else:
+        path = user_group_file(owner_userid, group_name)
+        if not path:
             path = f"data/users/{owner_userid}/groups/{group_name}.json"
 
         obj, _sha = gh_get_json(path)
@@ -2220,7 +2056,7 @@ def load_active_copy_setups_all():
 
             try:
                 files = gh_list_dir(copy_dir) or []
-            except:
+            except Exception:
                 continue
 
             for f in files:
@@ -2249,10 +2085,6 @@ def load_active_copy_setups_all():
 
     return setups
 
-import threading
-import time
-import sqlite3
-from datetime import datetime
 
 # maps: {setup_key: {master_order_id: {child_id: child_order_id}}}
 order_mapping = {}
@@ -2485,7 +2317,7 @@ def process_copy_order(order: dict, setup: dict):
     dt_obj = None
     try:
         dt_obj = datetime.strptime(order.get("recordinserttime"), "%d-%b-%Y %H:%M:%S")
-    except:
+    except Exception:
         pass
 
     if not dt_obj:
@@ -2672,7 +2504,7 @@ def motilal_copy_trading_loop():
             synchronize_copy_trading()
         except Exception as e:
             print("❌ Copy trading sync error:", str(e))
-        time.sleep(1)
+        time.sleep(5)  # 5s avoids GitHub API rate limits
 
 _copy_thread_started = False
 def start_copy_trading_thread():
@@ -2686,8 +2518,6 @@ def start_copy_trading_thread():
 def _startup_copy_trading():
     start_copy_trading_thread()
 
-from typing import Any, Dict, List, Optional
-import json
 
 # -------------------------
 # REQUIRED by your modify logic (fixes NameError)
