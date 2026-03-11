@@ -1751,15 +1751,25 @@ def modify_order(request: Request, payload: dict = Body(...)) -> Dict[str, Any]:
 # ─────────────────────────────────────────────────────────────
 # Copy Trading Engine
 # ─────────────────────────────────────────────────────────────
-order_mapping:               Dict = {}
-processed_order_ids_placed:  Dict = {}
+order_mapping:                Dict = {}
+processed_order_ids_placed:   Dict = {}
 processed_order_ids_canceled: Dict = {}
-COPY_WINDOW_SECONDS = 120
 
-def load_active_copy_setups_all():
+COPY_WINDOW_SECONDS   = 300   # ignore orders older than 5 min
+COPY_SETUPS_CACHE_TTL = 60    # re-fetch setup list every 60 s
+
+_copy_setups_cache:     list  = []
+_copy_setups_cache_ts:  float = 0.0
+_copy_setups_403_until: float = 0.0
+
+
+# ── Active-setup loader ───────────────────────────────────────
+def load_active_copy_setups_all() -> list:
     global _copy_setups_403_until, _copy_setups_cache, _copy_setups_cache_ts
+
     if time.time() < _copy_setups_403_until:
         return _copy_setups_cache
+
     if _copy_setups_cache and (time.time() - _copy_setups_cache_ts) < COPY_SETUPS_CACHE_TTL:
         return _copy_setups_cache
 
@@ -1767,163 +1777,221 @@ def load_active_copy_setups_all():
     try:
         users = gh_list_dir("data/users") or []
         for user in users:
-            if user.get("type") != "dir": continue
-            owner = user.get("name")
+            if user.get("type") != "dir":
+                continue
+            owner = user.get("name", "")
+            if not owner:
+                continue
             try:
                 files = gh_list_dir(f"data/users/{owner}/copytrading") or []
             except GitHubStorageError as e:
                 if e.status_code == 403:
                     _copy_setups_403_until = time.time() + 60
                 continue
-            except Exception: continue
+            except Exception:
+                continue
             for f in files:
-                if f.get("type") != "file" or not f.get("name","").endswith(".json"): continue
+                if f.get("type") != "file" or not f.get("name", "").endswith(".json"):
+                    continue
                 try:
                     setup, _ = gh_get_json(f["path"])
-                except Exception: continue
-                if not setup or not setup.get("enabled", False): continue
+                except Exception:
+                    continue
+                if not setup or not setup.get("enabled", False):
+                    continue
+                setup = dict(setup)
                 setup["owner_userid"] = owner
                 setups.append(setup)
     except GitHubStorageError as e:
-        if e.status_code == 403: _copy_setups_403_until = time.time() + 60
+        if e.status_code == 403:
+            _copy_setups_403_until = time.time() + 60
     except Exception as e:
         logging.error(f"load_active_copy_setups_all error: {e}")
 
     if setups:
         _copy_setups_cache    = setups
         _copy_setups_cache_ts = time.time()
+
     return setups
 
-# ── Exact field values observed from live Motilal API response ──
-# orderstatus  : "Traded", "Confirm"          (Title case)
-# ordertype    : "Market", "Limit", "Stop Loss" (Title case)
-# orderduration: "Day"                          (Title case)
-# producttype  : "DELIVERY"                     (UPPER)
-# buyorsell    : "BUY", "SELL"                  (UPPER) ✅ already correct
 
-_PLACE_STATUSES = {"TRADED", "CONFIRM", "CONFIRMED", "OPEN", "PENDING",
-                   "TRIGGER PENDING", "TRIGGERPENDING",
-                   "AMO REQ RECEIVED", "AMOREQRECEIVED",
-                   "PUT ORDER REQ RECEIVED", "PUTORDERREQRECEIVED",
-                   "MODIFIED", "MODIFY CONFIRM",
-                   "AFTER MARKET ORDER REQ RECEIVED"}
+# ── Field normalisation maps ──────────────────────────────────
+#
+# GetOrderBook actual field values (from live API):
+#   orderstatus  → "Traded", "Confirm"            (Title case)
+#   ordertype    → "Market", "Limit", "Stop Loss"  (Title case)
+#   orderduration→ "Day"                           (Title case)
+#   producttype  → "DELIVERY", "NORMAL", …        (UPPER — pass through as-is)
+#   buyorsell    → "BUY", "SELL"                   (UPPER ✅)
+#
+# PlaceOrder accepted values (from official Motilal API docs):
+#   ordertype    → LIMIT | MARKET | STOPLOSS
+#   producttype  → NORMAL | DELIVERY | SELLFROMDP | VALUEPLUS | BTST | MTF
+#   orderduration→ DAY | GTC | GTD | IOC
+#   amoorder     → Y | N
 
-# Maps every known API ordertype string → Motilal PlaceOrder accepted value
+_PLACE_STATUSES = {
+    "TRADED",
+    "CONFIRM",
+    "CONFIRMED",
+    "OPEN",
+    "PENDING",
+    "TRIGGER PENDING",
+    "TRIGGERPENDING",
+    "AMO REQ RECEIVED",
+    "AMOREQRECEIVED",
+    "PUT ORDER REQ RECEIVED",
+    "PUTORDERREQRECEIVED",
+    "AFTER MARKET ORDER REQ RECEIVED",
+    "MODIFIED",
+    "MODIFY CONFIRM",
+}
+
+# GetOrderBook ordertype (uppercased) → PlaceOrder accepted value
 _OT_MAP = {
-    # As returned by GetOrderBook (Title / mixed case)
-    "MARKET":              "MARKET",
-    "LIMIT":               "LIMIT",
-    "STOP LOSS":           "STOPLOSS",   # ← THIS was the silent killer
-    "STOP_LOSS":           "STOPLOSS",
-    "SL":                  "STOPLOSS",
-    "STOPLOSS":            "STOPLOSS",
-    "SL-M":                "SL-M",
-    "STOP LOSS MARKET":    "SL-M",
-    "STOP_LOSS_MARKET":    "SL-M",
-    "STOPLOSS MARKET":     "SL-M",
-    "STOPLOSS_MARKET":     "SL-M",
+    "MARKET":            "MARKET",
+    "LIMIT":             "LIMIT",
+    "STOP LOSS":         "STOPLOSS",   # live API returns "Stop Loss"
+    "STOP_LOSS":         "STOPLOSS",
+    "SL":                "STOPLOSS",
+    "STOPLOSS":          "STOPLOSS",
+    "SL-M":              "STOPLOSS",   # no separate SL-M in PlaceOrder docs
+    "STOP LOSS MARKET":  "STOPLOSS",
+    "STOP_LOSS_MARKET":  "STOPLOSS",
+    "STOPLOSS MARKET":   "STOPLOSS",
+    "STOPLOSS_MARKET":   "STOPLOSS",
 }
 
-# Maps producttype from GetOrderBook → PlaceOrder accepted value
-_PT_MAP = {
-    "DELIVERY": "CNC",        # ← GetOrderBook says "DELIVERY", PlaceOrder needs "CNC"
-    "CNC":      "CNC",
-    "INTRADAY": "MIS",
-    "MIS":      "MIS",
-    "MARGIN":   "MARGIN",
-    "MTF":      "MTF",
-    "CO":       "CO",
-    "BO":       "BO",
+# producttype values PlaceOrder actually accepts
+_PT_ALLOWED = {"NORMAL", "DELIVERY", "SELLFROMDP", "VALUEPLUS", "BTST", "MTF"}
+
+# Legacy / wrong values that some older code paths may send
+_PT_LEGACY = {
+    "CNC":      "DELIVERY",
+    "MIS":      "NORMAL",
+    "INTRADAY": "NORMAL",
+    "MARGIN":   "NORMAL",
 }
 
-COPY_WINDOW_SECONDS = 300
+def _norm_ot(raw: str) -> str:
+    """Normalise GetOrderBook ordertype → PlaceOrder value."""
+    key = str(raw or "").strip().upper()
+    result = _OT_MAP.get(key)
+    if not result:
+        print(f"⚠️ [COPY] Unknown ordertype '{raw}' — defaulting to MARKET")
+        result = "MARKET"
+    return result
 
+def _norm_pt(raw: str) -> str:
+    """Normalise producttype → PlaceOrder accepted value."""
+    v = str(raw or "").strip().upper()
+    if v in _PT_ALLOWED:
+        return v
+    return _PT_LEGACY.get(v, "DELIVERY")   # unknown → safest default
+
+def _norm_dur(raw: str) -> str:
+    """Normalise orderduration → PlaceOrder accepted value."""
+    v = str(raw or "").strip().upper()
+    # "Day" → "DAY",  "NORMAL" (some brokers) → "DAY"
+    return "DAY" if v in ("DAY", "NORMAL", "D", "") else v
+
+
+# ── Core copy logic ───────────────────────────────────────────
 def process_copy_order(order: dict, setup: dict):
     owner      = str(setup.get("owner_userid") or "").strip()
-    setup_name = setup.get("name") or setup.get("id") or "setup"
+    setup_name = str(setup.get("name") or setup.get("id") or "setup")
     setup_key  = f"{owner}:{setup.get('id') or setup_name}"
     master_oid = str(order.get("uniqueorderid") or "").strip()
+
     if not master_oid or master_oid == "0":
         return
 
     # ── Time-window guard ──────────────────────────────────────
+    ri = order.get("recordinserttime") or ""
     try:
-        dt_obj = datetime.strptime(order.get("recordinserttime", ""), "%d-%b-%Y %H:%M:%S")
-    except Exception as e:
-        print(f"⚠️ [COPY] Could not parse recordinserttime '{order.get('recordinserttime')}': {e}")
+        dt_obj = datetime.strptime(ri, "%d-%b-%Y %H:%M:%S")
+    except Exception:
+        print(f"⚠️ [COPY] Cannot parse recordinserttime='{ri}' oid={master_oid} — skipping")
         return
+
     age = int(time.time()) - int(dt_obj.timestamp())
     if age > COPY_WINDOW_SECONDS:
-        return
+        return   # order too old for this poll cycle
 
-    # ── Normalise status (API returns Title case e.g. "Traded") ──
-    order_status = str(order.get("orderstatus") or "").strip().upper()
-
+    # ── Per-setup tracking dicts ───────────────────────────────
     processed_order_ids_placed.setdefault(setup_key, set())
     processed_order_ids_canceled.setdefault(setup_key, set())
     order_mapping.setdefault(setup_key, {})
 
-    is_place_status = order_status in _PLACE_STATUSES
+    order_status = str(order.get("orderstatus") or "").strip().upper()
 
-    if is_place_status and master_oid not in processed_order_ids_placed[setup_key]:
+    # ══════════════════════════════════════════════════════════
+    # PLACE path — copy any live/placed order to all children
+    # ══════════════════════════════════════════════════════════
+    if order_status in _PLACE_STATUSES and master_oid not in processed_order_ids_placed[setup_key]:
+
         children    = setup.get("children") or []
         multipliers = setup.get("multipliers") or {}
 
-        # buyorsell is already "BUY"/"SELL" in uppercase from API ✅
-        side = str(order.get("buyorsell") or "").upper().strip()
-
-        # ── Normalise ordertype ─────────────────────────────────
-        ot_raw = str(order.get("ordertype") or "").strip().upper()
-        ot     = _OT_MAP.get(ot_raw)
-        if not ot:
-            print(f"⚠️ [COPY] Unknown ordertype '{order.get('ordertype')}' for {master_oid} — defaulting to MARKET")
-            ot = "MARKET"
-
-        # ── Normalise producttype ───────────────────────────────
-        pt_raw = str(order.get("producttype") or "").strip().upper()
-        pt     = _PT_MAP.get(pt_raw, pt_raw) or "CNC"
-
-        # ── Normalise orderduration ────────────────────────────
-        dur_raw = str(order.get("orderduration") or "Day").strip().upper()
-        dur     = "DAY" if dur_raw in ("DAY", "NORMAL", "D", "") else dur_raw
-
-        # ── AMO flag ───────────────────────────────────────────
-        amo = str(order.get("amoorder") or "N").strip().upper()
+        # Field values straight from the master order
+        side         = str(order.get("buyorsell") or "").upper().strip()   # BUY / SELL
+        ot           = _norm_ot(order.get("ordertype"))
+        pt           = _norm_pt(order.get("producttype"))
+        dur          = _norm_dur(order.get("orderduration"))
+        price        = float(order.get("price") or 0)
+        triggerprice = float(order.get("triggerprice") or 0)
+        exchange     = str(order.get("exchange") or "NSE").upper()
+        symboltoken  = int(order.get("symboltoken") or 0)
+        amo          = str(order.get("amoorder") or "N").upper().strip()
         if amo not in ("Y", "N"):
             amo = "N"
 
-        price        = float(order.get("price") or 0)
-        triggerprice = float(order.get("triggerprice") or 0)
+        print(
+            f"🧬 [COPY] TRIGGERED  master={setup.get('master')}  oid={master_oid}  "
+            f"side={side}  raw_ot='{order.get('ordertype')}'→ot={ot}  "
+            f"raw_pt='{order.get('producttype')}'→pt={pt}  "
+            f"dur={dur}  price={price}  trig={triggerprice}  status={order_status}"
+        )
 
-        print(f"🧬 [COPY] master={setup.get('master')} oid={master_oid} "
-              f"side={side} ot={ot} pt={pt} dur={dur} status={order_status}")
+        if not side:
+            print(f"⚠️ [COPY] Empty buyorsell — skipping oid={master_oid}")
+            processed_order_ids_placed[setup_key].add(master_oid)
+            return
+
+        if not symboltoken:
+            print(f"⚠️ [COPY] Empty symboltoken — skipping oid={master_oid}")
+            processed_order_ids_placed[setup_key].add(master_oid)
+            return
 
         for child_id in children:
             child_id = str(child_id).strip()
             if not child_id:
                 continue
 
+            # ── Ensure session (auto re-login after Railway restart) ──
             sess = mofsl_sessions.get(child_id)
-            if not sess or not sess.get("mofsl"):
-                print(f"🔁 [COPY] re-logging child {child_id}")
+            if not (isinstance(sess, dict) and sess.get("mofsl") and _session_fresh(sess)):
+                print(f"🔁 [COPY] Re-logging child={child_id}")
                 cobj = _load_client_from_github(owner, child_id)
                 if cobj:
                     motilal_login(cobj)
                 sess = mofsl_sessions.get(child_id)
-            if not sess or not sess.get("mofsl"):
-                print(f"❌ [COPY] child session missing {child_id}")
+
+            if not (isinstance(sess, dict) and sess.get("mofsl")):
+                print(f"❌ [COPY] Session unavailable child={child_id} — skipping")
                 continue
 
-            mult     = float(multipliers.get(child_id, 1) or 1)
-            master_q = int(order.get("orderqty") or 1)
-            min_qty  = _min_qty_from_symbol_db(order.get("symboltoken"))
-            raw_qty  = max(1, int(round(master_q * mult)))
-            qty_lot  = max(1, int(raw_qty // max(1, min_qty)))
+            # ── Quantity scaling ───────────────────────────────────────
+            mult      = float(multipliers.get(child_id, 1) or 1)
+            master_q  = int(order.get("orderqty") or 1)
+            min_qty   = _min_qty_from_symbol_db(symboltoken)
+            raw_qty   = max(1, int(round(master_q * mult)))
+            qty_lot   = max(1, int(raw_qty // max(1, min_qty)))
 
             child_order = {
                 "clientcode":        sess["userid"],
-                "exchange":          str(order.get("exchange") or "NSE").upper(),
-                "symboltoken":       int(order.get("symboltoken") or 0),
+                "exchange":          exchange,
+                "symboltoken":       symboltoken,
                 "buyorsell":         side,
                 "ordertype":         ot,
                 "producttype":       pt,
@@ -1939,43 +2007,111 @@ def process_copy_order(order: dict, setup: dict):
             }
 
             try:
-                print(f"📦 [COPY] placing for child {child_id}: {child_order}")
+                print(f"📦 [COPY] Placing  child={child_id}  payload={child_order}")
                 resp = sess["mofsl"].PlaceOrder(child_order)
-                print(f"📨 [COPY] child {child_id} resp: {resp}")
+                print(f"📨 [COPY] Response child={child_id}  resp={resp}")
                 coid = (resp or {}).get("uniqueorderid")
                 if coid:
                     order_mapping[setup_key].setdefault(master_oid, {})[child_id] = coid
                 else:
-                    print(f"❌ [COPY] child FAILED {child_id} — full resp: {resp}")
+                    print(f"❌ [COPY] PlaceOrder FAILED child={child_id}  full_resp={resp}")
             except Exception as e:
-                print(f"❌ [COPY] child error {child_id}: {e}")
+                print(f"❌ [COPY] PlaceOrder exception child={child_id}: {e}")
 
+        # Mark as processed regardless of per-child outcome
         processed_order_ids_placed[setup_key].add(master_oid)
 
+    # ══════════════════════════════════════════════════════════
+    # CANCEL propagation — cancel child orders when master cancelled
+    # ══════════════════════════════════════════════════════════
     elif "CANCEL" in order_status:
         if master_oid in processed_order_ids_canceled[setup_key]:
             return
+
         child_map = order_mapping.get(setup_key, {}).get(master_oid, {}) or {}
+        if not child_map:
+            print(f"ℹ️ [COPY] Cancel received but no child orders mapped oid={master_oid}")
+            processed_order_ids_canceled[setup_key].add(master_oid)
+            return
+
         for child_id, coid in child_map.items():
             sess = mofsl_sessions.get(child_id)
-            if not sess or not sess.get("mofsl"):
+            if not (isinstance(sess, dict) and sess.get("mofsl")):
+                print(f"⚠️ [COPY] Cancel skipped — no session child={child_id}")
                 continue
             try:
-                sess["mofsl"].CancelOrder(coid, sess["userid"])
-                print(f"✅ [COPY] cancel propagated child={child_id} coid={coid}")
+                resp = sess["mofsl"].CancelOrder(coid, sess["userid"])
+                print(f"✅ [COPY] Cancel propagated child={child_id}  coid={coid}  resp={resp}")
             except Exception as e:
-                print(f"❌ [COPY] cancel error child={child_id}: {e}")
+                print(f"❌ [COPY] Cancel error child={child_id}  coid={coid}: {e}")
+
         processed_order_ids_canceled[setup_key].add(master_oid)
+
+
+# ── Synchronise all active setups ─────────────────────────────
+def synchronize_copy_trading():
+    setups = load_active_copy_setups_all()
+    if not setups:
+        return
+
+    def handle_setup(setup):
+        owner     = str(setup.get("owner_userid") or "").strip()
+        master_id = str(setup.get("master") or "").strip()
+        if not owner or not master_id:
+            return
+
+        sess = _ensure_session_for_copy(owner, master_id)
+        if not isinstance(sess, dict) or not sess.get("mofsl"):
+            print(f"❌ [COPY] Master session unavailable master={master_id}")
+            return
+
+        today = datetime.now().strftime("%d-%b-%Y 09:00:00")
+        try:
+            resp = sess["mofsl"].GetOrderBook({
+                "clientcode":    str(sess.get("userid") or master_id),
+                "datetimestamp": today,
+            })
+            if not resp or resp.get("status") != "SUCCESS":
+                print(f"⚠️ [COPY] GetOrderBook failed master={master_id}: {(resp or {}).get('message','')}")
+                return
+
+            orders = resp.get("data") or []
+            if not isinstance(orders, list):
+                return
+
+            print(f"📋 [COPY] master={master_id}  {len(orders)} order(s) in book")
+            for order in orders:
+                try:
+                    process_copy_order(order, setup)
+                except Exception as e:
+                    print(f"❌ [COPY] process_copy_order error oid={order.get('uniqueorderid','?')}: {e}")
+
+        except Exception as e:
+            print(f"❌ [COPY] GetOrderBook exception master={master_id}: {e}")
+
+    threads = [threading.Thread(target=handle_setup, args=(s,), daemon=True) for s in setups]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+
+# ── Main loop ─────────────────────────────────────────────────
 def motilal_copy_trading_loop():
     print("✅ Copy Trading Engine running…")
     while True:
-        try: synchronize_copy_trading()
-        except Exception as e: print("❌ Copy trading sync error:", e)
+        try:
+            synchronize_copy_trading()
+        except Exception as e:
+            print(f"❌ Copy trading sync error: {e}")
         time.sleep(10)
 
+
 _copy_thread_started = False
+
 def start_copy_trading_thread():
     global _copy_thread_started
-    if _copy_thread_started: return
+    if _copy_thread_started:
+        return
     _copy_thread_started = True
     threading.Thread(target=motilal_copy_trading_loop, daemon=True).start()
