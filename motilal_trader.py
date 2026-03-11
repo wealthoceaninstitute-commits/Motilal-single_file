@@ -1346,14 +1346,16 @@ async def close_position(request: Request, payload: dict = Body(...)):
 
 
 # ─────────────────────────────────────────────────────────────
-# Holdings + Summary
+# Holdings + Summary (fully independent)
 # ─────────────────────────────────────────────────────────────
 summary_data_global: Dict = {}
+
 
 def get_available_margin(Mofsl, clientcode):
     try:
         r = Mofsl.GetReportMarginSummary(clientcode)
-        if r.get("status") != "SUCCESS": return 0
+        if r.get("status") != "SUCCESS":
+            return 0
         for item in r.get("data", []):
             if item.get("particulars") == "Total Available Margin for Cash":
                 return float(item.get("amount", 0))
@@ -1361,80 +1363,233 @@ def get_available_margin(Mofsl, clientcode):
         print(f"❌ Margin error for {clientcode}: {e}")
     return 0
 
+
+def _build_client_capital_map(owner_userid: str) -> Dict:
+    """Read capital values from all client JSON files for this owner."""
+    capital_map: Dict = {}
+    try:
+        for ent in (gh_list_dir(f"data/users/{owner_userid}/clients") or []):
+            if not isinstance(ent, dict) or ent.get("type") != "file":
+                continue
+            if not str(ent.get("name", "")).endswith(".json") or not ent.get("path"):
+                continue
+            co, _ = gh_get_json_cached(ent["path"])
+            if not isinstance(co, dict):
+                continue
+            cid = str(co.get("userid") or co.get("client_id") or "").strip()
+            nm  = str(co.get("name", "") or cid).strip()
+            cap = co.get("capital") or co.get("base_amount") or 0
+            if cid: capital_map[cid] = cap
+            if nm:  capital_map[nm]  = cap
+    except Exception as e:
+        print(f"Capital map error: {e}")
+    return capital_map
+
+
+def _fetch_summary_for_owner(owner_userid: str) -> Dict:
+    """
+    Fetch margin + holdings PnL for every session belonging to owner.
+    Returns dict keyed by client name.
+    Does NOT require get_holdings to have been called first.
+    """
+    capital_map  = _build_client_capital_map(owner_userid)
+    summary_data: Dict = {}
+
+    for client_id, sess in list(mofsl_sessions.items()):
+        try:
+            if not isinstance(sess, dict):
+                continue
+            if str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
+                continue
+            name  = sess.get("name", "") or client_id
+            Mofsl = sess.get("mofsl")
+            uid_  = sess.get("userid") or client_id
+            if not Mofsl or not uid_:
+                continue
+
+            # ── Holdings PnL ───────────────────────────────────
+            invested   = 0.0
+            total_pnl  = 0.0
+            try:
+                resp = Mofsl.GetDPHolding(uid_)
+                if resp and resp.get("status") == "SUCCESS":
+                    for h in (resp.get("data") or []):
+                        qty     = float(h.get("dpquantity", 0) or 0)
+                        buy_avg = float(h.get("buyavgprice", 0) or 0)
+                        sc      = h.get("nsesymboltoken")
+                        if not sc or qty <= 0:
+                            continue
+                        try:
+                            ltp_resp = Mofsl.GetLtp({
+                                "clientcode": uid_,
+                                "exchange":   "NSE",
+                                "scripcode":  int(sc),
+                            })
+                            ltp = float((ltp_resp or {}).get("data", {}).get("ltp", 0) or 0) / 100
+                        except Exception:
+                            ltp = 0.0
+                        invested  += qty * buy_avg
+                        total_pnl += (ltp - buy_avg) * qty
+            except Exception as e:
+                print(f"⚠️ Holdings fetch skipped for {name}: {e}")
+
+            # ── Available margin ───────────────────────────────
+            available_margin = get_available_margin(Mofsl, uid_)
+
+            capital       = float(capital_map.get(uid_) or capital_map.get(name) or 0)
+            current_value = invested + total_pnl
+
+            summary_data[name] = {
+                "name":             name,
+                "capital":          round(capital, 2),
+                "invested":         round(invested, 2),
+                "pnl":              round(total_pnl, 2),
+                "current_value":    round(current_value, 2),
+                "available_margin": round(available_margin, 2),
+                "net_gain":         round((current_value + available_margin) - capital, 2),
+            }
+        except Exception as e:
+            print(f"❌ Summary error for {client_id}: {e}")
+
+    return summary_data
+
+
 @app.get("/get_holdings")
 def get_holdings(request: Request, userid: str = None, user_id: str = None):
     owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
     if not owner_userid:
         return {"ok": False, "error": "userid missing"}
 
-    holdings_data, summary_data = [], {}
-    client_capital_map: Dict = {}
-
-    try:
-        for ent in (gh_list_dir(f"data/users/{owner_userid}/clients") or []):
-            if not isinstance(ent, dict) or ent.get("type") != "file": continue
-            if not str(ent.get("name","")).endswith(".json") or not ent.get("path"): continue
-            co, _ = gh_get_json_cached(ent["path"])
-            if not isinstance(co, dict): continue
-            cid = str(co.get("userid") or co.get("client_id") or "").strip()
-            nm  = str(co.get("name","") or cid).strip()
-            cap = co.get("capital") or co.get("base_amount") or 0
-            if cid: client_capital_map[cid] = cap
-            if nm:  client_capital_map[nm]  = cap
-    except Exception as e:
-        print("Capital map error:", e)
+    holdings_data: List = []
+    capital_map   = _build_client_capital_map(owner_userid)
+    summary_data: Dict = {}
 
     for client_id, sess in list(mofsl_sessions.items()):
         try:
-            if not isinstance(sess, dict): continue
-            if str(sess.get("owner_userid","")).strip() != str(owner_userid).strip(): continue
-            name  = sess.get("name","") or client_id
+            if not isinstance(sess, dict):
+                continue
+            if str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
+                continue
+            name  = sess.get("name", "") or client_id
             Mofsl = sess.get("mofsl")
             uid_  = sess.get("userid") or client_id
-            if not Mofsl or not uid_: continue
+            if not Mofsl or not uid_:
+                continue
 
             resp = Mofsl.GetDPHolding(uid_)
-            if not resp or resp.get("status") != "SUCCESS": continue
-            holdings   = resp.get("data", [])
-            invested   = 0.0; total_pnl = 0.0
+            if not resp or resp.get("status") != "SUCCESS":
+                continue
 
-            for h in holdings:
-                symbol   = (h.get("scripname") or "").strip()
-                qty      = float(h.get("dpquantity", 0) or 0)
-                buy_avg  = float(h.get("buyavgprice", 0) or 0)
+            invested  = 0.0
+            total_pnl = 0.0
+
+            for h in (resp.get("data") or []):
+                symbol    = (h.get("scripname") or "").strip()
+                qty       = float(h.get("dpquantity", 0) or 0)
+                buy_avg   = float(h.get("buyavgprice", 0) or 0)
                 scripcode = h.get("nsesymboltoken")
-                if not scripcode or qty <= 0: continue
+                if not scripcode or qty <= 0:
+                    continue
+                try:
+                    ltp_resp = Mofsl.GetLtp({
+                        "clientcode": uid_,
+                        "exchange":   "NSE",
+                        "scripcode":  int(scripcode),
+                    })
+                    ltp = float((ltp_resp or {}).get("data", {}).get("ltp", 0) or 0) / 100
+                except Exception:
+                    ltp = 0.0
+                pnl        = round((ltp - buy_avg) * qty, 2)
+                invested  += qty * buy_avg
+                total_pnl += pnl
+                holdings_data.append({
+                    "name":    name,
+                    "symbol":  symbol,
+                    "quantity": qty,
+                    "buy_avg": round(buy_avg, 2),
+                    "ltp":     round(ltp, 2),
+                    "pnl":     pnl,
+                })
 
-                ltp_resp = Mofsl.GetLtp({"clientcode": uid_, "exchange": "NSE", "scripcode": int(scripcode)})
-                ltp      = float((ltp_resp or {}).get("data", {}).get("ltp", 0) or 0) / 100
-                pnl      = round((ltp - buy_avg) * qty, 2)
-                invested += qty * buy_avg; total_pnl += pnl
-                holdings_data.append({"name": name, "symbol": symbol, "quantity": qty,
-                                       "buy_avg": round(buy_avg,2), "ltp": round(ltp,2), "pnl": pnl})
-
-            capital = float(client_capital_map.get(uid_) or client_capital_map.get(name) or 0)
-            current_value    = invested + total_pnl
+            # Build summary alongside holdings (avoid double API call)
             available_margin = get_available_margin(Mofsl, uid_)
-            summary_data[name] = {"name": name, "capital": round(capital,2),
-                                   "invested": round(invested,2), "pnl": round(total_pnl,2),
-                                   "current_value": round(current_value,2),
-                                   "available_margin": round(available_margin,2),
-                                   "net_gain": round((current_value + available_margin) - capital, 2)}
+            capital          = float(capital_map.get(uid_) or capital_map.get(name) or 0)
+            current_value    = invested + total_pnl
+            summary_data[name] = {
+                "name":             name,
+                "capital":          round(capital, 2),
+                "invested":         round(invested, 2),
+                "pnl":              round(total_pnl, 2),
+                "current_value":    round(current_value, 2),
+                "available_margin": round(available_margin, 2),
+                "net_gain":         round((current_value + available_margin) - capital, 2),
+            }
         except Exception as e:
             print(f"❌ Holdings error for {client_id}: {e}")
 
+    # Update global cache so /get_summary can serve from it
     global summary_data_global
     summary_data_global[str(owner_userid).strip()] = summary_data
+
     return {"holdings": holdings_data, "summary": list(summary_data.values())}
+
 
 @app.get("/get_summary")
 def get_summary(request: Request, userid: str = None, user_id: str = None):
+    """
+    Fully independent — fetches fresh margin + PnL data directly.
+    Does NOT require /get_holdings to have been called first.
+    Falls back to cached data only if a live fetch fails entirely.
+    """
     owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
     if not owner_userid:
         return {"ok": False, "error": "userid missing", "summary": []}
-    data = (summary_data_global or {}).get(str(owner_userid).strip(), {}) or {}
-    return {"summary": list(data.values())}
 
+    # Always fetch fresh data independently
+    try:
+        summary_data = _fetch_summary_for_owner(owner_userid)
+    except Exception as e:
+        print(f"❌ get_summary fetch error: {e}")
+        summary_data = {}
+
+    if summary_data:
+        # Update global cache with fresh data
+        global summary_data_global
+        summary_data_global[str(owner_userid).strip()] = summary_data
+        return {"summary": list(summary_data.values())}
+
+    # Nothing came back from live fetch — serve stale cache if available
+    cached = (summary_data_global or {}).get(str(owner_userid).strip(), {}) or {}
+    if cached:
+        print(f"⚠️ get_summary serving stale cache for {owner_userid}")
+        return {"summary": list(cached.values()), "stale": True}
+
+    # No sessions active yet — return margin-only rows from sessions
+    rows = []
+    for client_id, sess in list(mofsl_sessions.items()):
+        try:
+            if not isinstance(sess, dict):
+                continue
+            if str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
+                continue
+            name  = sess.get("name", "") or client_id
+            Mofsl = sess.get("mofsl")
+            uid_  = sess.get("userid") or client_id
+            if not Mofsl or not uid_:
+                continue
+            available_margin = get_available_margin(Mofsl, uid_)
+            rows.append({
+                "name":             name,
+                "capital":          0,
+                "invested":         0,
+                "pnl":              0,
+                "current_value":    0,
+                "available_margin": round(available_margin, 2),
+                "net_gain":         0,
+            })
+        except Exception:
+            pass
+    return {"summary": rows}
 
 # ─────────────────────────────────────────────────────────────
 # Place Order
