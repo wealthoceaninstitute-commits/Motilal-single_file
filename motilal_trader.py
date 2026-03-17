@@ -1918,8 +1918,14 @@ def modify_order(request: Request, payload: dict = Body(...)) -> Dict[str, Any]:
 # Architecture:
 #   • Master account → WebSocket (TradeStatus) for instant updates
 #   • On every order event → process_copy_order() immediately
-#   • Polling loop runs every 30s as fallback if socket is down
-#   • Children always use REST PlaceOrder (no socket needed)
+#   • Polling loop runs every 30s as fallback ONLY if socket dead
+#   • Children always use REST PlaceOrder
+#
+# Multiplier fix:
+#   orderqty (shares) → master_lots = orderqty // min_qty
+#   child_lots = round(master_lots × multiplier)
+#   processed_order_ids_placed dedup blocks BOTH WS + POLL
+#   from placing twice for the same master order id
 # ─────────────────────────────────────────────────────────────
 order_mapping:                Dict = {}
 processed_order_ids_placed:   Dict = {}
@@ -1927,16 +1933,16 @@ processed_order_ids_canceled: Dict = {}
 
 COPY_WINDOW_SECONDS   = 300   # ignore orders older than 5 min
 COPY_SETUPS_CACHE_TTL = 60    # re-fetch setup list every 60 s
-POLL_INTERVAL_SECONDS = 30    # fallback poll interval (was 10s)
+POLL_INTERVAL_SECONDS = 30    # synchronize_copy_trading loop cadence
+SOCKET_STALE_SECONDS  = 300   # poll only if no WS event for 5 min
 
 _copy_setups_cache:     list  = []
 _copy_setups_cache_ts:  float = 0.0
 _copy_setups_403_until: float = 0.0
 
-# Tracks which master accounts have an active WebSocket
-# master_id → {"thread": Thread, "connected": bool, "last_event_ts": float}
-_master_sockets: Dict[str, Dict] = {}
-_master_sockets_lock = threading.Lock()
+# master_id → {"thread": Thread, "connected": bool, "last_event_ts": float, "owner": str}
+_master_sockets:      Dict[str, Dict] = {}
+_master_sockets_lock: threading.Lock  = threading.Lock()
 
 
 # ── Active-setup loader ───────────────────────────────────────
@@ -1993,24 +1999,24 @@ def load_active_copy_setups_all() -> list:
 
 # ── Field normalisation ───────────────────────────────────────
 #
-# WebSocket push (live values observed):
-#   orderstatus  → "SENT", "Confirm", "Traded", "ERROR"  (mixed case)
-#   ordertype    → "Market", "Limit", "Stop Loss"         (Title case)
-#   orderduration→ "Day", "DAY"                           (mixed)
-#   producttype  → "DELIVERY", "NORMAL", "VALUEPLUS", …  (UPPER)
-#   buyorsell    → "BUY", "SELL"                          (UPPER ✅)
+# GetOrderBook / WebSocket actual field values (live API):
+#   orderstatus  → "SENT", "Confirm", "Traded", "ERROR"   (mixed case)
+#   ordertype    → "Market", "Limit", "Stop Loss"          (Title case)
+#   orderduration→ "Day", "DAY"                            (mixed)
+#   producttype  → "DELIVERY", "NORMAL", "VALUEPLUS", …   (UPPER — pass through)
+#   buyorsell    → "BUY", "SELL"                           (UPPER ✅)
 #
-# PlaceOrder accepts:
+# PlaceOrder accepted values (official Motilal API docs):
 #   ordertype    → LIMIT | MARKET | STOPLOSS
 #   producttype  → NORMAL | DELIVERY | SELLFROMDP | VALUEPLUS | BTST | MTF
 #   orderduration→ DAY | GTC | GTD | IOC
+#   amoorder     → Y | N
 
 _PLACE_STATUSES = {
-    # WebSocket statuses
-    "SENT",                              # order just submitted — copy immediately
-    "CONFIRM",                           # order confirmed/open
+    "SENT",
+    "CONFIRM",
     "CONFIRMED",
-    "TRADED",                            # fully traded
+    "TRADED",
     "OPEN",
     "PENDING",
     "TRIGGER PENDING",
@@ -2024,28 +2030,33 @@ _PLACE_STATUSES = {
     "MODIFY CONFIRM",
 }
 
-# Statuses we should NOT copy (terminal failure states)
-_SKIP_STATUSES = {"ERROR", "REJECTED", "CANCELLED", "CANCELED"}
+_SKIP_STATUSES = {"ERROR", "REJECTED"}   # terminal failures — never copy
 
 _OT_MAP = {
-    "MARKET":           "MARKET",
-    "LIMIT":            "LIMIT",
-    "STOP LOSS":        "STOPLOSS",
-    "STOP_LOSS":        "STOPLOSS",
-    "SL":               "STOPLOSS",
-    "STOPLOSS":         "STOPLOSS",
-    "SL-M":             "STOPLOSS",
-    "STOP LOSS MARKET": "STOPLOSS",
-    "STOP_LOSS_MARKET": "STOPLOSS",
-    "STOPLOSS MARKET":  "STOPLOSS",
-    "STOPLOSS_MARKET":  "STOPLOSS",
+    "MARKET":            "MARKET",
+    "LIMIT":             "LIMIT",
+    "STOP LOSS":         "STOPLOSS",   # GetOrderBook / WS returns "Stop Loss"
+    "STOP_LOSS":         "STOPLOSS",
+    "SL":                "STOPLOSS",
+    "STOPLOSS":          "STOPLOSS",
+    "SL-M":              "STOPLOSS",
+    "STOP LOSS MARKET":  "STOPLOSS",
+    "STOP_LOSS_MARKET":  "STOPLOSS",
+    "STOPLOSS MARKET":   "STOPLOSS",
+    "STOPLOSS_MARKET":   "STOPLOSS",
 }
 
 _PT_ALLOWED = {"NORMAL", "DELIVERY", "SELLFROMDP", "VALUEPLUS", "BTST", "MTF"}
-_PT_LEGACY  = {"CNC": "DELIVERY", "MIS": "NORMAL", "INTRADAY": "NORMAL", "MARGIN": "NORMAL"}
+_PT_LEGACY  = {
+    "CNC":      "DELIVERY",
+    "MIS":      "NORMAL",
+    "INTRADAY": "NORMAL",
+    "MARGIN":   "NORMAL",
+}
 
 def _norm_ot(raw: str) -> str:
-    key = str(raw or "").strip().upper()
+    """Normalise GetOrderBook/WS ordertype → PlaceOrder accepted value."""
+    key    = str(raw or "").strip().upper()
     result = _OT_MAP.get(key)
     if not result:
         print(f"⚠️ [COPY] Unknown ordertype '{raw}' — defaulting MARKET")
@@ -2053,22 +2064,36 @@ def _norm_ot(raw: str) -> str:
     return result
 
 def _norm_pt(raw: str) -> str:
+    """Normalise producttype → PlaceOrder accepted value. Pass through valid values."""
     v = str(raw or "").strip().upper()
     if v in _PT_ALLOWED:
         return v
     return _PT_LEGACY.get(v, "DELIVERY")
 
 def _norm_dur(raw: str) -> str:
+    """Normalise orderduration → PlaceOrder accepted value."""
     v = str(raw or "").strip().upper()
     return "DAY" if v in ("DAY", "NORMAL", "D", "") else v
 
 
-# ── Core copy logic (shared by WebSocket + polling paths) ─────
+# ── Core copy logic ───────────────────────────────────────────
 def process_copy_order(order: dict, setup: dict, source: str = "POLL"):
     """
-    source: "WS" (WebSocket push) or "POLL" (fallback polling)
-    WebSocket orders may not have recordinserttime — we skip the
-    time-window guard for WS events since they are real-time.
+    Called for every master order event — from WebSocket push or polling.
+
+    source = "WS"   → real-time WebSocket push, skip time-window guard
+    source = "POLL" → fallback GetOrderBook poll, apply time-window guard
+
+    Multiplier logic (FIXED):
+        master_q    = orderqty (shares as returned by API)
+        min_qty     = lot size from symbol DB (1 for equity)
+        master_lots = master_q // min_qty
+        child_lots  = round(master_lots × multiplier)
+
+    Double-fire guard:
+        processed_order_ids_placed is checked at the TOP of the place
+        path before any work is done, blocking both WS and POLL from
+        placing twice for the same uniqueorderid.
     """
     owner      = str(setup.get("owner_userid") or "").strip()
     setup_name = str(setup.get("name") or setup.get("id") or "setup")
@@ -2090,21 +2115,32 @@ def process_copy_order(order: dict, setup: dict, source: str = "POLL"):
             print(f"⚠️ [COPY] Cannot parse recordinserttime='{ri}' oid={master_oid} — skipping")
             return
 
-    # ── Per-setup tracking ─────────────────────────────────────
+    # ── Per-setup tracking dicts ───────────────────────────────
     processed_order_ids_placed.setdefault(setup_key, set())
     processed_order_ids_canceled.setdefault(setup_key, set())
     order_mapping.setdefault(setup_key, {})
 
     order_status = str(order.get("orderstatus") or "").strip().upper()
 
-    # Skip terminal error/cancel states entirely for place path
-    if order_status in _SKIP_STATUSES and order_status not in ("CANCELLED", "CANCELED"):
+    # Skip terminal error states — never copy these
+    if order_status in _SKIP_STATUSES:
         return
 
     # ══════════════════════════════════════════════════════════
     # PLACE path
     # ══════════════════════════════════════════════════════════
-    if order_status in _PLACE_STATUSES and master_oid not in processed_order_ids_placed[setup_key]:
+    if order_status in _PLACE_STATUSES:
+
+        # ── Double-fire dedup guard (MUST be first check) ─────
+        # This single check prevents BOTH WS and POLL placing
+        # twice for the same order. Without this, mult=2 places
+        # 2 lots via WS then 2 more via POLL = 4× master qty.
+        if master_oid in processed_order_ids_placed[setup_key]:
+            return
+
+        # Mark as processing immediately — before any await/IO
+        # so a concurrent WS or POLL call cannot race past here
+        processed_order_ids_placed[setup_key].add(master_oid)
 
         children    = setup.get("children") or []
         multipliers = setup.get("multipliers") or {}
@@ -2121,22 +2157,32 @@ def process_copy_order(order: dict, setup: dict, source: str = "POLL"):
         if amo not in ("Y", "N"):
             amo = "N"
 
+        if not side or not symboltoken:
+            print(f"⚠️ [COPY] Missing side or symboltoken — oid={master_oid} marked done, skipping")
+            return
+
+        # ── Quantity calculation ───────────────────────────────
+        # API returns orderqty in shares. quantityinlot needs lots.
+        # master_lots = shares ÷ lot_size  (e.g. 15 shares ÷ 1 = 15 lots for equity)
+        # child_lots  = master_lots × child_multiplier
+        min_qty     = max(1, _min_qty_from_symbol_db(symboltoken))
+        master_q    = int(order.get("orderqty") or 1)
+        master_lots = max(1, master_q // min_qty)
+
         print(
             f"🧬 [COPY/{source}] TRIGGERED  master={setup.get('master')}  oid={master_oid}  "
-            f"side={side}  ot={ot}  pt={pt}  dur={dur}  "
-            f"price={price}  trig={triggerprice}  status={order_status}"
+            f"side={side}  ot_raw='{order.get('ordertype')}'→{ot}  "
+            f"pt_raw='{order.get('producttype')}'→{pt}  dur={dur}  "
+            f"price={price}  trig={triggerprice}  status={order_status}  "
+            f"master_q={master_q}  min_qty={min_qty}  master_lots={master_lots}"
         )
-
-        if not side or not symboltoken:
-            print(f"⚠️ [COPY] Missing side or symboltoken — skipping oid={master_oid}")
-            processed_order_ids_placed[setup_key].add(master_oid)
-            return
 
         for child_id in children:
             child_id = str(child_id).strip()
             if not child_id:
                 continue
 
+            # ── Ensure session ─────────────────────────────────
             sess = mofsl_sessions.get(child_id)
             if not (isinstance(sess, dict) and sess.get("mofsl") and _session_fresh(sess)):
                 print(f"🔁 [COPY] Re-logging child={child_id}")
@@ -2149,11 +2195,14 @@ def process_copy_order(order: dict, setup: dict, source: str = "POLL"):
                 print(f"❌ [COPY] Session unavailable child={child_id} — skipping")
                 continue
 
-            mult     = float(multipliers.get(child_id, 1) or 1)
-            master_q = int(order.get("orderqty") or 1)
-            min_qty  = _min_qty_from_symbol_db(symboltoken)
-            raw_qty  = max(1, int(round(master_q * mult)))
-            qty_lot  = max(1, int(raw_qty // max(1, min_qty)))
+            # ── Child quantity ─────────────────────────────────
+            mult       = float(multipliers.get(child_id, 1) or 1)
+            child_lots = max(1, int(round(master_lots * mult)))
+
+            print(
+                f"   child={child_id}  mult={mult}  "
+                f"master_lots={master_lots}  child_lots={child_lots}"
+            )
 
             child_order = {
                 "clientcode":        sess["userid"],
@@ -2165,7 +2214,7 @@ def process_copy_order(order: dict, setup: dict, source: str = "POLL"):
                 "orderduration":     dur,
                 "price":             price,
                 "triggerprice":      triggerprice,
-                "quantityinlot":     qty_lot,
+                "quantityinlot":     child_lots,
                 "disclosedquantity": 0,
                 "amoorder":          amo,
                 "algoid":            "",
@@ -2185,8 +2234,6 @@ def process_copy_order(order: dict, setup: dict, source: str = "POLL"):
             except Exception as e:
                 print(f"❌ [COPY] PlaceOrder exception child={child_id}: {e}")
 
-        processed_order_ids_placed[setup_key].add(master_oid)
-
     # ══════════════════════════════════════════════════════════
     # CANCEL propagation
     # ══════════════════════════════════════════════════════════
@@ -2203,30 +2250,30 @@ def process_copy_order(order: dict, setup: dict, source: str = "POLL"):
         for child_id, coid in child_map.items():
             sess = mofsl_sessions.get(child_id)
             if not (isinstance(sess, dict) and sess.get("mofsl")):
+                print(f"⚠️ [COPY] Cancel skipped — no session child={child_id}")
                 continue
             try:
                 resp = sess["mofsl"].CancelOrder(coid, sess["userid"])
                 print(f"✅ [COPY] Cancel propagated child={child_id}  coid={coid}  resp={resp}")
             except Exception as e:
-                print(f"❌ [COPY] Cancel error child={child_id}: {e}")
+                print(f"❌ [COPY] Cancel error child={child_id}  coid={coid}: {e}")
 
         processed_order_ids_canceled[setup_key].add(master_oid)
 
 
-# ── WebSocket handler for one master ─────────────────────────
-def _run_master_socket(master_id: str, owner: str, setups_for_master: list):
+# ── WebSocket thread for one master ──────────────────────────
+def _run_master_socket(master_id: str, owner: str):
     """
-    Connects the TradeStatus WebSocket for a master account.
-    On every order event, immediately calls process_copy_order()
-    for all setups that have this master.
-    Runs in its own daemon thread. Auto-reconnects on disconnect.
+    Blocking loop — connects WebSocket, auto-reconnects on drop.
+    Runs as a daemon thread, one per master account.
+    On every order push → process_copy_order(source="WS") immediately.
     """
-    RECONNECT_DELAY = 15   # seconds between reconnect attempts
+    RECONNECT_DELAY = 15
 
     while True:
         sess = _ensure_session_for_copy(owner, master_id)
         if not isinstance(sess, dict) or not sess.get("mofsl"):
-            print(f"❌ [WS] No session for master={master_id} — retrying in {RECONNECT_DELAY}s")
+            print(f"❌ [WS] No session master={master_id} — retry in {RECONNECT_DELAY}s")
             with _master_sockets_lock:
                 if master_id in _master_sockets:
                     _master_sockets[master_id]["connected"] = False
@@ -2245,15 +2292,17 @@ def _run_master_socket(master_id: str, owner: str, setups_for_master: list):
                 mofsl.Tradelogin()
                 mofsl.OrderSubscribe()
                 mofsl.TradeSubscribe()
+                print(f"✅ [WS] Subscribed master={master_id}")
             except Exception as e:
                 print(f"❌ [WS] Subscribe error master={master_id}: {e}")
 
         def on_message(ws, message_type, message):
+            # Update heartbeat timestamp
             with _master_sockets_lock:
                 if master_id in _master_sockets:
                     _master_sockets[master_id]["last_event_ts"] = time.time()
 
-            # message may be dict or JSON string
+            # Normalise to dict
             if isinstance(message, str):
                 try:
                     message = json.loads(message)
@@ -2262,23 +2311,30 @@ def _run_master_socket(master_id: str, owner: str, setups_for_master: list):
             if not isinstance(message, dict):
                 return
 
-            # Skip pure auth/subscribe ack messages
+            # Skip auth / subscribe ack messages
             msg_status = str(message.get("status") or "").upper()
             msg_text   = str(message.get("message") or "").lower()
-            if msg_status == "SUCCESS" and any(k in msg_text for k in ("auth", "subscribed", "success")):
+            if msg_status == "SUCCESS" and any(
+                k in msg_text for k in ("auth", "subscribed", "success")
+            ):
                 return
 
             order_status = str(message.get("orderstatus") or "").upper()
             if not order_status:
                 return
 
-            print(f"📡 [WS] master={master_id}  oid={message.get('uniqueorderid')}  status={order_status}")
+            print(
+                f"📡 [WS] master={master_id}  "
+                f"oid={message.get('uniqueorderid')}  "
+                f"status={order_status}  side={message.get('buyorsell')}  "
+                f"symbol={message.get('symbol')}"
+            )
 
-            # Refresh setups inline (uses cache — cheap)
+            # Match against all active setups for this master (cached)
             current_setups = load_active_copy_setups_all()
             matched = [
                 s for s in current_setups
-                if str(s.get("master") or "").strip() == master_id
+                if str(s.get("master") or "").strip()       == master_id
                 and str(s.get("owner_userid") or "").strip() == owner
             ]
 
@@ -2312,17 +2368,17 @@ def _run_master_socket(master_id: str, owner: str, setups_for_master: list):
         time.sleep(RECONNECT_DELAY)
 
 
-def _ensure_master_socket(master_id: str, owner: str, setups: list):
-    """Start WebSocket thread for a master if not already running."""
+def _ensure_master_socket(master_id: str, owner: str):
+    """Start WebSocket daemon thread for master if not already running."""
     with _master_sockets_lock:
         info = _master_sockets.get(master_id)
         if info and info.get("thread") and info["thread"].is_alive():
-            return   # already running
+            return  # already running
 
         print(f"🚀 [WS] Starting socket thread master={master_id}")
         t = threading.Thread(
             target=_run_master_socket,
-            args=(master_id, owner, setups),
+            args=(master_id, owner),
             daemon=True,
             name=f"ws-master-{master_id}",
         )
@@ -2335,8 +2391,14 @@ def _ensure_master_socket(master_id: str, owner: str, setups: list):
         }
 
 
-# ── Fallback polling (runs when socket is down / stale) ───────
+# ── Fallback polling ──────────────────────────────────────────
 def _poll_master(master_id: str, owner: str, setups: list):
+    """
+    Called only when WebSocket is down or stale.
+    Fetches GetOrderBook and calls process_copy_order(source="POLL").
+    The dedup guard in process_copy_order prevents double-placing
+    if the WS already handled the same order.
+    """
     sess = _ensure_session_for_copy(owner, master_id)
     if not isinstance(sess, dict) or not sess.get("mofsl"):
         print(f"❌ [POLL] Master session unavailable master={master_id}")
@@ -2349,20 +2411,24 @@ def _poll_master(master_id: str, owner: str, setups: list):
             "datetimestamp": today,
         })
         if not resp or resp.get("status") != "SUCCESS":
-            print(f"⚠️ [POLL] GetOrderBook failed master={master_id}: {(resp or {}).get('message','')}")
+            print(
+                f"⚠️ [POLL] GetOrderBook failed master={master_id}: "
+                f"{(resp or {}).get('message', '')}"
+            )
             return
 
         orders = resp.get("data") or []
         if not isinstance(orders, list):
             return
 
-        print(f"📋 [POLL] master={master_id}  {len(orders)} order(s)")
+        print(f"📋 [POLL] master={master_id}  {len(orders)} order(s) in book")
         for order in orders:
             for setup in setups:
                 try:
                     process_copy_order(order, setup, source="POLL")
                 except Exception as e:
                     print(f"❌ [POLL] process_copy_order error: {e}")
+
     except Exception as e:
         print(f"❌ [POLL] GetOrderBook exception master={master_id}: {e}")
 
@@ -2373,8 +2439,8 @@ def synchronize_copy_trading():
     if not setups:
         return
 
-    # Group setups by (owner, master_id)
-    master_map: Dict[str, Dict] = {}   # key: master_id → {owner, setups}
+    # Group by master_id
+    master_map: Dict[str, Dict] = {}
     for setup in setups:
         master_id = str(setup.get("master") or "").strip()
         owner     = str(setup.get("owner_userid") or "").strip()
@@ -2384,35 +2450,32 @@ def synchronize_copy_trading():
             master_map[master_id] = {"owner": owner, "setups": []}
         master_map[master_id]["setups"].append(setup)
 
-    SOCKET_STALE_SECONDS = 60   # treat socket as stale if no event for 60s
-
     for master_id, info in master_map.items():
         owner  = info["owner"]
         msetts = info["setups"]
 
-        # Always ensure WebSocket is running
-        _ensure_master_socket(master_id, owner, msetts)
+        # Always ensure WebSocket thread is alive
+        _ensure_master_socket(master_id, owner)
 
-        # Check if socket is alive and recently active
+        # Decide whether polling fallback is needed
         with _master_sockets_lock:
             sock_info     = _master_sockets.get(master_id, {})
             connected     = sock_info.get("connected", False)
             last_event_ts = sock_info.get("last_event_ts", 0.0)
 
-        socket_stale = (time.time() - last_event_ts) > SOCKET_STALE_SECONDS
+        socket_healthy = connected and (time.time() - last_event_ts) < SOCKET_STALE_SECONDS
 
-        if connected and not socket_stale:
-            # WebSocket is healthy — no polling needed
-            print(f"✅ [SYNC] WS healthy master={master_id} — skipping poll")
+        if socket_healthy:
+            print(f"✅ [SYNC] WS healthy master={master_id} — poll skipped")
             continue
 
-        # Socket not connected or stale — fall back to polling
-        reason = "not connected" if not connected else "stale"
+        reason = "not connected" if not connected else f"stale >{SOCKET_STALE_SECONDS}s"
         print(f"⚠️ [SYNC] WS {reason} master={master_id} — falling back to poll")
         threading.Thread(
             target=_poll_master,
             args=(master_id, owner, msetts),
             daemon=True,
+            name=f"poll-master-{master_id}",
         ).start()
 
 
@@ -2439,4 +2502,3 @@ def start_copy_trading_thread():
         daemon=True,
         name="copy-trading-main",
     ).start()
-
