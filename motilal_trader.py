@@ -679,7 +679,25 @@ def auth_register(payload: dict = Body(...)):
         existing, _ = gh_get_json(user_profile_path(userid))
     except GitHubStorageError as e:
         return {"success": False, "error": f"Storage unavailable: {e}"}
-    # ... rest unchanged
+
+    if existing:
+        return {"success": False, "error": "User already exists"}
+
+    salt = base64.b64encode(os.urandom(12)).decode()
+    profile = {
+        "userid":        userid,
+        "email":         email,
+        "salt":          salt,
+        "password_hash": password_hash(password, salt),
+        "created_at":    utcnow_iso(),
+        "updated_at":    utcnow_iso(),
+    }
+    try:
+        gh_put_json(user_profile_path(userid), profile, message=f"register {userid}")
+    except GitHubStorageError as e:
+        return {"success": False, "error": f"Storage unavailable: {e}"}
+    return {"success": True, "userid": userid}
+
 
 @app.post("/auth/login")
 def auth_login(payload: dict = Body(...)):
@@ -703,10 +721,10 @@ def auth_login(payload: dict = Body(...)):
         return {"success": False}
     return {"success": True, "userid": userid, "access_token": create_token(userid)}
 
+
 @app.get("/me")
 def me(userid: str = Depends(get_current_user)):
     return {"success": True, "userid": userid}
-
 
 
 # ─────────────────────────────────────────────────────────────
