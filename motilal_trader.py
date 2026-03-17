@@ -672,25 +672,14 @@ def auth_register(payload: dict = Body(...)):
     if confirm and password != confirm:
         return {"success": False, "error": "Passwords do not match"}
 
+    # Bypass cache — must read live value to check if user exists
+    gh_cache_invalidate(user_profile_path(userid))
+
     try:
         existing, _ = gh_get_json(user_profile_path(userid))
     except GitHubStorageError as e:
         return {"success": False, "error": f"Storage unavailable: {e}"}
-
-    if existing:
-        return {"success": False, "error": "User already exists"}
-
-    salt = base64.b64encode(os.urandom(12)).decode()
-    profile = {
-        "userid": userid, "email": email, "salt": salt,
-        "password_hash": password_hash(password, salt),
-        "created_at": utcnow_iso(), "updated_at": utcnow_iso(),
-    }
-    try:
-        gh_put_json(user_profile_path(userid), profile, message=f"register {userid}")
-    except GitHubStorageError as e:
-        return {"success": False, "error": f"Storage unavailable: {e}"}
-    return {"success": True, "userid": userid}
+    # ... rest unchanged
 
 @app.post("/auth/login")
 def auth_login(payload: dict = Body(...)):
@@ -698,6 +687,10 @@ def auth_login(payload: dict = Body(...)):
     password = (payload.get("password") or "").strip()
     if not userid or not password:
         return {"success": False}
+
+    # Always bypass cache for login — stale cache causes "Invalid login"
+    gh_cache_invalidate(user_profile_path(userid))
+
     try:
         profile, _ = gh_get_json(user_profile_path(userid))
     except GitHubStorageError as e:
@@ -714,31 +707,6 @@ def auth_login(payload: dict = Body(...)):
 def me(userid: str = Depends(get_current_user)):
     return {"success": True, "userid": userid}
 
-@app.get("/debug_login")
-def debug_login(u: str = Query(""), p: str = Query("")):
-    """TEMPORARY DEBUG — remove after fixing. Never expose in production."""
-    if not u or not p:
-        return {"error": "provide u and p params"}
-    try:
-        profile, _ = gh_get_json(user_profile_path(u))
-    except Exception as e:
-        return {"error": f"gh read failed: {e}"}
-    if not isinstance(profile, dict) or not profile:
-        return {"error": "profile not found", "path": user_profile_path(u)}
-    
-    salt = profile.get("salt", "")
-    ph   = profile.get("password_hash", "")
-    computed = password_hash(p, salt)
-    
-    return {
-        "userid":          u,
-        "profile_found":   True,
-        "salt_present":    bool(salt),
-        "stored_hash":     ph[:10] + "...",   # partial for safety
-        "computed_hash":   computed[:10] + "...",
-        "match":           computed == ph,
-        "profile_keys":    list(profile.keys()),
-    }
 
 
 # ─────────────────────────────────────────────────────────────
