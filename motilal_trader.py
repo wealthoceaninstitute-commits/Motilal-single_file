@@ -714,6 +714,32 @@ def auth_login(payload: dict = Body(...)):
 def me(userid: str = Depends(get_current_user)):
     return {"success": True, "userid": userid}
 
+@app.get("/debug_login")
+def debug_login(u: str = Query(""), p: str = Query("")):
+    """TEMPORARY DEBUG — remove after fixing. Never expose in production."""
+    if not u or not p:
+        return {"error": "provide u and p params"}
+    try:
+        profile, _ = gh_get_json(user_profile_path(u))
+    except Exception as e:
+        return {"error": f"gh read failed: {e}"}
+    if not isinstance(profile, dict) or not profile:
+        return {"error": "profile not found", "path": user_profile_path(u)}
+    
+    salt = profile.get("salt", "")
+    ph   = profile.get("password_hash", "")
+    computed = password_hash(p, salt)
+    
+    return {
+        "userid":          u,
+        "profile_found":   True,
+        "salt_present":    bool(salt),
+        "stored_hash":     ph[:10] + "...",   # partial for safety
+        "computed_hash":   computed[:10] + "...",
+        "match":           computed == ph,
+        "profile_keys":    list(profile.keys()),
+    }
+
 
 # ─────────────────────────────────────────────────────────────
 # Client CRUD
