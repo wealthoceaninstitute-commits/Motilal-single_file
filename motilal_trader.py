@@ -694,21 +694,30 @@ def auth_register(payload: dict = Body(...)):
 
 @app.post("/auth/login")
 def auth_login(payload: dict = Body(...)):
-    userid   = normalize_userid(payload.get("userid"))
+    userid = normalize_userid(payload.get("userid"))
     password = (payload.get("password") or "").strip()
+
     if not userid or not password:
-        return {"success": False}
+        raise HTTPException(status_code=400, detail="Missing userid or password")
+
     try:
         profile, _ = gh_get_json(user_profile_path(userid))
     except GitHubStorageError as e:
-        return {"success": False, "error": f"Storage unavailable: {e}"}
+        raise HTTPException(status_code=503, detail=f"Storage unavailable: {e}")
+
     if not isinstance(profile, dict) or not profile:
-        return {"success": False}
+        raise HTTPException(status_code=401, detail="Invalid userid or password")
+
     salt = profile.get("salt", "")
-    ph   = profile.get("password_hash", "")
+    ph = profile.get("password_hash", "")
     if not salt or not ph or password_hash(password, salt) != ph:
-        return {"success": False}
-    return {"success": True, "userid": userid, "access_token": create_token(userid)}
+        raise HTTPException(status_code=401, detail="Invalid userid or password")
+
+    return {
+        "success": True,
+        "userid": userid,
+        "access_token": create_token(userid),
+    }
 
 @app.get("/me")
 def me(userid: str = Depends(get_current_user)):
