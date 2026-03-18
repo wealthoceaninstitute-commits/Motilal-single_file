@@ -705,23 +705,24 @@ def get_clients(request: Request, userid: str = None, user_id: str = None):
         return {"clients": []}
 
     try:
-        rows = db_execute("SELECT * FROM clients WHERE owner_userid=%s ORDER BY name", (uid,), fetch="all") or []
+        rows = db_execute(
+            "SELECT * FROM clients WHERE owner_userid=%s ORDER BY name",
+            (uid,), fetch="all"
+        ) or []
     except Exception as e:
         return {"clients": [], "error": str(e)}
 
     clients = []
     for row in rows:
         client_id = row["userid"]
-        # Attempt login if session missing
-        client_obj = dict(row)
-        client_obj["owner_userid"] = uid
-        try:
-            motilal_login(client_obj)
-        except Exception:
-            pass
+        # Just check in-memory session — do NOT attempt login here
         sess = mofsl_sessions.get(client_id)
-        sa   = bool(sess and _norm_uid(sess.get("owner_userid","")) == uid
-                    and _session_fresh(sess) and sess.get("mofsl"))
+        sa   = bool(
+            sess
+            and _norm_uid(sess.get("owner_userid", "")) == uid
+            and _session_fresh(sess)
+            and sess.get("mofsl")
+        )
         clients.append({
             "name":           row["name"],
             "client_id":      client_id,
@@ -731,7 +732,6 @@ def get_clients(request: Request, userid: str = None, user_id: str = None):
             "status":         "logged_in" if sa else "logged_out",
         })
     return {"clients": clients}
-
 
 @app.post("/delete_client")
 async def delete_client(request: Request, payload: dict = Body(...)):
