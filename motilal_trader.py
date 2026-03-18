@@ -20,7 +20,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from io import StringIO
+from io import BytesIO, StringIO
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -296,9 +296,9 @@ CREATE TABLE IF NOT EXISTS copy_setups (
 );
 
 CREATE TABLE IF NOT EXISTS symbol_master (
+    security_id      TEXT NOT NULL PRIMARY KEY,
     exchange         TEXT NOT NULL,
     stock_symbol     TEXT NOT NULL,
-    security_id      TEXT NOT NULL PRIMARY KEY,
     min_qty          INTEGER NOT NULL DEFAULT 1,
     raw_exchange     TEXT DEFAULT '',
     raw_instrument   TEXT DEFAULT '',
@@ -491,8 +491,23 @@ def _ensure_session_for_copy(owner: str, client_id: str) -> Optional[dict]:
 
 
 # ─────────────────────────────────────────────────────────────
-# Symbol master in PostgreSQL (from Dhan CSV)
-# Daily refresh at 8:00 AM IST
+# Symbol master — Dhan CSV → PostgreSQL
+# Daily refresh at 08:00 AM IST
+#
+# Exchange mapping (from Dhan SEM_EXM_EXCH_ID + SEM_INSTRUMENT_NAME):
+#   NSE  + EQUITY, INDEX          → NSE
+#   NSE  + FUTCUR, OPTCUR         → NSECD
+#   NSE  + FUTIDX, FUTSTK,
+#           OPTIDX, OPTSTK,
+#           FUTIVX                → NSEFO
+#   BSE  + EQUITY, INDEX          → BSE
+#   BSE  + FUTCUR, OPTCUR         → BSECD
+#   BSE  + FUTIDX, FUTSTK,
+#           OPTIDX, OPTSTK        → BSEFO
+#   MCX  + FUTCOM, FUTIDX,
+#           OPTFUT, OPTIDX,
+#           OPTCOM                → MCX
+#   Everything else               → dropped (NCDEX, unknown, etc.)
 # ─────────────────────────────────────────────────────────────
 DHAN_SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 
@@ -501,6 +516,44 @@ _SYMBOL_REFRESH_META_KEY = "dhan_scrip_master"
 _SYMBOL_SCHEDULER_STARTED = False
 
 IST_OFFSET_SECONDS = 5 * 3600 + 30 * 60
+
+# ── Instrument sets per exchange ──────────────────────────────
+_NSE_EQUITY = {"EQUITY", "INDEX"}
+_NSE_CD     = {"FUTCUR", "OPTCUR"}
+_NSE_FO     = {"FUTIDX", "FUTSTK", "OPTIDX", "OPTSTK", "FUTIVX"}
+_BSE_EQUITY = {"EQUITY", "INDEX"}
+_BSE_CD     = {"FUTCUR", "OPTCUR"}
+_BSE_FO     = {"FUTIDX", "FUTSTK", "OPTIDX", "OPTSTK"}
+_MCX_ALL    = {"FUTCOM", "FUTIDX", "OPTFUT", "OPTIDX", "OPTCOM"}
+
+
+def _classify_exchange(exch: str, instrument: str) -> Optional[str]:
+    """
+    Map Dhan (SEM_EXM_EXCH_ID, SEM_INSTRUMENT_NAME) → one of
+    NSE | NSECD | NSEFO | BSE | BSECD | BSEFO | MCX
+    Returns None for anything we don't support so it gets dropped.
+    """
+    exch       = str(exch or "").strip().upper()
+    instrument = str(instrument or "").strip().upper()
+
+    if exch == "NSE":
+        if instrument in _NSE_EQUITY:  return "NSE"
+        if instrument in _NSE_CD:      return "NSECD"
+        if instrument in _NSE_FO:      return "NSEFO"
+        return None
+
+    if exch == "BSE":
+        if instrument in _BSE_EQUITY:  return "BSE"
+        if instrument in _BSE_CD:      return "BSECD"
+        if instrument in _BSE_FO:      return "BSEFO"
+        return None
+
+    if exch == "MCX":
+        if instrument in _MCX_ALL:     return "MCX"
+        return None
+
+    # NCDEX, IDX, or anything else — skip
+    return None
 
 
 def _utc_now_ts() -> int:
@@ -521,69 +574,33 @@ def _today_ist_str() -> str:
 
 def _next_8am_ist_epoch() -> int:
     now_ist = _ist_datetime_now()
-    target = now_ist.replace(hour=8, minute=0, second=0, microsecond=0)
+    target  = now_ist.replace(hour=8, minute=0, second=0, microsecond=0)
     if now_ist >= target:
         target = target + timedelta(days=1)
     return int(target.timestamp()) - IST_OFFSET_SECONDS
 
 
-def _normalize_text(v: Any) -> str:
-    return str(v or "").strip()
-
-
-def _classify_exchange(exch: str, instrument: str) -> Optional[str]:
-    exch = _normalize_text(exch).upper()
-    instrument = _normalize_text(instrument).upper()
-
-    if exch == "NSE":
-        if instrument == "EQUITY":
-            return "NSE"
-        if instrument in ("FUTCUR", "OPTCUR"):
-            return "NSECD"
-        if instrument in ("FUTIDX", "FUTSTK", "OPTIDX", "OPTSTK"):
-            return "NSEFO"
-        return None
-
-    if exch == "BSE":
-        if instrument == "EQUITY":
-            return "BSE"
-        if instrument in ("FUTCUR", "OPTCUR"):
-            return "BSECD"
-        if instrument in ("FUTIDX", "FUTSTK", "OPTIDX", "OPTSTK"):
-            return "BSEFO"
-        return None
-
-    if exch == "MCX":
-        return "MCX"
-
-    return None
-
-
 def _ensure_symbol_tables():
     ddl = """
     CREATE TABLE IF NOT EXISTS symbol_master (
+        security_id      TEXT NOT NULL PRIMARY KEY,
         exchange         TEXT NOT NULL,
         stock_symbol     TEXT NOT NULL,
-        security_id      TEXT NOT NULL PRIMARY KEY,
         min_qty          INTEGER NOT NULL DEFAULT 1,
         raw_exchange     TEXT DEFAULT '',
         raw_instrument   TEXT DEFAULT '',
         updated_at       TIMESTAMPTZ DEFAULT NOW()
     );
-
-    CREATE INDEX IF NOT EXISTS idx_symbol_master_exchange
+    CREATE INDEX IF NOT EXISTS idx_sm_exchange
         ON symbol_master (exchange);
-
-    CREATE INDEX IF NOT EXISTS idx_symbol_master_symbol
+    CREATE INDEX IF NOT EXISTS idx_sm_symbol
         ON symbol_master (stock_symbol);
-
-    CREATE INDEX IF NOT EXISTS idx_symbol_master_symbol_lower
+    CREATE INDEX IF NOT EXISTS idx_sm_symbol_lower
         ON symbol_master ((LOWER(stock_symbol)));
-
     CREATE TABLE IF NOT EXISTS app_meta (
-        key         TEXT PRIMARY KEY,
-        value       TEXT NOT NULL,
-        updated_at  TIMESTAMPTZ DEFAULT NOW()
+        key        TEXT PRIMARY KEY,
+        value      TEXT NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
     );
     """
     with get_db() as conn:
@@ -591,100 +608,169 @@ def _ensure_symbol_tables():
 
 
 def _get_symbol_refresh_meta() -> dict:
-    row = db_execute(
-        "SELECT key, value, updated_at FROM app_meta WHERE key=%s",
-        (_SYMBOL_REFRESH_META_KEY,),
-        fetch="one",
-    )
-    if not row:
-        return {}
     try:
-        val = json.loads(row["value"] or "{}")
-        return val if isinstance(val, dict) else {}
+        row = db_execute(
+            "SELECT value FROM app_meta WHERE key=%s",
+            (_SYMBOL_REFRESH_META_KEY,),
+            fetch="one",
+        )
+        if not row:
+            return {}
+        return json.loads(row["value"] or "{}") or {}
     except Exception:
         return {}
 
 
 def _set_symbol_refresh_meta(meta: dict):
-    payload = json.dumps(meta or {})
     db_execute(
         """
         INSERT INTO app_meta (key, value, updated_at)
         VALUES (%s, %s, NOW())
-        ON CONFLICT (key)
-        DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+        ON CONFLICT (key) DO UPDATE
+            SET value=EXCLUDED.value, updated_at=NOW()
         """,
-        (_SYMBOL_REFRESH_META_KEY, payload),
+        (_SYMBOL_REFRESH_META_KEY, json.dumps(meta or {})),
     )
 
 
 def _symbols_are_fresh_for_today_ist() -> bool:
-    meta = _get_symbol_refresh_meta()
-    return meta.get("trade_date_ist") == _today_ist_str()
+    return _get_symbol_refresh_meta().get("trade_date_ist") == _today_ist_str()
 
 
 def refresh_symbol_db_from_dhan(force: bool = False) -> Dict[str, Any]:
+    """
+    Downloads the full Dhan scrip master CSV (~35 MB, ~270k rows),
+    maps each row to our 7-exchange taxonomy, drops everything else
+    (NCDEX, unknown instruments), then does an atomic TRUNCATE+INSERT
+    into symbol_master.
+
+    Expect ~130k–160k rows after filtering.
+    """
     with _SYMBOL_REFRESH_LOCK:
         _ensure_symbol_tables()
 
         if not force and _symbols_are_fresh_for_today_ist():
             row = db_execute("SELECT COUNT(*) AS c FROM symbol_master", fetch="one")
             return {
-                "status": "success",
-                "message": "Already fresh for today",
-                "rows": int((row or {}).get("c") or 0),
+                "status":         "already_fresh",
+                "message":        "Already fresh for today",
+                "rows":           int((row or {}).get("c") or 0),
                 "trade_date_ist": _today_ist_str(),
             }
 
-        print("🔄 Refreshing symbol master from Dhan CSV...")
+        print(f"⬇️  [SYMBOLS] Downloading Dhan scrip master…")
+        t0 = time.time()
 
-        r = requests.get(DHAN_SCRIP_MASTER_URL, timeout=90)
-        r.raise_for_status()
+        # Stream download — avoids holding 35 MB twice in memory
+        resp = requests.get(DHAN_SCRIP_MASTER_URL, timeout=120, stream=True)
+        resp.raise_for_status()
 
-        df = pd.read_csv(StringIO(r.text), dtype=str).fillna("")
+        chunks, downloaded = [], 0
+        for chunk in resp.iter_content(chunk_size=256 * 1024):
+            if chunk:
+                chunks.append(chunk)
+                downloaded += len(chunk)
+        raw_bytes = b"".join(chunks)
+        print(f"   Downloaded {downloaded / 1024 / 1024:.1f} MB in {time.time() - t0:.1f}s")
 
-        required_cols = [
+        # ── Parse ────────────────────────────────────────────
+        df = pd.read_csv(
+            BytesIO(raw_bytes),
+            dtype=str,
+            low_memory=False,
+            on_bad_lines="skip",
+        ).fillna("")
+
+        total_raw = len(df)
+        print(f"   Raw rows : {total_raw:,}")
+        print(f"   Columns  : {list(df.columns)}")
+
+        # ── Validate required columns ────────────────────────
+        required = [
             "SEM_EXM_EXCH_ID",
             "SEM_INSTRUMENT_NAME",
             "SEM_TRADING_SYMBOL",
             "SEM_SMST_SECURITY_ID",
             "SEM_LOT_UNITS",
         ]
-        missing = [c for c in required_cols if c not in df.columns]
+        missing = [c for c in required if c not in df.columns]
         if missing:
-            raise RuntimeError(f"Missing required Dhan columns: {missing}")
+            raise RuntimeError(f"Dhan CSV missing columns: {missing}")
 
-        df["mapped_exchange"] = df.apply(
-            lambda x: _classify_exchange(
-                x.get("SEM_EXM_EXCH_ID", ""),
-                x.get("SEM_INSTRUMENT_NAME", ""),
-            ),
-            axis=1,
-        )
+        # Strip whitespace on key columns before classify
+        for col in required:
+            df[col] = df[col].astype(str).str.strip()
 
-        df = df[df["mapped_exchange"].notna()].copy()
-
-        df["stock_symbol"] = df["SEM_TRADING_SYMBOL"].astype(str).str.strip()
-        df["security_id"] = (
-            df["SEM_SMST_SECURITY_ID"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
-        )
-        df["min_qty"] = df["SEM_LOT_UNITS"].apply(lambda x: max(1, _safe_int(x, 1)))
-
-        df = df[(df["stock_symbol"] != "") & (df["security_id"] != "")].copy()
-        df = df.drop_duplicates(subset=["security_id"], keep="first")
-
-        records = [
-            (
-                str(row["mapped_exchange"]).strip(),
-                str(row["stock_symbol"]).strip(),
-                str(row["security_id"]).strip(),
-                int(row["min_qty"]),
-                str(row.get("SEM_EXM_EXCH_ID", "")).strip(),
-                str(row.get("SEM_INSTRUMENT_NAME", "")).strip(),
-            )
-            for _, row in df.iterrows()
+        # ── Classify exchange (vectorised via list-comp) ─────
+        print("   Classifying exchanges…")
+        df["mapped_exchange"] = [
+            _classify_exchange(e, i)
+            for e, i in zip(df["SEM_EXM_EXCH_ID"], df["SEM_INSTRUMENT_NAME"])
         ]
 
+        classified   = int(df["mapped_exchange"].notna().sum())
+        dropped_rows = total_raw - classified
+        print(f"   Classified: {classified:,}  |  Dropped: {dropped_rows:,}")
+
+        # Per-exchange breakdown — helpful for debugging
+        breakdown = (
+            df[df["mapped_exchange"].notna()]["mapped_exchange"]
+            .value_counts()
+            .to_dict()
+        )
+        for exch, cnt in sorted(breakdown.items()):
+            print(f"     {exch}: {cnt:,}")
+
+        # Log top dropped combos so we can catch new instrument types
+        dropped_df = df[df["mapped_exchange"].isna()]
+        if not dropped_df.empty:
+            top_dropped = (
+                (dropped_df["SEM_EXM_EXCH_ID"] + "/" + dropped_df["SEM_INSTRUMENT_NAME"])
+                .value_counts()
+                .head(15)
+                .to_dict()
+            )
+            print("   Top dropped exchange/instrument combos:")
+            for combo, cnt in top_dropped.items():
+                print(f"     {combo}: {cnt:,}")
+
+        # ── Filter & build final columns ─────────────────────
+        df = df[df["mapped_exchange"].notna()].copy()
+
+        df["security_id"] = (
+            df["SEM_SMST_SECURITY_ID"]
+            .str.replace(r"\.0$", "", regex=True)
+            .str.strip()
+        )
+        df["stock_symbol"] = df["SEM_TRADING_SYMBOL"].str.strip()
+        df["min_qty"] = df["SEM_LOT_UNITS"].apply(lambda x: max(1, _safe_int(x, 1)))
+
+        # Drop rows with empty security_id or stock_symbol
+        df = df[(df["security_id"] != "") & (df["stock_symbol"] != "")].copy()
+
+        # Deduplicate on security_id — keep first occurrence
+        before_dedup = len(df)
+        df = df.drop_duplicates(subset=["security_id"], keep="first")
+        deduped = before_dedup - len(df)
+        if deduped:
+            print(f"   Removed {deduped:,} duplicate security_ids")
+
+        final_rows = len(df)
+        print(f"   Final rows to insert: {final_rows:,}")
+
+        # ── Build tuples for batch insert ────────────────────
+        records = list(zip(
+            df["security_id"],
+            df["mapped_exchange"],
+            df["stock_symbol"],
+            df["min_qty"].astype(int),
+            df["SEM_EXM_EXCH_ID"],
+            df["SEM_INSTRUMENT_NAME"],
+        ))
+
+        # ── Atomic TRUNCATE + INSERT ─────────────────────────
+        print("   Writing to PostgreSQL…")
+        t1 = time.time()
         with get_db() as conn:
             cur = conn.cursor()
             cur.execute("TRUNCATE TABLE symbol_master")
@@ -692,32 +778,31 @@ def refresh_symbol_db_from_dhan(force: bool = False) -> Dict[str, Any]:
                 psycopg2.extras.execute_batch(
                     cur,
                     """
-                    INSERT INTO symbol_master (
-                        exchange,
-                        stock_symbol,
-                        security_id,
-                        min_qty,
-                        raw_exchange,
-                        raw_instrument,
-                        updated_at
-                    )
+                    INSERT INTO symbol_master
+                        (security_id, exchange, stock_symbol, min_qty,
+                         raw_exchange, raw_instrument, updated_at)
                     VALUES (%s, %s, %s, %s, %s, %s, NOW())
                     """,
                     records,
                     page_size=5000,
                 )
+        print(f"   DB write done in {time.time() - t1:.1f}s")
 
         meta = {
-            "trade_date_ist": _today_ist_str(),
+            "trade_date_ist":   _today_ist_str(),
             "refreshed_at_utc": utcnow_iso(),
-            "row_count": len(records),
-            "source": DHAN_SCRIP_MASTER_URL,
+            "row_count":        final_rows,
+            "total_raw_rows":   total_raw,
+            "dropped_rows":     dropped_rows,
+            "by_exchange":      breakdown,
+            "source":           DHAN_SCRIP_MASTER_URL,
         }
         _set_symbol_refresh_meta(meta)
 
         print(
-            f"✅ Symbol master refreshed from Dhan: rows={len(records)} "
-            f"trade_date_ist={meta['trade_date_ist']}"
+            f"✅ [SYMBOLS] Done — {final_rows:,} rows in DB "
+            f"(from {total_raw:,} raw, dropped {dropped_rows:,}) "
+            f"date={meta['trade_date_ist']}"
         )
         return {"status": "success", **meta}
 
@@ -728,7 +813,7 @@ def _ensure_symbols_ready():
         try:
             refresh_symbol_db_from_dhan(force=False)
         except Exception as e:
-            print(f"❌ Symbol refresh ensure failed: {e}")
+            print(f"❌ Symbol refresh failed: {e}")
 
 
 def _min_qty_from_symbol_db(symboltoken) -> int:
@@ -741,9 +826,7 @@ def _min_qty_from_symbol_db(symboltoken) -> int:
             (token,),
             fetch="one",
         )
-        if not row:
-            return 1
-        return max(1, int(row.get("min_qty") or 1))
+        return max(1, int((row or {}).get("min_qty") or 1))
     except Exception:
         return 1
 
@@ -753,16 +836,18 @@ def _seconds_until_next_8am_ist() -> int:
 
 
 def symbol_refresh_scheduler_loop():
-    print("🕗 Symbol refresh scheduler started (8:00 AM IST daily)")
+    print("🕗 [SYMBOLS] Scheduler started — daily refresh at 08:00 IST")
     while True:
         try:
-            sleep_for = _seconds_until_next_8am_ist()
-            print(f"⏳ Next symbol refresh in {sleep_for} seconds")
-            time.sleep(sleep_for)
+            secs    = _seconds_until_next_8am_ist()
+            next_dt = _ist_datetime_now() + timedelta(seconds=secs)
+            print(f"⏳ [SYMBOLS] Next refresh at {next_dt.strftime('%Y-%m-%d %H:%M')} IST ({secs / 3600:.1f}h away)")
+            time.sleep(secs)
+            print("🔄 [SYMBOLS] Daily 08:00 IST refresh starting…")
             refresh_symbol_db_from_dhan(force=True)
         except Exception as e:
-            print(f"❌ Daily symbol refresh error: {e}")
-            time.sleep(300)
+            print(f"❌ [SYMBOLS] Daily refresh error: {e}")
+            time.sleep(300)   # retry in 5 min on failure
 
 
 def start_symbol_refresh_thread():
@@ -831,10 +916,10 @@ def health():
 
 @app.post("/auth/register")
 def auth_register(payload: dict = Body(...)):
-    userid = normalize_userid(payload.get("userid"))
-    email = (payload.get("email") or "").strip()
+    userid   = normalize_userid(payload.get("userid"))
+    email    = (payload.get("email") or "").strip()
     password = (payload.get("password") or "").strip()
-    confirm = (payload.get("confirm_password") or payload.get("confirmPassword") or "").strip()
+    confirm  = (payload.get("confirm_password") or payload.get("confirmPassword") or "").strip()
 
     if not userid or not email or not password:
         return {"success": False, "error": "Missing userid/email/password"}
@@ -845,9 +930,8 @@ def auth_register(payload: dict = Body(...)):
         existing = db_execute("SELECT userid FROM users WHERE userid=%s", (userid,), fetch="one")
         if existing:
             return {"success": False, "error": "User already exists"}
-
         salt = base64.b64encode(os.urandom(12)).decode()
-        ph = password_hash(password, salt)
+        ph   = password_hash(password, salt)
         db_execute(
             "INSERT INTO users (userid, email, salt, password_hash) VALUES (%s,%s,%s,%s)",
             (userid, email, salt, ph),
@@ -859,7 +943,7 @@ def auth_register(payload: dict = Body(...)):
 
 @app.post("/auth/login")
 def auth_login(payload: dict = Body(...)):
-    userid = normalize_userid(payload.get("userid"))
+    userid   = normalize_userid(payload.get("userid"))
     password = (payload.get("password") or "").strip()
     if not userid or not password:
         return {"success": False}
@@ -868,7 +952,7 @@ def auth_login(payload: dict = Body(...)):
         if not row:
             return {"success": False}
         salt = row["salt"]
-        ph = row["password_hash"]
+        ph   = row["password_hash"]
         if not salt or not ph or password_hash(password, salt) != ph:
             return {"success": False}
         return {"success": True, "userid": userid, "access_token": create_token(userid)}
@@ -897,7 +981,7 @@ async def add_client(request: Request, payload: dict = Body(...)):
     if not client_userid:
         raise HTTPException(400, "Client userid required")
 
-    name = payload.get("name") or ""
+    name    = payload.get("name") or ""
     capital = _safe_float(payload.get("capital", 0), 0.0)
 
     try:
@@ -909,43 +993,28 @@ async def add_client(request: Request, payload: dict = Body(...)):
                 name=%s, password=%s, pan=%s, apikey=%s, totpkey=%s, capital=%s
             """,
             (
-                owner_userid,
-                client_userid,
-                name,
-                payload.get("password", ""),
-                payload.get("pan", ""),
-                payload.get("apikey", ""),
-                payload.get("totpkey", ""),
-                capital,
-                name,
-                payload.get("password", ""),
-                payload.get("pan", ""),
-                payload.get("apikey", ""),
-                payload.get("totpkey", ""),
-                capital,
+                owner_userid, client_userid, name,
+                payload.get("password", ""), payload.get("pan", ""),
+                payload.get("apikey", ""), payload.get("totpkey", ""), capital,
+                name, payload.get("password", ""), payload.get("pan", ""),
+                payload.get("apikey", ""), payload.get("totpkey", ""), capital,
             ),
         )
     except Exception as e:
         raise HTTPException(503, f"DB error: {e}")
 
     client_obj = {
-        "name": name,
-        "userid": client_userid,
-        "password": payload.get("password", ""),
-        "pan": payload.get("pan", ""),
-        "apikey": payload.get("apikey", ""),
-        "totpkey": payload.get("totpkey", ""),
+        "name": name, "userid": client_userid,
+        "password": payload.get("password", ""), "pan": payload.get("pan", ""),
+        "apikey": payload.get("apikey", ""), "totpkey": payload.get("totpkey", ""),
         "owner_userid": owner_userid,
     }
-    ok = motilal_login(client_obj)
+    ok  = motilal_login(client_obj)
     msg = "Login successful" if ok else "Login failed"
     try:
         db_execute(
-            """
-            UPDATE clients
-            SET session_active=%s, last_login_ts=%s, last_login_msg=%s
-            WHERE owner_userid=%s AND userid=%s
-            """,
+            "UPDATE clients SET session_active=%s, last_login_ts=%s, last_login_msg=%s "
+            "WHERE owner_userid=%s AND userid=%s",
             (ok, int(time.time()), msg, owner_userid, client_userid),
         )
     except Exception:
@@ -955,15 +1024,14 @@ async def add_client(request: Request, payload: dict = Body(...)):
 
 @app.post("/edit_client")
 async def edit_client(request: Request, payload: dict = Body(...)):
-    owner_userid = _norm_uid(request.headers.get("x-user-id") or payload.get("owner_userid") or "")
+    owner_userid  = _norm_uid(request.headers.get("x-user-id") or payload.get("owner_userid") or "")
     client_userid = str(payload.get("userid") or payload.get("client_id") or "").strip()
     if not owner_userid or not client_userid:
         raise HTTPException(400, "Missing owner_userid or client_userid")
 
     row = db_execute(
         "SELECT * FROM clients WHERE owner_userid=%s AND userid=%s",
-        (owner_userid, client_userid),
-        fetch="one",
+        (owner_userid, client_userid), fetch="one",
     )
     if not row:
         raise HTTPException(404, "Client not found")
@@ -984,20 +1052,16 @@ async def edit_client(request: Request, payload: dict = Body(...)):
 
     updated_row = db_execute(
         "SELECT * FROM clients WHERE owner_userid=%s AND userid=%s",
-        (owner_userid, client_userid),
-        fetch="one",
+        (owner_userid, client_userid), fetch="one",
     )
     client_obj = dict(updated_row)
     client_obj["owner_userid"] = owner_userid
     mofsl_sessions.pop(client_userid, None)
-    ok = motilal_login(client_obj)
+    ok  = motilal_login(client_obj)
     msg = "Login successful" if ok else "Login failed"
     db_execute(
-        """
-        UPDATE clients
-        SET session_active=%s, last_login_ts=%s, last_login_msg=%s
-        WHERE owner_userid=%s AND userid=%s
-        """,
+        "UPDATE clients SET session_active=%s, last_login_ts=%s, last_login_msg=%s "
+        "WHERE owner_userid=%s AND userid=%s",
         (ok, int(time.time()), msg, owner_userid, client_userid),
     )
     return {"success": True}
@@ -1006,21 +1070,15 @@ async def edit_client(request: Request, payload: dict = Body(...)):
 @app.get("/clients")
 def get_clients(request: Request, userid: str = None, user_id: str = None):
     uid = _norm_uid(
-        request.headers.get("x-user-id")
-        or userid
-        or user_id
-        or request.query_params.get("userid")
-        or request.query_params.get("user_id")
-        or ""
+        request.headers.get("x-user-id") or userid or user_id
+        or request.query_params.get("userid") or request.query_params.get("user_id") or ""
     )
     if not uid:
         return {"clients": []}
 
     try:
         rows = db_execute(
-            "SELECT * FROM clients WHERE owner_userid=%s ORDER BY name",
-            (uid,),
-            fetch="all",
+            "SELECT * FROM clients WHERE owner_userid=%s ORDER BY name", (uid,), fetch="all"
         ) or []
     except Exception as e:
         return {"clients": [], "error": str(e)}
@@ -1035,16 +1093,14 @@ def get_clients(request: Request, userid: str = None, user_id: str = None):
             and _session_fresh(sess)
             and sess.get("mofsl")
         )
-        clients.append(
-            {
-                "name": row["name"],
-                "client_id": client_id,
-                "capital": float(row.get("capital") or 0),
-                "session": "Logged in" if sa else "Logged out",
-                "session_active": sa,
-                "status": "logged_in" if sa else "logged_out",
-            }
-        )
+        clients.append({
+            "name":           row["name"],
+            "client_id":      client_id,
+            "capital":        float(row.get("capital") or 0),
+            "session":        "Logged in" if sa else "Logged out",
+            "session_active": sa,
+            "status":         "logged_in" if sa else "logged_out",
+        })
     return {"clients": clients}
 
 
@@ -1064,8 +1120,7 @@ async def delete_client(request: Request, payload: dict = Body(...)):
         try:
             row = db_execute(
                 "SELECT id FROM clients WHERE owner_userid=%s AND userid=%s",
-                (owner_userid, cuid),
-                fetch="one",
+                (owner_userid, cuid), fetch="one",
             )
             if not row:
                 missing.append(cuid)
@@ -1079,7 +1134,7 @@ async def delete_client(request: Request, payload: dict = Body(...)):
 
 
 # ─────────────────────────────────────────────────────────────
-# Symbol search
+# Symbol search endpoints
 # ─────────────────────────────────────────────────────────────
 @app.post("/refresh_symbols")
 def refresh_symbols():
@@ -1092,12 +1147,17 @@ def refresh_symbols():
 @app.get("/symbols_status")
 def symbols_status():
     _ensure_symbol_tables()
-    row = db_execute("SELECT COUNT(*) AS c FROM symbol_master", fetch="one")
+    total = db_execute("SELECT COUNT(*) AS c FROM symbol_master", fetch="one")
+    by_exchange = db_execute(
+        "SELECT exchange, COUNT(*) AS c FROM symbol_master GROUP BY exchange ORDER BY exchange",
+        fetch="all",
+    ) or []
     meta = _get_symbol_refresh_meta()
     return {
-        "count": int((row or {}).get("c") or 0),
-        "meta": meta,
-        "today_ist": _today_ist_str(),
+        "total":           int((total or {}).get("c") or 0),
+        "by_exchange":     {r["exchange"]: int(r["c"]) for r in by_exchange},
+        "meta":            meta,
+        "today_ist":       _today_ist_str(),
         "fresh_for_today": _symbols_are_fresh_for_today_ist(),
     }
 
@@ -1106,9 +1166,8 @@ def symbols_status():
 def search_symbols(q: str = Query(""), exchange: str = Query("")):
     _ensure_symbols_ready()
 
-    raw = (q or "").strip().lower()
+    raw  = (q or "").strip().lower()
     exch = (exchange or "").strip().upper()
-
     if not raw:
         return {"results": []}
 
@@ -1116,43 +1175,44 @@ def search_symbols(q: str = Query(""), exchange: str = Query("")):
     if not words:
         return {"results": []}
 
-    where = []
-    params: List[Any] = []
+    where_clauses: List[str] = []
+    filter_params: List[Any] = []
 
     for w in words:
-        where.append("LOWER(stock_symbol) LIKE %s")
-        params.append(f"%{w}%")
+        where_clauses.append("LOWER(stock_symbol) LIKE %s")
+        filter_params.append(f"%{w}%")
 
     if exch:
-        where.append("exchange = %s")
-        params.append(exch)
+        where_clauses.append("exchange = %s")
+        filter_params.append(exch)
 
     sql = f"""
-        SELECT
-            exchange,
-            stock_symbol,
-            security_id,
+        SELECT exchange, stock_symbol, security_id,
             CASE
-                WHEN LOWER(stock_symbol) = %s THEN 0
-                WHEN LOWER(stock_symbol) LIKE %s THEN 1
-                WHEN LOWER(stock_symbol) LIKE %s THEN 2
+                WHEN LOWER(stock_symbol) = %s          THEN 0
+                WHEN LOWER(stock_symbol) LIKE %s        THEN 1
+                WHEN LOWER(stock_symbol) LIKE %s        THEN 2
                 ELSE 3
             END AS rank_score
         FROM symbol_master
-        WHERE {' AND '.join(where)}
-        ORDER BY rank_score, stock_symbol
+        WHERE {' AND '.join(where_clauses)}
+        ORDER BY rank_score, exchange, stock_symbol
         LIMIT 200
     """
 
-    rows = db_execute(sql, (raw, f"{raw}%", f"%{raw}%") + tuple(params), fetch="all") or []
+    rows = db_execute(
+        sql,
+        (raw, f"{raw}%", f"%{raw}%") + tuple(filter_params),
+        fetch="all",
+    ) or []
 
     return {
         "results": [
             {
-                "id": f"{row['exchange']}|{row['stock_symbol']}|{row['security_id']}",
-                "text": f"{row['exchange']} | {row['stock_symbol']}",
+                "id":   f"{r['exchange']}|{r['stock_symbol']}|{r['security_id']}",
+                "text": f"{r['exchange']} | {r['stock_symbol']}",
             }
-            for row in rows
+            for r in rows
         ]
     }
 
@@ -1168,18 +1228,17 @@ async def get_groups(request: Request, userid: str = None, user_id: str = None):
     try:
         rows = db_execute(
             "SELECT * FROM groups WHERE owner_userid=%s ORDER BY name",
-            (owner_userid,),
-            fetch="all",
+            (owner_userid,), fetch="all",
         ) or []
     except Exception:
         return {"groups": []}
     return {
         "groups": [
             {
-                "id": row["name"],
-                "name": row["name"],
+                "id":         row["name"],
+                "name":       row["name"],
                 "multiplier": float(row.get("multiplier") or 1),
-                "members": row.get("members") or [],
+                "members":    row.get("members") or [],
             }
             for row in rows
         ]
@@ -1193,7 +1252,7 @@ async def add_group(request: Request, payload: dict = Body(...)):
     )
     if not owner_userid:
         raise HTTPException(401, "Missing owner userid")
-    name = (payload.get("name") or "").strip()
+    name    = (payload.get("name") or "").strip()
     members = payload.get("members") or []
     if not name:
         raise HTTPException(400, "Group name required")
@@ -1222,14 +1281,15 @@ async def edit_group(request: Request, payload: dict = Body(...)):
     )
     if not owner_userid:
         raise HTTPException(401, "Missing owner userid")
-    name = (payload.get("id") or payload.get("name") or "").strip()
+    name    = (payload.get("id") or payload.get("name") or "").strip()
     if not name:
         raise HTTPException(400, "Group name required")
     members = payload.get("members") or []
-    mult = max(0.01, float(payload.get("multiplier", 1) or 1))
+    mult    = max(0.01, float(payload.get("multiplier", 1) or 1))
     try:
         db_execute(
-            "UPDATE groups SET multiplier=%s, members=%s, updated_at=NOW() WHERE owner_userid=%s AND name=%s",
+            "UPDATE groups SET multiplier=%s, members=%s, updated_at=NOW() "
+            "WHERE owner_userid=%s AND name=%s",
             (mult, json.dumps(members), owner_userid, name),
         )
     except Exception as e:
@@ -1253,12 +1313,10 @@ async def delete_group(request: Request, payload: dict = Body(...)):
         try:
             row = db_execute(
                 "SELECT id FROM groups WHERE owner_userid=%s AND name=%s",
-                (owner_userid, gid),
-                fetch="one",
+                (owner_userid, gid), fetch="one",
             )
             if not row:
-                missing.append(gid)
-                continue
+                missing.append(gid); continue
             db_execute("DELETE FROM groups WHERE owner_userid=%s AND name=%s", (owner_userid, gid))
             deleted.append(gid)
         except Exception as e:
@@ -1277,20 +1335,19 @@ async def list_copytrading_setups(request: Request, userid: str = None, user_id:
     try:
         rows = db_execute(
             "SELECT * FROM copy_setups WHERE owner_userid=%s ORDER BY name",
-            (owner_userid,),
-            fetch="all",
+            (owner_userid,), fetch="all",
         ) or []
     except Exception:
         return {"setups": []}
     return {
         "setups": [
             {
-                "id": row["name"],
-                "name": row["name"],
-                "master": row["master"],
-                "children": row.get("children") or [],
+                "id":          row["name"],
+                "name":        row["name"],
+                "master":      row["master"],
+                "children":    row.get("children") or [],
                 "multipliers": row.get("multipliers") or {},
-                "enabled": bool(row.get("enabled", False)),
+                "enabled":     bool(row.get("enabled", False)),
             }
             for row in rows
         ]
@@ -1304,15 +1361,15 @@ async def save_copytrading_setup(request: Request, payload: dict = Body(...)):
     )
     if not owner_userid:
         raise HTTPException(401, "Missing owner userid")
-    name = (payload.get("name") or payload.get("id") or "").strip()
-    master = (payload.get("master") or "").strip()
-    children = payload.get("children") or []
+    name        = (payload.get("name") or payload.get("id") or "").strip()
+    master      = (payload.get("master") or "").strip()
+    children    = payload.get("children") or []
     if not name:
         raise HTTPException(400, "Setup name required")
     if not master or not children:
         raise HTTPException(400, "Master + at least one child required")
     multipliers = payload.get("multipliers") or {}
-    enabled = bool(payload.get("enabled", False))
+    enabled     = bool(payload.get("enabled", False))
     try:
         db_execute(
             """
@@ -1322,16 +1379,9 @@ async def save_copytrading_setup(request: Request, payload: dict = Body(...)):
                 master=%s, children=%s, multipliers=%s, enabled=%s, updated_at=NOW()
             """,
             (
-                owner_userid,
-                name,
-                master,
-                json.dumps(children),
-                json.dumps(multipliers),
-                enabled,
-                master,
-                json.dumps(children),
-                json.dumps(multipliers),
-                enabled,
+                owner_userid, name, master,
+                json.dumps(children), json.dumps(multipliers), enabled,
+                master, json.dumps(children), json.dumps(multipliers), enabled,
             ),
         )
     except Exception as e:
@@ -1339,12 +1389,8 @@ async def save_copytrading_setup(request: Request, payload: dict = Body(...)):
     return {
         "ok": True,
         "setup": {
-            "id": name,
-            "name": name,
-            "master": master,
-            "children": children,
-            "multipliers": multipliers,
-            "enabled": enabled,
+            "id": name, "name": name, "master": master,
+            "children": children, "multipliers": multipliers, "enabled": enabled,
         },
     }
 
@@ -1378,14 +1424,13 @@ async def _set_copy_enabled(request: Request, payload: dict, value: bool):
         try:
             row = db_execute(
                 "SELECT id FROM copy_setups WHERE owner_userid=%s AND name=%s",
-                (owner_userid, sid),
-                fetch="one",
+                (owner_userid, sid), fetch="one",
             )
             if not row:
-                missing.append(sid)
-                continue
+                missing.append(sid); continue
             db_execute(
-                "UPDATE copy_setups SET enabled=%s, updated_at=NOW() WHERE owner_userid=%s AND name=%s",
+                "UPDATE copy_setups SET enabled=%s, updated_at=NOW() "
+                "WHERE owner_userid=%s AND name=%s",
                 (value, owner_userid, sid),
             )
             updated.append(sid)
@@ -1415,13 +1460,14 @@ async def delete_copy_setup(request: Request, payload: dict = Body(...)):
         try:
             row = db_execute(
                 "SELECT id FROM copy_setups WHERE owner_userid=%s AND name=%s",
-                (owner_userid, sid),
-                fetch="one",
+                (owner_userid, sid), fetch="one",
             )
             if not row:
-                missing.append(sid)
-                continue
-            db_execute("DELETE FROM copy_setups WHERE owner_userid=%s AND name=%s", (owner_userid, sid))
+                missing.append(sid); continue
+            db_execute(
+                "DELETE FROM copy_setups WHERE owner_userid=%s AND name=%s",
+                (owner_userid, sid),
+            )
             deleted.append(sid)
         except Exception as e:
             errors.append(str(e))
@@ -1434,7 +1480,7 @@ async def delete_copy_setup(request: Request, payload: dict = Body(...)):
 @app.get("/get_orders")
 def get_orders(request: Request, userid: str = None, user_id: str = None):
     owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
-    orders_data = OrderedDict(pending=[], traded=[], rejected=[], cancelled=[], others=[])
+    orders_data  = OrderedDict(pending=[], traded=[], rejected=[], cancelled=[], others=[])
 
     for client_id, sess in list(mofsl_sessions.items()):
         try:
@@ -1442,28 +1488,28 @@ def get_orders(request: Request, userid: str = None, user_id: str = None):
                 continue
             if owner_userid and str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
                 continue
-            name = sess.get("name", "") or client_id
+            name  = sess.get("name", "") or client_id
             mofsl = sess.get("mofsl")
-            uid = sess.get("userid", client_id)
+            uid   = sess.get("userid", client_id)
             if not mofsl or not uid:
                 continue
 
             today = datetime.now().strftime("%d-%b-%Y 09:00:00")
-            resp = mofsl.GetOrderBook({"clientcode": uid, "datetimestamp": today})
+            resp  = mofsl.GetOrderBook({"clientcode": uid, "datetimestamp": today})
             orders = resp.get("data", []) if resp else []
             if not isinstance(orders, list):
                 orders = []
 
             for order in orders:
                 od = {
-                    "name": name,
-                    "client_id": uid,
-                    "symbol": order.get("symbol", ""),
+                    "name":             name,
+                    "client_id":        uid,
+                    "symbol":           order.get("symbol", ""),
                     "transaction_type": order.get("buyorsell", ""),
-                    "quantity": order.get("orderqty", ""),
-                    "price": order.get("price", ""),
-                    "status": order.get("orderstatus", ""),
-                    "order_id": order.get("uniqueorderid", ""),
+                    "quantity":         order.get("orderqty", ""),
+                    "price":            order.get("price", ""),
+                    "status":           order.get("orderstatus", ""),
+                    "order_id":         order.get("uniqueorderid", ""),
                 }
                 st = (order.get("orderstatus", "") or "").lower()
                 if "confirm" in st:
@@ -1502,7 +1548,7 @@ async def cancel_order(request: Request, payload: dict = Body(...)):
         return None
 
     def cancel_one(order):
-        oid = order.get("order_id")
+        oid  = order.get("order_id")
         sess = find_sess(order)
         if not sess:
             with lock:
@@ -1510,7 +1556,7 @@ async def cancel_order(request: Request, payload: dict = Body(...)):
             return
         try:
             resp = sess["mofsl"].CancelOrder(oid, sess["userid"])
-            msg = (resp.get("message", "") or "").lower()
+            msg  = (resp.get("message", "") or "").lower()
             with lock:
                 messages.append(
                     f"{'✅' if 'cancel order request sent' in msg else '❌'} "
@@ -1521,9 +1567,7 @@ async def cancel_order(request: Request, payload: dict = Body(...)):
                 messages.append(f"❌ Error cancelling {oid}: {e}")
 
     for o in orders:
-        t = threading.Thread(target=cancel_one, args=(o,))
-        t.start()
-        threads.append(t)
+        t = threading.Thread(target=cancel_one, args=(o,)); t.start(); threads.append(t)
     for t in threads:
         t.join()
     return {"message": messages}
@@ -1534,7 +1578,7 @@ async def cancel_order(request: Request, payload: dict = Body(...)):
 # ─────────────────────────────────────────────────────────────
 @app.get("/get_positions")
 def get_positions(request: Request, userid: str = None, user_id: str = None):
-    owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
+    owner_userid   = resolve_owner_userid(request, userid=userid, user_id=user_id)
     positions_data = {"open": [], "closed": []}
     new_meta: Dict = {}
     global position_meta
@@ -1545,9 +1589,9 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
                 continue
             if owner_userid and str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
                 continue
-            name = str(sess.get("name", "") or client_id)
+            name  = str(sess.get("name", "") or client_id)
             mofsl = sess.get("mofsl")
-            uid = str(sess.get("userid", client_id))
+            uid   = str(sess.get("userid", client_id))
             if not mofsl or not uid:
                 continue
 
@@ -1559,43 +1603,34 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
                 continue
 
             for pos in positions:
-                bq = float(pos.get("buyquantity") or 0)
-                sq = float(pos.get("sellquantity") or 0)
-                qty = bq - sq
-                ba = float(pos.get("buyamount") or 0)
-                sa = float(pos.get("sellamount") or 0)
-                buy_avg = (ba / bq) if bq else 0.0
+                bq       = float(pos.get("buyquantity") or 0)
+                sq       = float(pos.get("sellquantity") or 0)
+                qty      = bq - sq
+                ba       = float(pos.get("buyamount") or 0)
+                sa       = float(pos.get("sellamount") or 0)
+                buy_avg  = (ba / bq) if bq else 0.0
                 sell_avg = (sa / sq) if sq else 0.0
-                ltp = float(pos.get("LTP") or 0)
-                bp = float(pos.get("bookedprofitloss") or 0)
-                net = (
-                    (ltp - buy_avg) * qty
-                    if qty > 0
-                    else (sell_avg - buy_avg) * abs(qty)
-                    if qty < 0
+                ltp      = float(pos.get("LTP") or 0)
+                bp       = float(pos.get("bookedprofitloss") or 0)
+                net      = (
+                    (ltp - buy_avg) * qty if qty > 0
+                    else (sell_avg - buy_avg) * abs(qty) if qty < 0
                     else bp
                 )
-
-                symbol = str(pos.get("symbol") or "")
+                symbol   = str(pos.get("symbol") or "")
                 exchange = str(pos.get("exchange") or "")
-                token = str(pos.get("symboltoken") or "")
-                product = str(pos.get("productname") or "")
+                token    = str(pos.get("symboltoken") or "")
+                product  = str(pos.get("productname") or "")
 
                 if qty != 0 and symbol:
                     new_meta[(uid, symbol)] = {
-                        "exchange": exchange,
-                        "symboltoken": token,
-                        "producttype": product,
-                        "client_id": uid,
+                        "exchange": exchange, "symboltoken": token,
+                        "producttype": product, "client_id": uid,
                     }
                 row = {
-                    "name": name,
-                    "client_id": uid,
-                    "symbol": symbol,
-                    "quantity": qty,
-                    "buy_avg": round(buy_avg, 2),
-                    "sell_avg": round(sell_avg, 2),
-                    "net_profit": round(net, 2),
+                    "name": name, "client_id": uid, "symbol": symbol,
+                    "quantity": qty, "buy_avg": round(buy_avg, 2),
+                    "sell_avg": round(sell_avg, 2), "net_profit": round(net, 2),
                 }
                 (positions_data["closed"] if qty == 0 else positions_data["open"]).append(row)
         except Exception as e:
@@ -1609,7 +1644,7 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
 @app.post("/close_position")
 async def close_position(request: Request, payload: dict = Body(...)):
     owner_userid = resolve_owner_userid(request, userid=payload.get("userid") or payload.get("user_id"))
-    positions = (payload or {}).get("positions", [])
+    positions    = (payload or {}).get("positions", [])
     messages, threads, lock = [], [], threading.Lock()
 
     min_qty_map = {}
@@ -1619,81 +1654,61 @@ async def close_position(request: Request, payload: dict = Body(...)):
             sid = str(row.get("security_id") or "").strip()
             qty = row.get("min_qty")
             if sid:
-                try:
-                    min_qty_map[sid] = max(1, int(qty or 1))
-                except Exception:
-                    min_qty_map[sid] = 1
+                try:    min_qty_map[sid] = max(1, int(qty or 1))
+                except: min_qty_map[sid] = 1
     except Exception as e:
-        print(f"❌ Error reading min_qty from PostgreSQL: {e}")
+        print(f"❌ Error reading min_qty: {e}")
 
     def find_sess(name, cid_hint=""):
         if cid_hint:
             s = mofsl_sessions.get(cid_hint)
             if isinstance(s, dict) and (
-                not owner_userid or str(s.get("owner_userid", "")).strip() == str(owner_userid).strip()
+                not owner_userid
+                or str(s.get("owner_userid", "")).strip() == str(owner_userid).strip()
             ):
                 return cid_hint, s
         for cid, s in mofsl_sessions.items():
-            if not isinstance(s, dict):
-                continue
-            if owner_userid and str(s.get("owner_userid", "")).strip() != str(owner_userid).strip():
-                continue
+            if not isinstance(s, dict): continue
+            if owner_userid and str(s.get("owner_userid", "")).strip() != str(owner_userid).strip(): continue
             if (s.get("name") or "").strip().lower() == (name or "").strip().lower():
                 return cid, s
         return "", None
 
     def close_one(pos):
-        name = (pos or {}).get("name") or ""
-        symbol = (pos or {}).get("symbol") or ""
-        qty = float((pos or {}).get("quantity", 0) or 0)
-        txtype = (pos or {}).get("transaction_type") or ""
+        name     = (pos or {}).get("name") or ""
+        symbol   = (pos or {}).get("symbol") or ""
+        qty      = float((pos or {}).get("quantity", 0) or 0)
+        txtype   = (pos or {}).get("transaction_type") or ""
         cid_hint = (pos or {}).get("client_id") or ""
         with _position_meta_lock:
             meta = position_meta.get((cid_hint, symbol)) or position_meta.get((name, symbol)) or {}
         cid, sess = find_sess(name, cid_hint=cid_hint)
         if not meta or not sess:
-            with lock:
-                messages.append(f"❌ Missing session/meta for {name} - {symbol}")
-            return
-        mofsl_ = sess.get("mofsl")
-        uid_ = sess.get("userid") or cid
+            with lock: messages.append(f"❌ Missing session/meta for {name} - {symbol}"); return
+        mofsl_ = sess.get("mofsl"); uid_ = sess.get("userid") or cid
         if not mofsl_ or not uid_:
-            with lock:
-                messages.append(f"❌ Invalid session for {name} - {symbol}")
-            return
-        token = meta.get("symboltoken")
+            with lock: messages.append(f"❌ Invalid session for {name} - {symbol}"); return
+        token   = meta.get("symboltoken")
         min_qty = min_qty_map.get(str(token), 1)
-        lots = max(1, int(abs(qty) // min_qty)) if min_qty and abs(qty) >= min_qty else 1
-        order = {
-            "clientcode": uid_,
-            "exchange": meta.get("exchange", ""),
-            "symboltoken": token,
-            "buyorsell": txtype.upper(),
-            "ordertype": "MARKET",
-            "producttype": meta.get("producttype", ""),
-            "orderduration": "DAY",
-            "price": 0,
-            "triggerprice": 0,
-            "quantityinlot": lots,
-            "disclosedquantity": 0,
-            "amoorder": "N",
-            "algoid": "",
-            "goodtilldate": "",
-            "tag": "",
+        lots    = max(1, int(abs(qty) // min_qty)) if min_qty and abs(qty) >= min_qty else 1
+        order   = {
+            "clientcode": uid_, "exchange": meta.get("exchange", ""),
+            "symboltoken": token, "buyorsell": txtype.upper(),
+            "ordertype": "MARKET", "producttype": meta.get("producttype", ""),
+            "orderduration": "DAY", "price": 0, "triggerprice": 0,
+            "quantityinlot": lots, "disclosedquantity": 0,
+            "amoorder": "N", "algoid": "", "goodtilldate": "", "tag": "",
         }
         try:
             resp = mofsl_.PlaceOrder(order)
-            ok = isinstance(resp, dict) and resp.get("status") == "SUCCESS"
+            ok   = isinstance(resp, dict) and resp.get("status") == "SUCCESS"
             with lock:
                 messages.append(f"{'✅' if ok else '❌'} {'Close requested' if ok else 'Close failed'}: {name} {symbol}")
         except Exception as e:
-            with lock:
-                messages.append(f"❌ Error closing {name} {symbol}: {e}")
+            with lock: messages.append(f"❌ Error closing {name} {symbol}: {e}")
 
     for p in positions:
-        t = threading.Thread(target=close_one, args=(p,))
-        t.start()
-        threads.append(t)
+        t = threading.Thread(target=close_one, args=(p,)); t.start(); threads.append(t)
     for t in threads:
         t.join()
     return {"message": messages}
@@ -1723,71 +1738,62 @@ def _build_client_capital_map(owner_userid: str) -> Dict:
     try:
         rows = db_execute(
             "SELECT userid, name, capital FROM clients WHERE owner_userid=%s",
-            (owner_userid,),
-            fetch="all",
+            (owner_userid,), fetch="all",
         ) or []
         for row in rows:
             cid = str(row["userid"] or "").strip()
-            nm = str(row["name"] or cid).strip()
+            nm  = str(row["name"] or cid).strip()
             cap = float(row.get("capital") or 0)
-            if cid:
-                capital_map[cid] = cap
-            if nm:
-                capital_map[nm] = cap
+            if cid: capital_map[cid] = cap
+            if nm:  capital_map[nm]  = cap
     except Exception as e:
         print(f"Capital map error: {e}")
     return capital_map
 
 
 def _fetch_summary_for_owner(owner_userid: str) -> Dict:
-    capital_map = _build_client_capital_map(owner_userid)
+    capital_map   = _build_client_capital_map(owner_userid)
     summary_data: Dict = {}
 
     for client_id, sess in list(mofsl_sessions.items()):
         try:
-            if not isinstance(sess, dict):
-                continue
-            if str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
-                continue
-            name = sess.get("name", "") or client_id
+            if not isinstance(sess, dict): continue
+            if str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip(): continue
+            name  = sess.get("name", "") or client_id
             Mofsl = sess.get("mofsl")
-            uid_ = sess.get("userid") or client_id
-            if not Mofsl or not uid_:
-                continue
+            uid_  = sess.get("userid") or client_id
+            if not Mofsl or not uid_: continue
 
-            invested = 0.0
-            total_pnl = 0.0
+            invested = 0.0; total_pnl = 0.0
             try:
                 resp = Mofsl.GetDPHolding(uid_)
                 if resp and resp.get("status") == "SUCCESS":
                     for h in (resp.get("data") or []):
-                        qty = float(h.get("dpquantity", 0) or 0)
+                        qty     = float(h.get("dpquantity", 0) or 0)
                         buy_avg = float(h.get("buyavgprice", 0) or 0)
-                        sc = h.get("nsesymboltoken")
-                        if not sc or qty <= 0:
-                            continue
+                        sc      = h.get("nsesymboltoken")
+                        if not sc or qty <= 0: continue
                         try:
                             ltp_resp = Mofsl.GetLtp({"clientcode": uid_, "exchange": "NSE", "scripcode": int(sc)})
                             ltp = float((ltp_resp or {}).get("data", {}).get("ltp", 0) or 0) / 100
                         except Exception:
                             ltp = 0.0
-                        invested += qty * buy_avg
+                        invested  += qty * buy_avg
                         total_pnl += (ltp - buy_avg) * qty
             except Exception as e:
                 print(f"⚠️ Holdings fetch skipped for {name}: {e}")
 
             available_margin = get_available_margin(Mofsl, uid_)
-            capital = float(capital_map.get(uid_) or capital_map.get(name) or 0)
-            current_value = invested + total_pnl
-
+            capital          = float(capital_map.get(uid_) or capital_map.get(name) or 0)
+            current_value    = invested + total_pnl
             summary_data[name] = {
-                "name": name,
-                "capital": round(capital, 2),
-                "invested": round(invested, 2),
-                "pnl": round(total_pnl, 2),
-                "current_value": round(current_value, 2),
+                "name":             name,
+                "capital":          round(capital, 2),
+                "invested":         round(invested, 2),
+                "pnl":              round(total_pnl, 2),
+                "current_value":    round(current_value, 2),
                 "available_margin": round(available_margin, 2),
-                "net_gain": round((current_value + available_margin) - capital, 2),
+                "net_gain":         round((current_value + available_margin) - capital, 2),
             }
         except Exception as e:
             print(f"❌ Summary error for {client_id}: {e}")
@@ -1801,65 +1807,53 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
         return {"ok": False, "error": "userid missing"}
 
     holdings_data: List = []
-    capital_map = _build_client_capital_map(owner_userid)
+    capital_map   = _build_client_capital_map(owner_userid)
     summary_data: Dict = {}
 
     for client_id, sess in list(mofsl_sessions.items()):
         try:
-            if not isinstance(sess, dict):
-                continue
-            if str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
-                continue
-            name = sess.get("name", "") or client_id
+            if not isinstance(sess, dict): continue
+            if str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip(): continue
+            name  = sess.get("name", "") or client_id
             Mofsl = sess.get("mofsl")
-            uid_ = sess.get("userid") or client_id
-            if not Mofsl or not uid_:
-                continue
+            uid_  = sess.get("userid") or client_id
+            if not Mofsl or not uid_: continue
 
             resp = Mofsl.GetDPHolding(uid_)
-            if not resp or resp.get("status") != "SUCCESS":
-                continue
+            if not resp or resp.get("status") != "SUCCESS": continue
 
-            invested = 0.0
-            total_pnl = 0.0
+            invested = 0.0; total_pnl = 0.0
 
             for h in (resp.get("data") or []):
-                symbol = (h.get("scripname") or "").strip()
-                qty = float(h.get("dpquantity", 0) or 0)
-                buy_avg = float(h.get("buyavgprice", 0) or 0)
+                symbol    = (h.get("scripname") or "").strip()
+                qty       = float(h.get("dpquantity", 0) or 0)
+                buy_avg   = float(h.get("buyavgprice", 0) or 0)
                 scripcode = h.get("nsesymboltoken")
-                if not scripcode or qty <= 0:
-                    continue
+                if not scripcode or qty <= 0: continue
                 try:
                     ltp_resp = Mofsl.GetLtp({"clientcode": uid_, "exchange": "NSE", "scripcode": int(scripcode)})
                     ltp = float((ltp_resp or {}).get("data", {}).get("ltp", 0) or 0) / 100
                 except Exception:
                     ltp = 0.0
-                pnl = round((ltp - buy_avg) * qty, 2)
-                invested += qty * buy_avg
+                pnl        = round((ltp - buy_avg) * qty, 2)
+                invested  += qty * buy_avg
                 total_pnl += pnl
-                holdings_data.append(
-                    {
-                        "name": name,
-                        "symbol": symbol,
-                        "quantity": qty,
-                        "buy_avg": round(buy_avg, 2),
-                        "ltp": round(ltp, 2),
-                        "pnl": pnl,
-                    }
-                )
+                holdings_data.append({
+                    "name": name, "symbol": symbol, "quantity": qty,
+                    "buy_avg": round(buy_avg, 2), "ltp": round(ltp, 2), "pnl": pnl,
+                })
 
             available_margin = get_available_margin(Mofsl, uid_)
-            capital = float(capital_map.get(uid_) or capital_map.get(name) or 0)
-            current_value = invested + total_pnl
+            capital          = float(capital_map.get(uid_) or capital_map.get(name) or 0)
+            current_value    = invested + total_pnl
             summary_data[name] = {
-                "name": name,
-                "capital": round(capital, 2),
-                "invested": round(invested, 2),
-                "pnl": round(total_pnl, 2),
-                "current_value": round(current_value, 2),
+                "name":             name,
+                "capital":          round(capital, 2),
+                "invested":         round(invested, 2),
+                "pnl":              round(total_pnl, 2),
+                "current_value":    round(current_value, 2),
                 "available_margin": round(available_margin, 2),
-                "net_gain": round((current_value + available_margin) - capital, 2),
+                "net_gain":         round((current_value + available_margin) - capital, 2),
             }
         except Exception as e:
             print(f"❌ Holdings error for {client_id}: {e}")
@@ -1894,12 +1888,12 @@ def get_summary(request: Request, userid: str = None, user_id: str = None):
 # ─────────────────────────────────────────────────────────────
 def _parse_symbol_token(payload: dict):
     symbol = (payload.get("symbol") or "").strip()
-    exch = (payload.get("exchange") or "NSE").strip().upper()
-    token = payload.get("symboltoken") or payload.get("security_id") or payload.get("token")
+    exch   = (payload.get("exchange") or "NSE").strip().upper()
+    token  = payload.get("symboltoken") or payload.get("security_id") or payload.get("token")
     if symbol and "|" in symbol:
         parts = symbol.split("|")
         if len(parts) >= 3:
-            exch = (parts[0] or exch).strip().upper()
+            exch  = (parts[0] or exch).strip().upper()
             token = parts[2].strip()
     return exch, _safe_int(token, 0)
 
@@ -1908,13 +1902,12 @@ def _get_group_members_from_db(owner_userid: str, group_name: str):
     try:
         row = db_execute(
             "SELECT multiplier, members FROM groups WHERE owner_userid=%s AND name=%s",
-            (owner_userid, group_name),
-            fetch="one",
+            (owner_userid, group_name), fetch="one",
         )
         if not row:
             return [], 1.0
         members = row["members"] or []
-        mult = max(0.01, float(row.get("multiplier") or 1))
+        mult    = max(0.01, float(row.get("multiplier") or 1))
         return members, mult
     except Exception:
         return [], 1.0
@@ -1922,7 +1915,9 @@ def _get_group_members_from_db(owner_userid: str, group_name: str):
 
 @app.post("/place_order")
 async def place_order(request: Request, payload: dict = Body(...)):
-    owner_userid = resolve_owner_userid(request, userid=payload.get("userid"), user_id=payload.get("user_id"))
+    owner_userid = resolve_owner_userid(
+        request, userid=payload.get("userid"), user_id=payload.get("user_id")
+    )
     if not owner_userid:
         raise HTTPException(401, "Missing owner userid")
 
@@ -1931,21 +1926,21 @@ async def place_order(request: Request, payload: dict = Body(...)):
     if not symboltoken:
         raise HTTPException(400, "Missing/invalid symbol token")
 
-    groupacc = bool(data.get("groupacc", False))
-    groups_raw = data.get("groups", []) or []
-    clients_raw = data.get("clients", []) or []
-    diffQty = bool(data.get("diffQty", False))
-    multiplier_on = bool(data.get("multiplier", False))
-    quantityinlot = _safe_int(data.get("quantityinlot", 0), 0)
-    perClientQty_raw = data.get("perClientQty", {}) or {}
-    action = (data.get("action") or "").strip().upper()
-    ordertype = (data.get("ordertype") or "").strip().upper()
-    producttype = (data.get("producttype") or "").strip().upper()
-    orderduration = (data.get("orderduration") or "").strip().upper()
-    price = _safe_float(data.get("price", 0), 0.0)
-    triggerprice = _safe_float(data.get("triggerprice", 0), 0.0)
+    groupacc          = bool(data.get("groupacc", False))
+    groups_raw        = data.get("groups", []) or []
+    clients_raw       = data.get("clients", []) or []
+    diffQty           = bool(data.get("diffQty", False))
+    multiplier_on     = bool(data.get("multiplier", False))
+    quantityinlot     = _safe_int(data.get("quantityinlot", 0), 0)
+    perClientQty_raw  = data.get("perClientQty", {}) or {}
+    action            = (data.get("action") or "").strip().upper()
+    ordertype         = (data.get("ordertype") or "").strip().upper()
+    producttype       = (data.get("producttype") or "").strip().upper()
+    orderduration     = (data.get("orderduration") or "").strip().upper()
+    price             = _safe_float(data.get("price", 0), 0.0)
+    triggerprice      = _safe_float(data.get("triggerprice", 0), 0.0)
     disclosedquantity = _safe_int(data.get("disclosedquantity", 0), 0)
-    amoorder = (data.get("amoorder") or "N").strip().upper()
+    amoorder          = (data.get("amoorder") or "N").strip().upper()
 
     def _extract_client_id(x) -> str:
         if isinstance(x, dict):
@@ -1957,24 +1952,20 @@ async def place_order(request: Request, payload: dict = Body(...)):
             return str(x.get("name") or x.get("group") or x.get("group_name") or "").strip()
         return str(x or "").strip()
 
-    groups = [_extract_group_name(g) for g in groups_raw if _extract_group_name(g)]
-    clients = [_extract_client_id(c) for c in clients_raw if _extract_client_id(c)]
+    groups       = [_extract_group_name(g) for g in groups_raw  if _extract_group_name(g)]
+    clients      = [_extract_client_id(c)  for c in clients_raw if _extract_client_id(c)]
     perClientQty = {
         _extract_client_id(k): _safe_int(v, quantityinlot)
-        for k, v in perClientQty_raw.items()
-        if _extract_client_id(k)
+        for k, v in perClientQty_raw.items() if _extract_client_id(k)
     }
 
     def _ensure_session(client_id: str) -> dict:
         cid = str(client_id or "").strip()
-        if not cid:
-            return {}
+        if not cid: return {}
         sess = mofsl_sessions.get(cid)
-        if isinstance(sess, dict) and sess.get("mofsl"):
-            return sess
+        if isinstance(sess, dict) and sess.get("mofsl"): return sess
         cobj = _load_client_from_db(owner_userid, cid)
-        if not cobj:
-            return {}
+        if not cobj: return {}
         cobj["owner_userid"] = owner_userid
         return mofsl_sessions.get(cid) or {} if motilal_login(cobj) else {}
 
@@ -1982,71 +1973,59 @@ async def place_order(request: Request, payload: dict = Body(...)):
     if groupacc:
         for gname in groups:
             members, gmult = _get_group_members_from_db(owner_userid, gname)
-            members_norm = [_extract_client_id(m) for m in members if _extract_client_id(m)]
+            members_norm   = [_extract_client_id(m) for m in members if _extract_client_id(m)]
             for cid in members_norm:
                 q = quantityinlot
-                if diffQty:
-                    q = _safe_int(perClientQty.get(cid, q), q)
+                if diffQty:      q = _safe_int(perClientQty.get(cid, q), q)
                 if multiplier_on:
-                    try:
-                        q = max(1, int(round(float(q) * float(gmult))))
-                    except Exception:
-                        q = max(1, int(q))
+                    try:    q = max(1, int(round(float(q) * float(gmult))))
+                    except: q = max(1, int(q))
                 targets.append((gname, cid, int(max(1, q))))
     else:
         for cid in clients:
             q = quantityinlot
-            if diffQty:
-                q = _safe_int(perClientQty.get(cid, q), q)
+            if diffQty: q = _safe_int(perClientQty.get(cid, q), q)
             targets.append(("", cid, int(max(1, q))))
 
     if not targets:
         raise HTTPException(400, "No target clients/groups selected")
 
     responses: Dict = {}
-    lock = threading.Lock()
-    threads = []
+    lock = threading.Lock(); threads = []
 
     def _place_one(tag: str, client_id: str, qty: int):
-        key = f"{tag}:{client_id}" if tag else client_id
+        key  = f"{tag}:{client_id}" if tag else client_id
         sess = _ensure_session(client_id)
         if not isinstance(sess, dict) or not sess.get("mofsl"):
-            with lock:
-                responses[key] = {"status": "ERROR", "message": "Session not found"}
-            return
+            with lock: responses[key] = {"status": "ERROR", "message": "Session not found"}; return
         sess_owner = (sess.get("owner_userid") or "").strip()
         if sess_owner and sess_owner != str(owner_userid).strip():
-            with lock:
-                responses[key] = {"status": "ERROR", "message": "Session belongs to another user"}
-            return
+            with lock: responses[key] = {"status": "ERROR", "message": "Session belongs to another user"}; return
         order_payload = {
-            "clientcode": str(sess.get("userid") or client_id),
-            "exchange": exch,
-            "symboltoken": int(symboltoken),
-            "buyorsell": action,
-            "ordertype": ordertype,
-            "producttype": producttype,
-            "orderduration": orderduration,
-            "price": float(price),
-            "triggerprice": float(triggerprice),
-            "quantityinlot": int(max(1, qty)),
+            "clientcode":       str(sess.get("userid") or client_id),
+            "exchange":         exch,
+            "symboltoken":      int(symboltoken),
+            "buyorsell":        action,
+            "ordertype":        ordertype,
+            "producttype":      producttype,
+            "orderduration":    orderduration,
+            "price":            float(price),
+            "triggerprice":     float(triggerprice),
+            "quantityinlot":    int(max(1, qty)),
             "disclosedquantity": int(disclosedquantity),
-            "amoorder": amoorder,
-            "algoid": "",
-            "goodtilldate": "",
-            "tag": tag or "",
+            "amoorder":         amoorder,
+            "algoid":           "",
+            "goodtilldate":     "",
+            "tag":              tag or "",
         }
         try:
             resp = sess["mofsl"].PlaceOrder(order_payload)
         except Exception as e:
             resp = {"status": "ERROR", "message": str(e)}
-        with lock:
-            responses[key] = resp
+        with lock: responses[key] = resp
 
     for (tag, cid, q) in targets:
-        t = threading.Thread(target=_place_one, args=(tag, cid, q))
-        t.start()
-        threads.append(t)
+        t = threading.Thread(target=_place_one, args=(tag, cid, q)); t.start(); threads.append(t)
     for t in threads:
         t.join()
     return {"success": True, "responses": responses}
@@ -2067,7 +2046,7 @@ def modify_order(request: Request, payload: dict = Body(...)) -> Dict[str, Any]:
     if not owner_userid:
         raise HTTPException(401, "Missing owner userid")
 
-    data = payload or {}
+    data   = payload or {}
     orders = data.get("orders")
     if not isinstance(orders, list) or not orders:
         one = data.get("order")
@@ -2078,58 +2057,41 @@ def modify_order(request: Request, payload: dict = Body(...)) -> Dict[str, Any]:
     messages: List[str] = []
 
     def _ni(x, d=None):
-        try:
-            return d if str(x).strip() == "" else int(float(str(x).strip()))
-        except Exception:
-            return d
+        try:    return d if str(x).strip() == "" else int(float(str(x).strip()))
+        except: return d
 
     def _nf(x, d=None):
-        try:
-            return d if str(x).strip() == "" else float(str(x).strip())
-        except Exception:
-            return d
+        try:    return d if str(x).strip() == "" else float(str(x).strip())
+        except: return d
 
     def _pos(x):
-        try:
-            return x is not None and float(x) > 0
-        except Exception:
-            return False
+        try:    return x is not None and float(x) > 0
+        except: return False
 
     def _ui_to_mo(ot):
         u = (ot or "").strip().upper().replace("-", "_").replace(" ", "_")
         return {
-            "LIMIT": "LIMIT",
-            "MARKET": "MARKET",
-            "STOP_LOSS": "STOPLOSS",
-            "STOPLOSS": "STOPLOSS",
-            "SL_LIMIT": "STOPLOSS",
-            "SL": "STOPLOSS",
-            "STOP_LOSS_MARKET": "SL-M",
-            "STOPLOSS_MARKET": "SL-M",
-            "SL_MARKET": "SL-M",
+            "LIMIT": "LIMIT", "MARKET": "MARKET",
+            "STOP_LOSS": "STOPLOSS", "STOPLOSS": "STOPLOSS",
+            "SL_LIMIT": "STOPLOSS", "SL": "STOPLOSS",
+            "STOP_LOSS_MARKET": "SL-M", "STOPLOSS_MARKET": "SL-M", "SL_MARKET": "SL-M",
         }.get(u, "")
 
     def _snap_to_mo(ot):
         u = (ot or "").strip().upper().replace("-", "_").replace(" ", "_")
-        if u in ("SL_LIMIT", "SL_L", "STOPLOSS_LIMIT"):
-            return "STOPLOSS"
-        if u in ("SL_MARKET", "SL_M", "STOPLOSS_MARKET"):
-            return "SL-M"
+        if u in ("SL_LIMIT", "SL_L", "STOPLOSS_LIMIT"):   return "STOPLOSS"
+        if u in ("SL_MARKET", "SL_M", "STOPLOSS_MARKET"): return "SL-M"
         return u if u in ("LIMIT", "MARKET", "STOPLOSS", "SL-M") else ""
 
     def _infer_type(s):
         for k in ("newordertype", "ordertype", "orderType", "OrderType"):
             t = _snap_to_mo(s.get(k))
-            if t:
-                return t
+            if t: return t
         has_p = any(_pos(_nf(s.get(k))) for k in ("newprice", "orderprice", "price", "Price"))
         has_t = any(_pos(_nf(s.get(k))) for k in ("newtriggerprice", "triggerprice", "triggerPrice"))
-        if has_t and has_p:
-            return "STOPLOSS"
-        if has_t:
-            return "SL-M"
-        if has_p:
-            return "LIMIT"
+        if has_t and has_p: return "STOPLOSS"
+        if has_t:           return "SL-M"
+        if has_p:           return "LIMIT"
         return "MARKET"
 
     def _get_session_for_row(r):
@@ -2141,40 +2103,34 @@ def modify_order(request: Request, payload: dict = Body(...)) -> Dict[str, Any]:
         nm = (r.get("name") or "").strip().lower()
         if nm:
             for _, s in list(mofsl_sessions.items()):
-                if not isinstance(s, dict):
-                    continue
-                if str(s.get("owner_userid", "")).strip() != str(owner_userid).strip():
-                    continue
-                if (s.get("name") or "").strip().lower() == nm:
-                    return s
+                if not isinstance(s, dict): continue
+                if str(s.get("owner_userid", "")).strip() != str(owner_userid).strip(): continue
+                if (s.get("name") or "").strip().lower() == nm: return s
         return None
 
     for row in (orders or []):
         try:
             name = (row.get("name") or "").strip() or "<unknown>"
-            oid = str(row.get("order_id") or row.get("orderId") or "").strip()
+            oid  = str(row.get("order_id") or row.get("orderId") or "").strip()
             if not oid:
-                messages.append(f"ℹ️ {name}: skipped (missing order_id)")
-                continue
+                messages.append(f"ℹ️ {name}: skipped (missing order_id)"); continue
             sess = _get_session_for_row(row)
             if not sess:
-                messages.append(f"❌ {name} ({oid}): session not available")
-                continue
+                messages.append(f"❌ {name} ({oid}): session not available"); continue
             uid = str(sess.get("userid") or "").strip()
             sdk = sess.get("mofsl")
             if not uid or not sdk:
-                messages.append(f"❌ {name} ({oid}): session not available")
-                continue
+                messages.append(f"❌ {name} ({oid}): session not available"); continue
 
             price_in = row.get("price")
-            trig_in = row.get("triggerPrice", row.get("triggerprice"))
-            qty_in = _ni(row.get("quantity"))
+            trig_in  = row.get("triggerPrice", row.get("triggerprice"))
+            qty_in   = _ni(row.get("quantity"))
 
             snap = None
             try:
                 resp = sdk.GetOrderDetails({"clientcode": uid, "uniqueorderid": oid})
                 if isinstance(resp, dict) and resp.get("status") == "SUCCESS":
-                    d = resp.get("data")
+                    d    = resp.get("data")
                     snap = d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else None)
             except Exception:
                 pass
@@ -2184,27 +2140,21 @@ def modify_order(request: Request, payload: dict = Body(...)) -> Dict[str, Any]:
                     ob = sdk.GetOrderBook({"clientcode": uid, "datetimestamp": ts})
                     for r2 in ((ob.get("data") or []) if isinstance(ob, dict) else []):
                         if str(r2.get("uniqueorderid", "")) == str(oid):
-                            snap = r2
-                            break
+                            snap = r2; break
                 except Exception:
                     pass
             snap = snap or {}
 
             shares = qty_in if _pos(qty_in) else (_ni(snap.get("orderqty")) or 0)
-            lots = int(shares) if _pos(shares) else 0
+            lots   = int(shares) if _pos(shares) else 0
             if lots <= 0:
-                messages.append(f"❌ {name} ({oid}): cannot determine quantity")
-                continue
+                messages.append(f"❌ {name} ({oid}): cannot determine quantity"); continue
 
             last_mod = next(
                 (
-                    v
-                    for k in (
-                        "lastmodifiedtime",
-                        "lastmodifieddatetime",
-                        "recordinsertime",
-                        "recordinserttime",
-                        "modifydatetime",
+                    v for k in (
+                        "lastmodifiedtime", "lastmodifieddatetime",
+                        "recordinsertime", "recordinserttime", "modifydatetime",
                     )
                     if isinstance(snap.get(k), str) and snap[k].strip()
                     for v in [snap[k].strip()]
@@ -2214,36 +2164,31 @@ def modify_order(request: Request, payload: dict = Body(...)) -> Dict[str, Any]:
 
             ui_type = _ui_to_mo(row.get("orderType") or row.get("ordertype")) or _infer_type(snap)
             out = {
-                "clientcode": uid,
-                "uniqueorderid": oid,
-                "newordertype": ui_type or "MARKET",
-                "neworderduration": str(row.get("validity") or "DAY").upper(),
+                "clientcode":          uid,
+                "uniqueorderid":       oid,
+                "newordertype":        ui_type or "MARKET",
+                "neworderduration":    str(row.get("validity") or "DAY").upper(),
                 "newdisclosedquantity": 0,
-                "lastmodifiedtime": last_mod,
-                "newquantityinlot": lots,
+                "lastmodifiedtime":    last_mod,
+                "newquantityinlot":    lots,
             }
-            if _pos(_nf(price_in)):
-                out["newprice"] = float(price_in)
-            if _pos(_nf(trig_in)):
-                out["newtriggerprice"] = float(trig_in)
+            if _pos(_nf(price_in)): out["newprice"]        = float(price_in)
+            if _pos(_nf(trig_in)):  out["newtriggerprice"] = float(trig_in)
 
             if out["newordertype"] == "LIMIT" and "newprice" not in out:
-                messages.append(f"❌ {name} ({oid}): LIMIT requires Price > 0")
-                continue
+                messages.append(f"❌ {name} ({oid}): LIMIT requires Price > 0"); continue
             if out["newordertype"] == "STOPLOSS" and not ("newprice" in out and "newtriggerprice" in out):
-                messages.append(f"❌ {name} ({oid}): STOPLOSS requires Price & Trigger > 0")
-                continue
+                messages.append(f"❌ {name} ({oid}): STOPLOSS requires Price & Trigger > 0"); continue
             if out["newordertype"] == "SL-M" and "newtriggerprice" not in out:
-                messages.append(f"❌ {name} ({oid}): SL-M requires Trigger > 0")
-                continue
+                messages.append(f"❌ {name} ({oid}): SL-M requires Trigger > 0"); continue
 
             resp = sdk.ModifyOrder(out)
             ok, msg = False, ""
             if isinstance(resp, dict):
                 status = str(resp.get("Status") or resp.get("status") or "").lower()
-                code = str(resp.get("ErrorCode") or resp.get("errorCode") or "")
-                msg = resp.get("Message") or resp.get("message") or code
-                ok = "success" in status or resp.get("Success") is True or code in ("0", "200", "201")
+                code   = str(resp.get("ErrorCode") or resp.get("errorCode") or "")
+                msg    = resp.get("Message") or resp.get("message") or code
+                ok     = "success" in status or resp.get("Success") is True or code in ("0", "200", "201")
             else:
                 ok = bool(resp)
             messages.append(f"{'✅' if ok else '❌'} {name} ({oid}): {'Modified' if ok else (msg or 'modify failed')}")
@@ -2255,30 +2200,31 @@ def modify_order(request: Request, payload: dict = Body(...)) -> Dict[str, Any]:
 
 # ─────────────────────────────────────────────────────────────
 # Copy Trading Engine
+# Pure polling, 1s loop, 5s order window
 # ─────────────────────────────────────────────────────────────
-order_mapping: Dict = {}
-processed_order_ids_placed: Dict = {}
+order_mapping:                Dict = {}
+processed_order_ids_placed:   Dict = {}
 processed_order_ids_canceled: Dict = {}
 
 COPY_ORDER_WINDOW_SECONDS = 5
-COPY_SETUPS_CACHE_TTL = 30
-POLL_INTERVAL_SECONDS = 1
+COPY_SETUPS_CACHE_TTL     = 30
+POLL_INTERVAL_SECONDS     = 1
 
-_copy_setups_cache: list = []
+_copy_setups_cache:    list  = []
 _copy_setups_cache_ts: float = 0.0
 _copy_setups_lock = threading.Lock()
 
 
 def _norm_ordertype(s: str) -> str:
-    s = (s or "").strip().upper()
+    s         = (s or "").strip().upper()
     collapsed = s.replace("_", "").replace(" ", "").replace("-", "")
     return "STOPLOSS" if collapsed == "STOPLOSS" else s
 
 
 def _norm_producttype(raw: str) -> str:
-    v = str(raw or "").strip().upper()
+    v       = str(raw or "").strip().upper()
     allowed = {"NORMAL", "DELIVERY", "SELLFROMDP", "VALUEPLUS", "BTST", "MTF"}
-    legacy = {"CNC": "DELIVERY", "MIS": "NORMAL", "INTRADAY": "NORMAL", "MARGIN": "NORMAL"}
+    legacy  = {"CNC": "DELIVERY", "MIS": "NORMAL", "INTRADAY": "NORMAL", "MARGIN": "NORMAL"}
     return v if v in allowed else legacy.get(v, "DELIVERY")
 
 
@@ -2293,10 +2239,10 @@ def load_active_copy_setups_all() -> list:
         if _copy_setups_cache and (time.time() - _copy_setups_cache_ts) < COPY_SETUPS_CACHE_TTL:
             return list(_copy_setups_cache)
     try:
-        rows = db_execute("SELECT * FROM copy_setups WHERE enabled=TRUE", fetch="all") or []
+        rows   = db_execute("SELECT * FROM copy_setups WHERE enabled=TRUE", fetch="all") or []
         setups = [dict(r) for r in rows]
         with _copy_setups_lock:
-            _copy_setups_cache = setups
+            _copy_setups_cache    = setups
             _copy_setups_cache_ts = time.time()
         return setups
     except Exception as e:
@@ -2310,7 +2256,7 @@ def _fetch_master_orders(master_id: str, owner: str) -> list:
         return []
     try:
         today = datetime.now().strftime("%d-%b-%Y 09:00:00")
-        resp = sess["mofsl"].GetOrderBook(
+        resp  = sess["mofsl"].GetOrderBook(
             {"clientcode": str(sess.get("userid") or master_id), "datetimestamp": today}
         )
         if not resp or resp.get("status") != "SUCCESS":
@@ -2323,9 +2269,9 @@ def _fetch_master_orders(master_id: str, owner: str) -> list:
 
 
 def process_copy_order(order: dict, setup: dict):
-    owner = str(setup.get("owner_userid") or "").strip()
+    owner      = str(setup.get("owner_userid") or "").strip()
     setup_name = str(setup.get("name") or "setup")
-    setup_key = f"{owner}:{setup_name}"
+    setup_key  = f"{owner}:{setup_name}"
     master_oid = str(order.get("uniqueorderid") or "").strip()
 
     if not master_oid or master_oid == "0":
@@ -2337,11 +2283,11 @@ def process_copy_order(order: dict, setup: dict):
 
     try:
         order_time_dt = datetime.strptime(order_time_str, "%d-%b-%Y %H:%M:%S")
-        order_time = int(order_time_dt.timestamp())
-        t = order_time_dt.time()
-        market_open = datetime.strptime("09:00:00", "%H:%M:%S").time()
-        market_close = datetime.strptime("15:30:00", "%H:%M:%S").time()
-        amo_flag = "N" if market_open <= t <= market_close else "Y"
+        order_time    = int(order_time_dt.timestamp())
+        t             = order_time_dt.time()
+        market_open   = datetime.strptime("09:00:00", "%H:%M:%S").time()
+        market_close  = datetime.strptime("15:30:00", "%H:%M:%S").time()
+        amo_flag      = "N" if market_open <= t <= market_close else "Y"
     except Exception as e:
         print(f"⚠️ [COPY] Bad recordinserttime='{order_time_str}' oid={master_oid}: {e}")
         return
@@ -2355,46 +2301,37 @@ def process_copy_order(order: dict, setup: dict):
     order_mapping.setdefault(setup_key, {})
 
     order_status = str(order.get("orderstatus") or "").strip().upper()
-    order_type = _norm_ordertype(order.get("ordertype") or "")
+    order_type   = _norm_ordertype(order.get("ordertype") or "")
 
     _PLACE_STATUSES = {
-        "CONFIRM",
-        "CONFIRMED",
-        "TRADED",
-        "SENT",
-        "OPEN",
-        "PENDING",
-        "TRIGGER PENDING",
-        "TRIGGERPENDING",
-        "AMO REQ RECEIVED",
-        "PUT ORDER REQ RECEIVED",
-        "AFTER MARKET ORDER REQ RECEIVED",
-        "MODIFIED",
-        "MODIFY CONFIRM",
+        "CONFIRM", "CONFIRMED", "TRADED", "SENT", "OPEN", "PENDING",
+        "TRIGGER PENDING", "TRIGGERPENDING",
+        "AMO REQ RECEIVED", "PUT ORDER REQ RECEIVED",
+        "AFTER MARKET ORDER REQ RECEIVED", "MODIFIED", "MODIFY CONFIRM",
     }
 
     if order_type == "MARKET" or order_status in _PLACE_STATUSES:
         if master_oid in processed_order_ids_placed[setup_key]:
             return
 
-        children = setup.get("children") or []
+        children    = setup.get("children") or []
         multipliers = setup.get("multipliers") or {}
 
-        side = str(order.get("buyorsell") or "").upper().strip()
-        ot = order_type
-        pt = _norm_producttype(order.get("producttype") or "")
-        dur = _norm_duration(order.get("orderduration") or order.get("validity") or "")
-        price = float(order.get("price") or 0)
-        trig = float(order.get("triggerprice") or 0)
+        side     = str(order.get("buyorsell") or "").upper().strip()
+        ot       = order_type
+        pt       = _norm_producttype(order.get("producttype") or "")
+        dur      = _norm_duration(order.get("orderduration") or order.get("validity") or "")
+        price    = float(order.get("price") or 0)
+        trig     = float(order.get("triggerprice") or 0)
         exchange = str(order.get("exchange") or "NSE").upper()
-        symtok = int(order.get("symboltoken") or 0)
+        symtok   = int(order.get("symboltoken") or 0)
 
         if not side or not symtok:
             processed_order_ids_placed[setup_key].add(master_oid)
             return
 
         master_qty = int(order.get("orderqty") or 1)
-        min_qty = max(1, _min_qty_from_symbol_db(symtok))
+        min_qty    = max(1, _min_qty_from_symbol_db(symtok))
 
         print(
             f"🧬 [COPY] TRIGGERED setup={setup_name} oid={master_oid} "
@@ -2419,26 +2356,26 @@ def process_copy_order(order: dict, setup: dict):
                 print(f"❌ [COPY] No session child={child_id} — skipping")
                 continue
 
-            mult = float(multipliers.get(child_id, 1) or 1)
+            mult     = float(multipliers.get(child_id, 1) or 1)
             total_qty = master_qty * mult
-            qty_lot = max(1, int(total_qty // min_qty))
+            qty_lot  = max(1, int(total_qty // min_qty))
 
             child_order = {
-                "clientcode": sess["userid"],
-                "exchange": exchange,
-                "symboltoken": symtok,
-                "buyorsell": side,
-                "ordertype": ot,
-                "producttype": pt,
-                "orderduration": dur,
-                "price": price,
-                "triggerprice": trig,
-                "quantityinlot": qty_lot,
+                "clientcode":        sess["userid"],
+                "exchange":          exchange,
+                "symboltoken":       symtok,
+                "buyorsell":         side,
+                "ordertype":         ot,
+                "producttype":       pt,
+                "orderduration":     dur,
+                "price":             price,
+                "triggerprice":      trig,
+                "quantityinlot":     qty_lot,
                 "disclosedquantity": 0,
-                "amoorder": amo_flag,
-                "algoid": "",
-                "goodtilldate": "",
-                "tag": setup_name,
+                "amoorder":          amo_flag,
+                "algoid":            "",
+                "goodtilldate":      "",
+                "tag":               setup_name,
             }
 
             print(f"📦 [COPY] child={child_id} qty={qty_lot} payload={child_order}")
@@ -2482,7 +2419,7 @@ def synchronize_copy_trading():
 
     def handle_setup(setup):
         master_id = str(setup.get("master") or "").strip()
-        owner = str(setup.get("owner_userid") or "").strip()
+        owner     = str(setup.get("owner_userid") or "").strip()
         if not master_id or not owner:
             return
         orders = _fetch_master_orders(master_id, owner)
@@ -2491,16 +2428,14 @@ def synchronize_copy_trading():
         order_threads = []
         for order in orders:
             t = threading.Thread(target=process_copy_order, args=(order, setup), daemon=True)
-            t.start()
-            order_threads.append(t)
+            t.start(); order_threads.append(t)
         for t in order_threads:
             t.join()
 
     setup_threads = []
     for setup in setups:
         t = threading.Thread(target=handle_setup, args=(setup,), daemon=True)
-        t.start()
-        setup_threads.append(t)
+        t.start(); setup_threads.append(t)
     for t in setup_threads:
         t.join()
 
@@ -2510,7 +2445,7 @@ def motilal_copy_trading_loop():
     last_enabled: set = set()
     while True:
         try:
-            setups = load_active_copy_setups_all()
+            setups      = load_active_copy_setups_all()
             enabled_now = {s.get("name", "") for s in setups}
             for sname in enabled_now - last_enabled:
                 print(f"[COPY] Setup ENABLED: {sname}")
