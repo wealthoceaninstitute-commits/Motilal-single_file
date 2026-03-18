@@ -1,10 +1,7 @@
 """
-Motilal Single File - Railway Backend (FIXED)
-
-BUGS FIXED vs previous Railway version:
-  FIX 1: _safe_int / _safe_float moved to top (were defined AFTER place_order → NameError on Railway)
-  FIX 2: startup now logs in ALL clients from GitHub (matching local desktop on_startup behavior)
-  FIX 3: Removed duplicate _load_client_from_github inside place_order (used module-level one instead)
+Motilal Single File - Railway Backend
+Storage: PostgreSQL (replaces GitHub JSON storage)
+Copy Engine: Pure polling, 1s loop, 5s order window (mirrors desktop CT_FastAPI.py)
 """
 
 from __future__ import annotations
@@ -21,10 +18,13 @@ import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+import psycopg2
+import psycopg2.extras
 import requests
 from fastapi import Depends, FastAPI, HTTPException, Request, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -69,14 +69,11 @@ def jwt_decode(token: str, secret: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────
-# FIX 1: _safe_int / _safe_float AT THE TOP
-# In the old Railway file these were defined ~800 lines in, AFTER
-# place_order already called them → NameError on cold start.
+# Safe type helpers (must be at top — used everywhere)
 # ─────────────────────────────────────────────────────────────
 def _safe_int(x, default=0):
     try:
-        if x is None:
-            return default
+        if x is None: return default
         s = str(x).strip()
         return default if s == "" else int(float(s))
     except Exception:
@@ -84,8 +81,7 @@ def _safe_int(x, default=0):
 
 def _safe_float(x, default=0.0):
     try:
-        if x is None:
-            return default
+        if x is None: return default
         s = str(x).strip()
         return default if s == "" else float(s)
     except Exception:
@@ -95,25 +91,22 @@ def _safe_float(x, default=0.0):
 # ─────────────────────────────────────────────────────────────
 # ENV config
 # ─────────────────────────────────────────────────────────────
-APP_NAME         = os.getenv("APP_NAME", "Auth Backend (Multiuser)")
-API_VERSION      = os.getenv("API_VERSION", "1.0.0")
-SECRET_KEY       = os.getenv("SECRET_KEY") or "CHANGE_ME_PLEASE_SET_SECRET_KEY"
+APP_NAME           = os.getenv("APP_NAME", "Motilal Trader Backend")
+API_VERSION        = os.getenv("API_VERSION", "2.0.0")
+SECRET_KEY         = os.getenv("SECRET_KEY") or "CHANGE_ME_PLEASE_SET_SECRET_KEY"
 TOKEN_EXPIRE_HOURS = int(os.getenv("TOKEN_EXPIRE_HOURS", "24"))
-GITHUB_OWNER     = os.getenv("GITHUB_OWNER", "")
-GITHUB_REPO      = os.getenv("GITHUB_REPO", "")
-GITHUB_BRANCH    = os.getenv("GITHUB_BRANCH", "main")
-GITHUB_TOKEN     = os.getenv("GITHUB_TOKEN", "")
+DATABASE_URL       = os.getenv("DATABASE_URL", "")   # Railway provides this automatically
 
 cors_origins_raw = (os.getenv("CORS_ORIGINS") or "").strip()
 if cors_origins_raw == "*":
-    allow_origins    = ["*"]
+    allow_origins     = ["*"]
     allow_credentials = False
 elif cors_origins_raw:
-    allow_origins    = [o.strip().rstrip("/") for o in cors_origins_raw.split(",") if o.strip()]
+    allow_origins     = [o.strip().rstrip("/") for o in cors_origins_raw.split(",") if o.strip()]
     allow_credentials = True
 else:
-    allow_origins    = ["http://localhost:3000", "http://127.0.0.1:3000",
-                        "https://woi-mosl-trader.vercel.app"]
+    allow_origins     = ["http://localhost:3000", "http://127.0.0.1:3000",
+                         "https://woi-mosl-trader.vercel.app"]
     allow_credentials = True
 
 
@@ -138,8 +131,7 @@ def utcnow_iso() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 def normalize_userid(v: Any) -> str:
-    if v is None:
-        return ""
+    if v is None: return ""
     if isinstance(v, str):
         vv = v.strip()
         if (vv.startswith('"') and vv.endswith('"')) or (vv.startswith("'") and vv.endswith("'")):
@@ -166,161 +158,138 @@ def create_token(userid: str) -> str:
 
 def _safe_filename(s: str) -> str:
     s = (s or "").strip().replace(" ", "_")
-    return re.sub(r"[^A-Za-z0-9_\-]", "_", s)[:80] or "client"
+    return re.sub(r"[^A-Za-z0-9_\-]", "_", s)[:80] or "item"
 
 
 # ─────────────────────────────────────────────────────────────
-# GitHub storage helpers
+# PostgreSQL connection pool
 # ─────────────────────────────────────────────────────────────
-def gh_enabled() -> bool:
-    return bool(GITHUB_OWNER and GITHUB_REPO and GITHUB_TOKEN)
+_pg_lock = threading.Lock()
+_pg_pool: List = []
+_PG_POOL_SIZE = 5
 
-def gh_headers() -> Dict[str, str]:
-    return {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+def _make_pg_conn():
+    """Create a new PostgreSQL connection."""
+    url = DATABASE_URL
+    if not url:
+        raise RuntimeError("DATABASE_URL environment variable not set")
+    # Railway provides postgres:// but psycopg2 needs postgresql://
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    conn = psycopg2.connect(url, cursor_factory=psycopg2.extras.RealDictCursor)
+    conn.autocommit = False
+    return conn
 
-def gh_url(path: str) -> str:
-    return f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{path.lstrip('/')}"
-
-def b64encode_str(s: str) -> str:
-    return base64.b64encode(s.encode()).decode()
-
-def b64decode_to_str(s: str) -> str:
-    return base64.b64decode(s.encode()).decode()
-
-class GitHubStorageError(Exception):
-    def __init__(self, status_code: int, message: str):
-        self.status_code = status_code
-        super().__init__(f"GitHub API {status_code}: {message}")
-
-def gh_get_json(path: str) -> Tuple[Optional[Any], Optional[str]]:
-    if not gh_enabled():
-        return None, None
-    r = requests.get(gh_url(path), headers=gh_headers(), params={"ref": GITHUB_BRANCH})
-    if r.status_code == 404:
-        return None, None
-    if r.status_code == 401:
-        raise GitHubStorageError(401, "GitHub token invalid.")
-    if r.status_code == 403:
-        raise GitHubStorageError(403, "GitHub token forbidden/rate-limited.")
-    if not r.ok:
-        raise GitHubStorageError(r.status_code, r.text[:200])
-    data = r.json()
-    if isinstance(data, dict) and data.get("type") == "file":
-        content = (data.get("content") or "").replace("\n", "")
-        sha = data.get("sha")
-        text = b64decode_to_str(content) if content else ""
-        if not text:
-            return {}, sha
+@contextmanager
+def get_db():
+    """Context manager — get a connection, return to pool after use."""
+    with _pg_lock:
+        conn = _pg_pool.pop() if _pg_pool else None
+    if conn is None:
+        conn = _make_pg_conn()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
         try:
-            return json.loads(text), sha
+            conn.rollback()
         except Exception:
-            return {"_raw": text}, sha
-    return data, data.get("sha")
+            pass
+        raise
+    finally:
+        try:
+            # Test connection is still alive before returning to pool
+            conn.cursor().execute("SELECT 1")
+            with _pg_lock:
+                if len(_pg_pool) < _PG_POOL_SIZE:
+                    _pg_pool.append(conn)
+                    return
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
 
-def gh_put_json(path: str, obj: Any, message: str, sha: Optional[str] = None) -> None:
-    if not gh_enabled():
-        raise HTTPException(500, "GitHub storage not configured.")
-    if sha is None:
-        _, sha = gh_get_json(path)
-    payload: dict = {
-        "message": message,
-        "content": b64encode_str(json.dumps(obj, indent=2, ensure_ascii=False)),
-        "branch": GITHUB_BRANCH,
-    }
-    if sha:
-        payload["sha"] = sha
-    r = requests.put(gh_url(path), headers=gh_headers(), json=payload)
-    if r.status_code == 401:
-        raise GitHubStorageError(401, "GitHub token invalid.")
-    if r.status_code == 403:
-        raise GitHubStorageError(403, "GitHub token forbidden/rate-limited.")
-    if not r.ok:
-        raise GitHubStorageError(r.status_code, r.text[:200])
 
-def gh_list_dir(path: str) -> list:
-    if not gh_enabled():
-        raise HTTPException(500, "GitHub storage not configured.")
-    r = requests.get(gh_url(path), headers=gh_headers(), params={"ref": GITHUB_BRANCH})
-    if r.status_code == 404:
-        return []
-    if r.status_code == 401:
-        raise GitHubStorageError(401, "GitHub token invalid.")
-    if r.status_code == 403:
-        raise GitHubStorageError(403, "GitHub token forbidden/rate-limited.")
-    if not r.ok:
-        raise GitHubStorageError(r.status_code, r.text[:200])
-    data = r.json()
-    return data if isinstance(data, list) else []
-
-def gh_delete_path(path: str, sha: str, message: str = "delete file") -> bool:
-    if not gh_enabled():
-        raise HTTPException(500, "GitHub storage not configured.")
-    if not sha:
-        _, sha2 = gh_get_json(path)
-        sha = sha2 or ""
-    if not sha:
-        return False
-    r = requests.delete(gh_url(path), headers=gh_headers(),
-                        json={"message": message, "sha": sha, "branch": GITHUB_BRANCH})
-    if r.status_code == 404:
-        return False
-    if r.status_code == 401:
-        raise GitHubStorageError(401, "GitHub token invalid.")
-    if r.status_code == 403:
-        raise GitHubStorageError(403, "GitHub token forbidden/rate-limited.")
-    if not r.ok:
-        raise GitHubStorageError(r.status_code, r.text[:200])
-    return True
-
-# In-memory GitHub read cache
-_gh_cache: Dict[str, Any] = {}
-_gh_cache_ts: Dict[str, float] = {}
-_gh_cache_lock = threading.Lock()
-GH_CACHE_TTL = 30
-
-def gh_get_json_cached(path: str, ttl: int = GH_CACHE_TTL) -> Tuple[Optional[Any], Optional[str]]:
-    now = time.time()
-    with _gh_cache_lock:
-        if path in _gh_cache and (now - _gh_cache_ts.get(path, 0)) < ttl:
-            return _gh_cache[path]
-    result = gh_get_json(path)
-    with _gh_cache_lock:
-        _gh_cache[path] = result
-        _gh_cache_ts[path] = time.time()
-    return result
-
-def gh_cache_invalidate(path: str):
-    with _gh_cache_lock:
-        _gh_cache.pop(path, None)
-        _gh_cache_ts.pop(path, None)
+def db_execute(sql: str, params=None, fetch: str = "none"):
+    """
+    Execute SQL and optionally fetch results.
+    fetch: "none" | "one" | "all"
+    """
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, params or ())
+        if fetch == "one":
+            return cur.fetchone()
+        if fetch == "all":
+            return cur.fetchall()
+        return None
 
 
 # ─────────────────────────────────────────────────────────────
-# Path helpers
+# DB schema bootstrap
 # ─────────────────────────────────────────────────────────────
-def user_root(userid: str) -> str:           return f"data/users/{userid}"
-def user_profile_path(userid: str) -> str:   return f"{user_root(userid)}/profile.json"
-def user_clients_dir(userid: str) -> str:    return f"{user_root(userid)}/clients"
-def user_groups_dir(owner: str) -> str:      return f"data/users/{owner}/groups"
-def user_copy_dir(owner: str) -> str:        return f"data/users/{owner}/copytrading"
+_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+    userid        TEXT PRIMARY KEY,
+    email         TEXT NOT NULL,
+    salt          TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at    TIMESTAMPTZ DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ DEFAULT NOW()
+);
 
-def user_group_file(owner: str, gid: str) -> str:
-    return f"{user_groups_dir(owner)}/{_safe_filename(gid)}.json"
+CREATE TABLE IF NOT EXISTS clients (
+    id             SERIAL PRIMARY KEY,
+    owner_userid   TEXT NOT NULL,
+    userid         TEXT NOT NULL,
+    name           TEXT DEFAULT '',
+    password       TEXT DEFAULT '',
+    pan            TEXT DEFAULT '',
+    apikey         TEXT DEFAULT '',
+    totpkey        TEXT DEFAULT '',
+    capital        NUMERIC DEFAULT 0,
+    session_active BOOLEAN DEFAULT FALSE,
+    last_login_ts  BIGINT DEFAULT 0,
+    last_login_msg TEXT DEFAULT '',
+    UNIQUE(owner_userid, userid)
+);
 
-def user_copy_file(owner: str, sid: str) -> str:
-    return f"{user_copy_dir(owner)}/{_safe_filename(sid)}.json"
+CREATE TABLE IF NOT EXISTS groups (
+    id           SERIAL PRIMARY KEY,
+    owner_userid TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    multiplier   NUMERIC DEFAULT 1,
+    members      JSONB DEFAULT '[]',
+    created_at   TIMESTAMPTZ DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(owner_userid, name)
+);
 
-def _client_dir(owner: str) -> str:
-    return f"data/users/{owner}/clients"
+CREATE TABLE IF NOT EXISTS copy_setups (
+    id           SERIAL PRIMARY KEY,
+    owner_userid TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    master       TEXT NOT NULL,
+    children     JSONB DEFAULT '[]',
+    multipliers  JSONB DEFAULT '{}',
+    enabled      BOOLEAN DEFAULT FALSE,
+    created_at   TIMESTAMPTZ DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(owner_userid, name)
+);
+"""
 
-
-# ─────────────────────────────────────────────────────────────
-# Copy-trading setup cache
-# ─────────────────────────────────────────────────────────────
-_copy_setups_cache: list = []
-_copy_setups_cache_ts: float = 0.0
-COPY_SETUPS_CACHE_TTL = 60
-_copy_setups_403_until: float = 0.0
+def _init_db():
+    """Create tables if they don't exist."""
+    try:
+        with get_db() as conn:
+            conn.cursor().execute(_SCHEMA_SQL)
+        print("✅ PostgreSQL schema ready")
+    except Exception as e:
+        print(f"❌ DB schema init failed: {e}")
+        raise
 
 
 # ─────────────────────────────────────────────────────────────
@@ -361,7 +330,7 @@ def resolve_owner_userid(request: Request, userid: Optional[str] = None, user_id
 
 
 # ─────────────────────────────────────────────────────────────
-# Motilal session store
+# Motilal session store (in-memory — unchanged)
 # ─────────────────────────────────────────────────────────────
 Base_Url       = "https://openapi.motilaloswal.com"
 SourceID       = "Desktop"
@@ -389,13 +358,13 @@ def _session_fresh(sess: dict) -> bool:
         return False
 
 def motilal_login(client: dict) -> bool:
-    """Login a client and store session in mofsl_sessions. Reuses fresh session."""
-    name        = client.get("name", "")
-    userid      = str(client.get("userid", "") or client.get("client_id", "") or "").strip()
-    password    = client.get("password", "")
-    pan         = client.get("pan", "")
-    apikey      = client.get("apikey", "")
-    totpkey     = client.get("totpkey", "")
+    """Login a Motilal client and store session. Reuses fresh session."""
+    name         = client.get("name", "")
+    userid       = str(client.get("userid", "") or client.get("client_id", "") or "").strip()
+    password     = client.get("password", "")
+    pan          = client.get("pan", "")
+    apikey       = client.get("apikey", "")
+    totpkey      = client.get("totpkey", "")
     owner_userid = _norm_uid(client.get("owner_userid", "") or "")
 
     if not userid:
@@ -429,59 +398,21 @@ def motilal_login(client: dict) -> bool:
             return False
 
 
-# ─────────────────────────────────────────────────────────────
-# FIX 2: Module-level _load_client_from_github (used by both
-#         place_order AND the copy-trading engine)
-# ─────────────────────────────────────────────────────────────
-def _load_client_from_github(owner: str, client_id: str) -> Optional[dict]:
-    """
-    Load a client JSON from GitHub for a given owner.
-    Injects owner_userid so motilal_login can tag the session.
-    Returns None if not found.
-    """
-    owner     = str(owner or "").strip()
-    client_id = str(client_id or "").strip()
-    if not owner or not client_id:
+def _load_client_from_db(owner: str, client_userid: str) -> Optional[dict]:
+    """Load a single client row from PostgreSQL."""
+    row = db_execute(
+        "SELECT * FROM clients WHERE owner_userid=%s AND userid=%s",
+        (owner, client_userid), fetch="one"
+    )
+    if not row:
         return None
-
-    folder = _client_dir(owner)
-    preferred = f"{client_id}.json"
-    candidates = []
-
-    try:
-        entries = gh_list_dir(folder) or []
-    except Exception:
-        entries = []
-
-    for ent in entries:
-        if not isinstance(ent, dict) or ent.get("type") != "file":
-            continue
-        nm   = (ent.get("name") or "").strip()
-        path = (ent.get("path") or "").strip()
-        if not nm.endswith(".json") or not path:
-            continue
-        if nm == preferred:
-            candidates = [path]
-            break
-        candidates.append(path)
-
-    for path in candidates:
-        try:
-            obj, _ = gh_get_json(path)
-            if not isinstance(obj, dict) or not obj:
-                continue
-            uid = str(obj.get("userid") or obj.get("client_id") or "").strip()
-            if uid == client_id or path.endswith(f"/{preferred}"):
-                obj = dict(obj)
-                obj["owner_userid"] = owner   # runtime-only, NOT persisted
-                return obj
-        except Exception:
-            continue
-    return None
+    d = dict(row)
+    d["owner_userid"] = owner
+    return d
 
 
 def _ensure_session_for_copy(owner: str, client_id: str) -> Optional[dict]:
-    """Ensure a fresh session exists for copy-trading; auto-login if needed."""
+    """Ensure fresh Motilal session for copy trading; auto-login if needed."""
     owner     = str(owner or "").strip()
     client_id = str(client_id or "").strip()
     if not owner or not client_id:
@@ -492,7 +423,7 @@ def _ensure_session_for_copy(owner: str, client_id: str) -> Optional[dict]:
             and _norm_uid(sess.get("owner_userid", "")) == owner and sess.get("mofsl")):
         return sess
 
-    client_obj = _load_client_from_github(owner, client_id)
+    client_obj = _load_client_from_db(owner, client_id)
     if not client_obj:
         print(f"❌ [COPY] Client not found owner={owner} client_id={client_id}")
         return None
@@ -500,23 +431,19 @@ def _ensure_session_for_copy(owner: str, client_id: str) -> Optional[dict]:
     try:
         ok = bool(motilal_login(client_obj))
     except Exception as e:
-        print(f"❌ [COPY] Login exception owner={owner} client_id={client_id}: {e}")
+        print(f"❌ [COPY] Login exception: {e}")
         return None
 
-    if not ok:
-        print(f"❌ [COPY] Login failed owner={owner} client_id={client_id}")
-        return None
-
-    return mofsl_sessions.get(client_id)
+    return mofsl_sessions.get(client_id) if ok else None
 
 
 # ─────────────────────────────────────────────────────────────
-# Symbol DB (SQLite)
+# Symbol DB (SQLite — local, rebuilt from CSV on startup)
 # ─────────────────────────────────────────────────────────────
 GITHUB_CSV_URL = "https://raw.githubusercontent.com/Pramod541988/Stock_List/main/security_id.csv"
-BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
-SYMBOL_DB_PATH  = os.path.join(BASE_DIR, "symbols.db")
-SYMBOL_TABLE    = "symbols"
+BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
+SYMBOL_DB_PATH = os.path.join(BASE_DIR, "symbols.db")
+SYMBOL_TABLE   = "symbols"
 _symbol_db_lock = threading.Lock()
 
 def _symbol_db_exists() -> bool:
@@ -542,10 +469,8 @@ def refresh_symbol_db_from_github() -> str:
                 f'CREATE INDEX IF NOT EXISTS idx_sym_exchange ON {SYMBOL_TABLE} (Exchange);',
                 f'CREATE INDEX IF NOT EXISTS idx_sym_secid ON {SYMBOL_TABLE} ("Security ID");',
             ]:
-                try:
-                    conn.execute(idx_sql)
-                except Exception:
-                    pass
+                try: conn.execute(idx_sql)
+                except Exception: pass
             conn.commit()
         finally:
             conn.close()
@@ -555,7 +480,7 @@ def refresh_symbol_db_from_github() -> str:
 def _lazy_init_symbol_db():
     if not _symbol_db_exists():
         try:
-            print("ℹ️ Symbol DB not found — building from GitHub CSV…")
+            print("ℹ️ Symbol DB not found — building from CSV…")
             refresh_symbol_db_from_github()
         except Exception as e:
             print("❌ Symbol DB init failed:", e)
@@ -569,7 +494,7 @@ def _min_qty_from_symbol_db(symboltoken) -> int:
             conn = sqlite3.connect(SYMBOL_DB_PATH)
             cur  = conn.cursor()
             cur.execute(f'SELECT [Min Qty] FROM {SYMBOL_TABLE} WHERE [Security ID]=?', (token,))
-            row = cur.fetchone()
+            row  = cur.fetchone()
             conn.close()
         return max(1, int(row[0])) if row and row[0] else 1
     except Exception:
@@ -577,80 +502,46 @@ def _min_qty_from_symbol_db(symboltoken) -> int:
 
 
 # ─────────────────────────────────────────────────────────────
-# FIX 2 (continued): Startup — login ALL clients from GitHub
-# This is the exact equivalent of local on_startup() which calls
-# load_all_clients() + login_client() for every client file.
-# Without this, Railway sessions are empty after every restart.
+# Startup
 # ─────────────────────────────────────────────────────────────
 def _startup_login_all_clients():
-    """
-    Scan ALL users in data/users/ and login every client found.
-    Mirrors the local desktop's on_startup() load_all_clients() behaviour.
-    Runs in a background thread so it doesn't delay server readiness.
-    """
-    print("🔄 [STARTUP] Beginning login of all clients from GitHub…")
+    """Login every client in DB at startup (background thread)."""
+    print("🔄 [STARTUP] Logging in all clients from PostgreSQL…")
     try:
-        users = gh_list_dir("data/users") or []
+        rows = db_execute("SELECT * FROM clients", fetch="all") or []
     except Exception as e:
-        print(f"❌ [STARTUP] Could not list users: {e}")
+        print(f"❌ [STARTUP] DB error: {e}")
         return
 
-    all_client_pairs = []  # [(owner, client_json), ...]
-    for user_ent in users:
-        if user_ent.get("type") != "dir":
-            continue
-        owner = user_ent.get("name", "")
-        if not owner:
-            continue
-        try:
-            client_files = gh_list_dir(f"data/users/{owner}/clients") or []
-        except Exception:
-            continue
-        for cf in client_files:
-            if cf.get("type") != "file" or not (cf.get("name", "")).endswith(".json"):
-                continue
-            try:
-                client_obj, _ = gh_get_json(cf["path"])
-                if isinstance(client_obj, dict) and client_obj:
-                    client_obj = dict(client_obj)
-                    client_obj["owner_userid"] = owner  # runtime-only
-                    all_client_pairs.append(client_obj)
-            except Exception as e:
-                print(f"❌ [STARTUP] Could not read {cf.get('path')}: {e}")
-
-    if not all_client_pairs:
-        print("⚠️  [STARTUP] No clients found to login.")
+    if not rows:
+        print("⚠️ [STARTUP] No clients found.")
         return
 
-    print(f"🔑 [STARTUP] Logging in {len(all_client_pairs)} clients…")
+    print(f"🔑 [STARTUP] Logging in {len(rows)} clients…")
 
-    def _login_one(c):
+    def _login_one(row):
         try:
-            motilal_login(c)
+            motilal_login(dict(row))
         except Exception as e:
-            print(f"❌ [STARTUP] Login error for {c.get('userid','?')}: {e}")
+            print(f"❌ [STARTUP] Login error {row.get('userid','?')}: {e}")
 
     with ThreadPoolExecutor(max_workers=20) as ex:
-        list(ex.map(_login_one, all_client_pairs))
+        list(ex.map(_login_one, rows))
 
     logged = sum(1 for s in mofsl_sessions.values() if _session_fresh(s))
-    print(f"✅ [STARTUP] {logged}/{len(all_client_pairs)} clients logged in.")
+    print(f"✅ [STARTUP] {logged}/{len(rows)} clients logged in.")
 
 
-# ─────────────────────────────────────────────────────────────
-# Startup event
-# ─────────────────────────────────────────────────────────────
 @app.on_event("startup")
 def _startup():
+    _init_db()
     _lazy_init_symbol_db()
-    # Login all clients in background (non-blocking)
     threading.Thread(target=_startup_login_all_clients, daemon=True).start()
-    # Start copy trading engine
     start_copy_trading_thread()
 
 
 # ─────────────────────────────────────────────────────────────
-# Routes — Health / Auth
+# Health / Auth routes
 # ─────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
@@ -659,6 +550,7 @@ def root():
 @app.get("/health")
 def health():
     return {"ok": True}
+
 
 @app.post("/auth/register")
 def auth_register(payload: dict = Body(...)):
@@ -673,51 +565,39 @@ def auth_register(payload: dict = Body(...)):
         return {"success": False, "error": "Passwords do not match"}
 
     try:
-        existing, _ = gh_get_json(user_profile_path(userid))
-    except GitHubStorageError as e:
-        return {"success": False, "error": f"Storage unavailable: {e}"}
+        existing = db_execute("SELECT userid FROM users WHERE userid=%s", (userid,), fetch="one")
+        if existing:
+            return {"success": False, "error": "User already exists"}
 
-    if existing:
-        return {"success": False, "error": "User already exists"}
+        salt = base64.b64encode(os.urandom(12)).decode()
+        ph   = password_hash(password, salt)
+        db_execute(
+            "INSERT INTO users (userid, email, salt, password_hash) VALUES (%s,%s,%s,%s)",
+            (userid, email, salt, ph)
+        )
+        return {"success": True, "userid": userid}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
-    salt = base64.b64encode(os.urandom(12)).decode()
-    profile = {
-        "userid": userid, "email": email, "salt": salt,
-        "password_hash": password_hash(password, salt),
-        "created_at": utcnow_iso(), "updated_at": utcnow_iso(),
-    }
-    try:
-        gh_put_json(user_profile_path(userid), profile, message=f"register {userid}")
-    except GitHubStorageError as e:
-        return {"success": False, "error": f"Storage unavailable: {e}"}
-    return {"success": True, "userid": userid}
 
 @app.post("/auth/login")
 def auth_login(payload: dict = Body(...)):
-    userid = normalize_userid(payload.get("userid"))
+    userid   = normalize_userid(payload.get("userid"))
     password = (payload.get("password") or "").strip()
-
     if not userid or not password:
-        raise HTTPException(status_code=400, detail="Missing userid or password")
-
+        return {"success": False}
     try:
-        profile, _ = gh_get_json(user_profile_path(userid))
-    except GitHubStorageError as e:
-        raise HTTPException(status_code=503, detail=f"Storage unavailable: {e}")
+        row = db_execute("SELECT * FROM users WHERE userid=%s", (userid,), fetch="one")
+        if not row:
+            return {"success": False}
+        salt = row["salt"]
+        ph   = row["password_hash"]
+        if not salt or not ph or password_hash(password, salt) != ph:
+            return {"success": False}
+        return {"success": True, "userid": userid, "access_token": create_token(userid)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
-    if not isinstance(profile, dict) or not profile:
-        raise HTTPException(status_code=401, detail="Invalid userid or password")
-
-    salt = profile.get("salt", "")
-    ph = profile.get("password_hash", "")
-    if not salt or not ph or password_hash(password, salt) != ph:
-        raise HTTPException(status_code=401, detail="Invalid userid or password")
-
-    return {
-        "success": True,
-        "userid": userid,
-        "access_token": create_token(userid),
-    }
 
 @app.get("/me")
 def me(userid: str = Depends(get_current_user)):
@@ -729,45 +609,49 @@ def me(userid: str = Depends(get_current_user)):
 # ─────────────────────────────────────────────────────────────
 @app.post("/add_client")
 async def add_client(request: Request, payload: dict = Body(...)):
-    owner_userid = _norm_uid(request.headers.get("x-user-id") or payload.get("owner_userid") or payload.get("userid") or "")
-    if not owner_userid:
-        raise HTTPException(401, "Missing owner userid")
-
+    owner_userid  = _norm_uid(request.headers.get("x-user-id") or payload.get("owner_userid") or payload.get("userid") or "")
     client_userid = str(payload.get("userid") or payload.get("client_id") or payload.get("client_code") or "").strip()
-    if not client_userid:
-        raise HTTPException(400, "Client userid required")
+    if not owner_userid: raise HTTPException(401, "Missing owner userid")
+    if not client_userid: raise HTTPException(400, "Client userid required")
 
-    client = {
-        "broker": "motilal",
-        "name":     payload.get("name") or payload.get("display_name") or "",
-        "userid":   client_userid,
-        "password": payload.get("password") or "",
-        "pan":      payload.get("pan") or "",
-        "apikey":   payload.get("apikey") or "",
-        "totpkey":  payload.get("totpkey") or "",
-        "capital":  payload.get("capital", ""),
-        "session_active": False,
-        "last_login_ts":  0,
-        "last_login_msg": "Not logged in",
-    }
+    name    = payload.get("name") or ""
+    capital = _safe_float(payload.get("capital", 0), 0.0)
 
-    path = f"data/users/{owner_userid}/clients/{client_userid}.json"
     try:
-        gh_put_json(path, client, message=f"add client {owner_userid}:{client_userid}")
-        gh_cache_invalidate(path)
-    except GitHubStorageError as e:
-        raise HTTPException(503, f"Storage unavailable: {e}")
+        db_execute("""
+            INSERT INTO clients (owner_userid, userid, name, password, pan, apikey, totpkey, capital)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (owner_userid, userid) DO UPDATE SET
+                name=%s, password=%s, pan=%s, apikey=%s, totpkey=%s, capital=%s
+        """, (
+            owner_userid, client_userid,
+            name, payload.get("password",""), payload.get("pan",""),
+            payload.get("apikey",""), payload.get("totpkey",""), capital,
+            # ON CONFLICT updates:
+            name, payload.get("password",""), payload.get("pan",""),
+            payload.get("apikey",""), payload.get("totpkey",""), capital,
+        ))
+    except Exception as e:
+        raise HTTPException(503, f"DB error: {e}")
 
-    login_client = dict(client)
-    login_client["owner_userid"] = owner_userid
-    ok = motilal_login(login_client)
-
-    client["session_active"]  = ok
-    client["last_login_ts"]   = int(time.time())
-    client["last_login_msg"]  = "Login successful" if ok else "Login failed"
-    gh_put_json(path, client, message=f"update login status {owner_userid}:{client_userid}")
-    gh_cache_invalidate(path)
+    # Attempt Motilal login immediately
+    client_obj = {
+        "name": name, "userid": client_userid,
+        "password": payload.get("password",""), "pan": payload.get("pan",""),
+        "apikey": payload.get("apikey",""), "totpkey": payload.get("totpkey",""),
+        "owner_userid": owner_userid,
+    }
+    ok  = motilal_login(client_obj)
+    msg = "Login successful" if ok else "Login failed"
+    try:
+        db_execute(
+            "UPDATE clients SET session_active=%s, last_login_ts=%s, last_login_msg=%s WHERE owner_userid=%s AND userid=%s",
+            (ok, int(time.time()), msg, owner_userid, client_userid)
+        )
+    except Exception:
+        pass
     return {"success": True}
+
 
 @app.post("/edit_client")
 async def edit_client(request: Request, payload: dict = Body(...)):
@@ -776,77 +660,78 @@ async def edit_client(request: Request, payload: dict = Body(...)):
     if not owner_userid or not client_userid:
         raise HTTPException(400, "Missing owner_userid or client_userid")
 
-    path = f"data/users/{owner_userid}/clients/{client_userid}.json"
-    client, _ = gh_get_json(path)
-    if not isinstance(client, dict) or not client:
+    row = db_execute("SELECT * FROM clients WHERE owner_userid=%s AND userid=%s",
+                     (owner_userid, client_userid), fetch="one")
+    if not row:
         raise HTTPException(404, "Client not found")
 
-    for field in ("name", "password", "pan", "apikey", "totpkey", "capital"):
-        if payload.get(field) is not None:
-            client[field] = payload[field]
+    fields = {}
+    for f in ("name", "password", "pan", "apikey", "totpkey"):
+        if payload.get(f) is not None:
+            fields[f] = payload[f]
+    if payload.get("capital") is not None:
+        fields["capital"] = _safe_float(payload["capital"], 0.0)
 
-    gh_put_json(path, client, message="edit client")
-    gh_cache_invalidate(path)
+    if fields:
+        set_clause = ", ".join(f"{k}=%s" for k in fields)
+        db_execute(
+            f"UPDATE clients SET {set_clause} WHERE owner_userid=%s AND userid=%s",
+            list(fields.values()) + [owner_userid, client_userid]
+        )
 
-    login_client = dict(client)
-    login_client["owner_userid"] = owner_userid
-    ok = motilal_login(login_client)
-
-    client["session_active"]  = ok
-    client["last_login_ts"]   = int(time.time())
-    client["last_login_msg"]  = "Login successful" if ok else "Login failed"
-    gh_put_json(path, client, message="update login")
-    gh_cache_invalidate(path)
+    # Re-login with updated credentials
+    updated_row = db_execute("SELECT * FROM clients WHERE owner_userid=%s AND userid=%s",
+                              (owner_userid, client_userid), fetch="one")
+    client_obj = dict(updated_row)
+    client_obj["owner_userid"] = owner_userid
+    # Force re-login by evicting old session
+    mofsl_sessions.pop(client_userid, None)
+    ok  = motilal_login(client_obj)
+    msg = "Login successful" if ok else "Login failed"
+    db_execute(
+        "UPDATE clients SET session_active=%s, last_login_ts=%s, last_login_msg=%s WHERE owner_userid=%s AND userid=%s",
+        (ok, int(time.time()), msg, owner_userid, client_userid)
+    )
     return {"success": True}
+
 
 @app.get("/clients")
 def get_clients(request: Request, userid: str = None, user_id: str = None):
-    uid = _norm_uid(request.headers.get("x-user-id") or userid or user_id or
-                    request.query_params.get("userid") or request.query_params.get("user_id") or "")
+    uid = _norm_uid(
+        request.headers.get("x-user-id") or userid or user_id
+        or request.query_params.get("userid") or request.query_params.get("user_id") or ""
+    )
     if not uid:
         return {"clients": []}
 
-    folder  = f"data/users/{uid}/clients"
-    clients = []
     try:
-        entries = gh_list_dir(folder) or []
-    except GitHubStorageError as e:
+        rows = db_execute("SELECT * FROM clients WHERE owner_userid=%s ORDER BY name", (uid,), fetch="all") or []
+    except Exception as e:
         return {"clients": [], "error": str(e)}
 
-    for ent in entries:
-        if not isinstance(ent, dict) or ent.get("type") != "file":
-            continue
-        if not ent.get("name", "").endswith(".json") or not ent.get("path"):
-            continue
+    clients = []
+    for row in rows:
+        client_id = row["userid"]
+        # Attempt login if session missing
+        client_obj = dict(row)
+        client_obj["owner_userid"] = uid
         try:
-            client_obj, _ = gh_get_json_cached(ent["path"])
-            if not isinstance(client_obj, dict):
-                continue
-
-            client_obj_local = dict(client_obj)
-            client_obj_local["owner_userid"] = uid
-            try:
-                motilal_login(client_obj_local)
-            except Exception:
-                pass
-
-            client_id = str(client_obj.get("userid") or client_obj.get("client_id") or "").strip()
-            sess = mofsl_sessions.get(client_id) if client_id else None
-            sa   = bool(sess and _norm_uid(sess.get("owner_userid","")) == uid
-                        and _session_fresh(sess) and sess.get("mofsl"))
-
-            clients.append({
-                "name":           client_obj.get("name", ""),
-                "client_id":      client_id,
-                "capital":        client_obj.get("capital", ""),
-                "session":        "Logged in" if sa else "Logged out",
-                "session_active": sa,
-                "status":         "logged_in" if sa else "logged_out",
-            })
-        except Exception as e:
-            print(f"Error reading {ent.get('path')}: {e}")
-
+            motilal_login(client_obj)
+        except Exception:
+            pass
+        sess = mofsl_sessions.get(client_id)
+        sa   = bool(sess and _norm_uid(sess.get("owner_userid","")) == uid
+                    and _session_fresh(sess) and sess.get("mofsl"))
+        clients.append({
+            "name":           row["name"],
+            "client_id":      client_id,
+            "capital":        float(row.get("capital") or 0),
+            "session":        "Logged in" if sa else "Logged out",
+            "session_active": sa,
+            "status":         "logged_in" if sa else "logged_out",
+        })
     return {"clients": clients}
+
 
 @app.post("/delete_client")
 async def delete_client(request: Request, payload: dict = Body(...)):
@@ -856,20 +741,18 @@ async def delete_client(request: Request, payload: dict = Body(...)):
 
     deleted, missing, errors = [], [], []
     for it in (payload.get("items") or []):
+        cuid = str((it or {}).get("userid") or (it or {}).get("client_id") or "").strip()
+        if not cuid:
+            continue
         try:
-            cuid = str((it or {}).get("userid") or (it or {}).get("client_id") or "").strip()
-            if not cuid:
-                continue
-            path     = f"data/users/{owner_userid}/clients/{cuid}.json"
-            _, sha   = gh_get_json(path)
-            if not sha:
-                missing.append(cuid); continue
-            ok = gh_delete_path(path, sha, message=f"delete client {owner_userid}:{cuid}")
-            if ok:
-                deleted.append(cuid)
-                mofsl_sessions.pop(cuid, None)
-            else:
+            row = db_execute("SELECT id FROM clients WHERE owner_userid=%s AND userid=%s",
+                             (owner_userid, cuid), fetch="one")
+            if not row:
                 missing.append(cuid)
+                continue
+            db_execute("DELETE FROM clients WHERE owner_userid=%s AND userid=%s", (owner_userid, cuid))
+            mofsl_sessions.pop(cuid, None)
+            deleted.append(cuid)
         except Exception as e:
             errors.append(str(e))
     return {"ok": True, "deleted": deleted, "missing": missing, "errors": errors}
@@ -885,6 +768,7 @@ def refresh_symbols():
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+
 @app.get("/search_symbols")
 def search_symbols(q: str = Query(""), exchange: str = Query("")):
     _lazy_init_symbol_db()
@@ -893,8 +777,8 @@ def search_symbols(q: str = Query(""), exchange: str = Query("")):
     if not raw:
         return {"results": []}
 
-    words      = [w for w in raw.split() if w]
-    where_sql  = ['LOWER([Stock Symbol]) LIKE ?' for w in words]
+    words        = [w for w in raw.split() if w]
+    where_sql    = ['LOWER([Stock Symbol]) LIKE ?' for _ in words]
     where_params = [f"%{w}%" for w in words]
     if exch:
         where_sql.append('UPPER(Exchange) = ?')
@@ -921,101 +805,75 @@ def search_symbols(q: str = Query(""), exchange: str = Query("")):
 # ─────────────────────────────────────────────────────────────
 # Groups
 # ─────────────────────────────────────────────────────────────
-import re as _re
-
-def _extract_uid_from_member(m) -> str:
-    if isinstance(m, dict):
-        return str(m.get("userid") or m.get("client_id") or m.get("client_code") or "").strip()
-    if isinstance(m, str):
-        s = m.strip()
-        if s.startswith("{"):
-            try:
-                d = json.loads(s)
-                return str(d.get("userid") or d.get("client_id") or "").strip()
-            except Exception:
-                pass
-            hit = _re.search(r"(?:userid|client_id)['\"]?\s*:\s*['\"]([^'\"]+)['\"]", s)
-            if hit:
-                return hit.group(1).strip()
-        return s
-    return str(m or "").strip()
-
 @app.get("/groups")
 async def get_groups(request: Request, userid: str = None, user_id: str = None):
     owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
     if not owner_userid:
         return {"groups": []}
-    groups = []
     try:
-        for ent in (gh_list_dir(user_groups_dir(owner_userid)) or []):
-            if not isinstance(ent, dict) or ent.get("type") != "file":
-                continue
-            if not ent.get("name", "").endswith(".json") or not ent.get("path"):
-                continue
-            obj, _ = gh_get_json(ent["path"])
-            if isinstance(obj, dict) and obj:
-                gid = obj.get("id") or ent["name"].replace(".json", "")
-                groups.append({"id": gid, "name": obj.get("name", gid),
-                               "multiplier": obj.get("multiplier", 1),
-                               "members": obj.get("members", [])})
+        rows = db_execute("SELECT * FROM groups WHERE owner_userid=%s ORDER BY name", (owner_userid,), fetch="all") or []
     except Exception:
-        pass
-    return {"groups": groups}
+        return {"groups": []}
+    return {"groups": [
+        {"id": row["name"], "name": row["name"],
+         "multiplier": float(row.get("multiplier") or 1),
+         "members": row.get("members") or []}
+        for row in rows
+    ]}
+
 
 @app.post("/add_group")
 async def add_group(request: Request, payload: dict = Body(...)):
     owner_userid = resolve_owner_userid(request, userid=payload.get("userid") or payload.get("owner_userid"))
-    if not owner_userid:
-        raise HTTPException(401, "Missing owner userid")
-    name = (payload.get("name") or "").strip()
-    if not name:
-        raise HTTPException(400, "Group name required")
+    if not owner_userid: raise HTTPException(401, "Missing owner userid")
+    name    = (payload.get("name") or "").strip()
     members = payload.get("members") or []
-    if not isinstance(members, list) or not members:
-        raise HTTPException(400, "Group members required")
+    if not name: raise HTTPException(400, "Group name required")
+    if not members: raise HTTPException(400, "Group members required")
     mult = max(0.01, float(payload.get("multiplier", 1) or 1))
-    gid  = (payload.get("id") or name).strip()
-    obj  = {"id": gid, "name": name, "multiplier": mult, "members": members,
-            "created_at": utcnow_iso(), "updated_at": utcnow_iso()}
-    gh_put_json(user_group_file(owner_userid, gid), obj, message=f"add group {owner_userid}:{gid}")
-    return {"ok": True, "group": obj}
+    try:
+        db_execute("""
+            INSERT INTO groups (owner_userid, name, multiplier, members)
+            VALUES (%s,%s,%s,%s)
+            ON CONFLICT (owner_userid, name) DO UPDATE SET multiplier=%s, members=%s, updated_at=NOW()
+        """, (owner_userid, name, mult, json.dumps(members), mult, json.dumps(members)))
+    except Exception as e:
+        raise HTTPException(503, str(e))
+    return {"ok": True, "group": {"id": name, "name": name, "multiplier": mult, "members": members}}
+
 
 @app.post("/edit_group")
 async def edit_group(request: Request, payload: dict = Body(...)):
     owner_userid = resolve_owner_userid(request, userid=payload.get("userid") or payload.get("owner_userid"))
-    if not owner_userid:
-        raise HTTPException(401, "Missing owner userid")
-    gid  = (payload.get("id") or payload.get("name") or "").strip()
-    if not gid:
-        raise HTTPException(400, "Group id required")
-    path = user_group_file(owner_userid, gid)
-    prev, _ = gh_get_json(path)
-    if not isinstance(prev, dict):
-        prev = {}
-    mult = max(0.01, float(payload.get("multiplier", 1) or 1))
-    obj  = {"id": prev.get("id") or gid, "name": payload.get("name") or gid,
-            "multiplier": mult, "members": payload.get("members") or [],
-            "created_at": prev.get("created_at") or utcnow_iso(), "updated_at": utcnow_iso()}
-    gh_put_json(path, obj, message=f"edit group {owner_userid}:{gid}")
-    return {"ok": True, "group": obj}
+    if not owner_userid: raise HTTPException(401, "Missing owner userid")
+    name    = (payload.get("id") or payload.get("name") or "").strip()
+    if not name: raise HTTPException(400, "Group name required")
+    members = payload.get("members") or []
+    mult    = max(0.01, float(payload.get("multiplier", 1) or 1))
+    try:
+        db_execute(
+            "UPDATE groups SET multiplier=%s, members=%s, updated_at=NOW() WHERE owner_userid=%s AND name=%s",
+            (mult, json.dumps(members), owner_userid, name)
+        )
+    except Exception as e:
+        raise HTTPException(503, str(e))
+    return {"ok": True, "group": {"id": name, "name": name, "multiplier": mult, "members": members}}
+
 
 @app.post("/delete_group")
 async def delete_group(request: Request, payload: dict = Body(...)):
     owner_userid = resolve_owner_userid(request, userid=payload.get("userid") or payload.get("owner_userid"))
-    if not owner_userid:
-        raise HTTPException(401, "Missing owner userid")
+    if not owner_userid: raise HTTPException(401, "Missing owner userid")
     ids = payload.get("ids") or payload.get("names") or []
-    if not isinstance(ids, list):
-        ids = [ids]
+    if not isinstance(ids, list): ids = [ids]
     deleted, missing, errors = [], [], []
     for gid in ids:
+        gid = str(gid).strip()
         try:
-            gid  = str(gid).strip()
-            path = user_group_file(owner_userid, gid)
-            _, sha = gh_get_json(path)
-            if not sha:
-                missing.append(gid); continue
-            (deleted if gh_delete_path(path, sha, f"delete group {owner_userid}:{gid}") else missing).append(gid)
+            row = db_execute("SELECT id FROM groups WHERE owner_userid=%s AND name=%s", (owner_userid, gid), fetch="one")
+            if not row: missing.append(gid); continue
+            db_execute("DELETE FROM groups WHERE owner_userid=%s AND name=%s", (owner_userid, gid))
+            deleted.append(gid)
         except Exception as e:
             errors.append(str(e))
     return {"ok": True, "deleted": deleted, "missing": missing, "errors": errors}
@@ -1027,57 +885,48 @@ async def delete_group(request: Request, payload: dict = Body(...)):
 @app.get("/list_copytrading_setups")
 async def list_copytrading_setups(request: Request, userid: str = None, user_id: str = None):
     owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
-    if not owner_userid:
-        return {"setups": []}
-    setups = []
+    if not owner_userid: return {"setups": []}
     try:
-        for ent in (gh_list_dir(user_copy_dir(owner_userid)) or []):
-            if not isinstance(ent, dict) or ent.get("type") != "file":
-                continue
-            if not ent.get("name", "").endswith(".json") or not ent.get("path"):
-                continue
-            obj, _ = gh_get_json(ent["path"])
-            if not isinstance(obj, dict) or not obj:
-                continue
-            sid = obj.get("id") or obj.get("name") or ent["name"].replace(".json", "")
-            setups.append({"id": sid, "name": obj.get("name", sid),
-                           "master":      obj.get("master", ""),
-                           "children":    obj.get("children", []) or [],
-                           "multipliers": obj.get("multipliers", {}) or {},
-                           "enabled":     bool(obj.get("enabled", False))})
+        rows = db_execute("SELECT * FROM copy_setups WHERE owner_userid=%s ORDER BY name", (owner_userid,), fetch="all") or []
     except Exception:
-        pass
-    return {"setups": setups}
+        return {"setups": []}
+    return {"setups": [
+        {"id": row["name"], "name": row["name"],
+         "master":      row["master"],
+         "children":    row.get("children") or [],
+         "multipliers": row.get("multipliers") or {},
+         "enabled":     bool(row.get("enabled", False))}
+        for row in rows
+    ]}
+
 
 @app.post("/save_copytrading_setup")
 async def save_copytrading_setup(request: Request, payload: dict = Body(...)):
     owner_userid = resolve_owner_userid(request, userid=payload.get("userid") or payload.get("owner_userid"))
-    if not owner_userid:
-        raise HTTPException(401, "Missing owner userid")
-    name = (payload.get("name") or "").strip()
-    sid  = (payload.get("id") or name).strip()
-    if not sid:
-        raise HTTPException(400, "Setup name required")
+    if not owner_userid: raise HTTPException(401, "Missing owner userid")
+    name     = (payload.get("name") or payload.get("id") or "").strip()
     master   = (payload.get("master") or "").strip()
     children = payload.get("children") or []
-    if not master or not isinstance(children, list) or not children:
-        raise HTTPException(400, "Master + at least one child required")
-    path     = user_copy_file(owner_userid, sid)
-    prev, _  = gh_get_json(path)
-    if not isinstance(prev, dict):
-        prev = {}
-    enabled  = payload.get("enabled")
-    if enabled is None:
-        enabled = prev.get("enabled", False)
-    obj = {"id": sid, "name": name or sid, "master": master, "children": children,
-           "multipliers": payload.get("multipliers") or {},
-           "enabled": bool(enabled),
-           "created_at": prev.get("created_at") or utcnow_iso(), "updated_at": utcnow_iso()}
-    gh_put_json(path, obj, message=f"save copy setup {owner_userid}:{sid}")
-    gh_cache_invalidate(path)
-    global _copy_setups_cache_ts
-    _copy_setups_cache_ts = 0.0
-    return {"ok": True, "setup": obj}
+    if not name: raise HTTPException(400, "Setup name required")
+    if not master or not children: raise HTTPException(400, "Master + at least one child required")
+    multipliers = payload.get("multipliers") or {}
+    enabled     = bool(payload.get("enabled", False))
+    try:
+        db_execute("""
+            INSERT INTO copy_setups (owner_userid, name, master, children, multipliers, enabled)
+            VALUES (%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (owner_userid, name) DO UPDATE SET
+                master=%s, children=%s, multipliers=%s, enabled=%s, updated_at=NOW()
+        """, (
+            owner_userid, name, master,
+            json.dumps(children), json.dumps(multipliers), enabled,
+            master, json.dumps(children), json.dumps(multipliers), enabled,
+        ))
+    except Exception as e:
+        raise HTTPException(503, str(e))
+    return {"ok": True, "setup": {"id": name, "name": name, "master": master,
+                                   "children": children, "multipliers": multipliers, "enabled": enabled}}
+
 
 @app.post("/enable_copy")
 async def enable_copy(request: Request, payload: dict = Body(...)):
@@ -1089,55 +938,46 @@ async def disable_copy(request: Request, payload: dict = Body(...)):
 
 async def _set_copy_enabled(request: Request, payload: dict, value: bool):
     owner_userid = resolve_owner_userid(request, userid=payload.get("userid") or payload.get("owner_userid"))
-    if not owner_userid:
-        raise HTTPException(401, "Missing owner userid")
+    if not owner_userid: raise HTTPException(401, "Missing owner userid")
     ids = payload.get("ids") or []
-    if not isinstance(ids, list):
-        ids = [ids]
+    if not isinstance(ids, list): ids = [ids]
     if not ids:
         one = payload.get("id") or payload.get("setup_id") or payload.get("name")
-        if one:
-            ids = [one]
+        if one: ids = [one]
     updated, missing, errors = [], [], []
     for sid in ids:
+        sid = str(sid).strip()
         try:
-            sid  = str(sid).strip()
-            path = user_copy_file(owner_userid, sid)
-            obj, _ = gh_get_json(path)
-            if not isinstance(obj, dict) or not obj:
-                missing.append(sid); continue
-            obj["enabled"]    = bool(value)
-            obj["updated_at"] = utcnow_iso()
-            gh_put_json(path, obj, message=f"{'enable' if value else 'disable'} copy {owner_userid}:{sid}")
-            gh_cache_invalidate(path)
-            _copy_setups_cache_ts = 0.0
+            row = db_execute("SELECT id FROM copy_setups WHERE owner_userid=%s AND name=%s",
+                             (owner_userid, sid), fetch="one")
+            if not row: missing.append(sid); continue
+            db_execute("UPDATE copy_setups SET enabled=%s, updated_at=NOW() WHERE owner_userid=%s AND name=%s",
+                       (value, owner_userid, sid))
             updated.append(sid)
         except Exception as e:
             errors.append(str(e))
     return {"ok": True, "updated": updated, "missing": missing, "errors": errors}
 
+
 @app.post("/delete_copy_setup")
 @app.post("/delete_copytrading_setup")
 async def delete_copy_setup(request: Request, payload: dict = Body(...)):
     owner_userid = resolve_owner_userid(request, userid=payload.get("userid") or payload.get("owner_userid"))
-    if not owner_userid:
-        raise HTTPException(401, "Missing owner userid")
+    if not owner_userid: raise HTTPException(401, "Missing owner userid")
     ids = payload.get("ids") or []
-    if not isinstance(ids, list):
-        ids = [ids]
+    if not isinstance(ids, list): ids = [ids]
     if not ids:
         one = payload.get("id") or payload.get("setup_id") or payload.get("name")
-        if one:
-            ids = [one]
+        if one: ids = [one]
     deleted, missing, errors = [], [], []
     for sid in ids:
+        sid = str(sid).strip()
         try:
-            sid  = str(sid).strip()
-            path = user_copy_file(owner_userid, sid)
-            _, sha = gh_get_json(path)
-            if not sha:
-                missing.append(sid); continue
-            (deleted if gh_delete_path(path, sha, f"delete copy setup {owner_userid}:{sid}") else missing).append(sid)
+            row = db_execute("SELECT id FROM copy_setups WHERE owner_userid=%s AND name=%s",
+                             (owner_userid, sid), fetch="one")
+            if not row: missing.append(sid); continue
+            db_execute("DELETE FROM copy_setups WHERE owner_userid=%s AND name=%s", (owner_userid, sid))
+            deleted.append(sid)
         except Exception as e:
             errors.append(str(e))
     return {"ok": True, "deleted": deleted, "missing": missing, "errors": errors}
@@ -1153,70 +993,59 @@ def get_orders(request: Request, userid: str = None, user_id: str = None):
 
     for client_id, sess in list(mofsl_sessions.items()):
         try:
-            if not isinstance(sess, dict):
-                continue
-            if owner_userid and str(sess.get("owner_userid","")).strip() != str(owner_userid).strip():
-                continue
+            if not isinstance(sess, dict): continue
+            if owner_userid and str(sess.get("owner_userid","")).strip() != str(owner_userid).strip(): continue
             name  = sess.get("name","") or client_id
             mofsl = sess.get("mofsl")
             uid   = sess.get("userid", client_id)
-            if not mofsl or not uid:
-                continue
+            if not mofsl or not uid: continue
 
             today = datetime.now().strftime("%d-%b-%Y 09:00:00")
             resp  = mofsl.GetOrderBook({"clientcode": uid, "datetimestamp": today})
-            if resp and resp.get("status") != "SUCCESS":
-                logging.error(f"Error fetching orders for {name}: {resp.get('message','')}")
             orders = (resp.get("data", []) if resp else [])
-            if not isinstance(orders, list):
-                orders = []
+            if not isinstance(orders, list): orders = []
 
             for order in orders:
                 od = {"name": name, "client_id": uid,
-                      "symbol": order.get("symbol",""),
+                      "symbol":           order.get("symbol",""),
                       "transaction_type": order.get("buyorsell",""),
-                      "quantity": order.get("orderqty",""),
-                      "price":    order.get("price",""),
-                      "status":   order.get("orderstatus",""),
-                      "order_id": order.get("uniqueorderid","")}
+                      "quantity":         order.get("orderqty",""),
+                      "price":            order.get("price",""),
+                      "status":           order.get("orderstatus",""),
+                      "order_id":         order.get("uniqueorderid","")}
                 st = (order.get("orderstatus","") or "").lower()
-                if "confirm" in st:       orders_data["pending"].append(od)
-                elif "traded" in st:      orders_data["traded"].append(od)
-                elif "rejected" in st or "error" in st: orders_data["rejected"].append(od)
-                elif "cancel" in st:      orders_data["cancelled"].append(od)
-                else:                     orders_data["others"].append(od)
+                if "confirm" in st:                             orders_data["pending"].append(od)
+                elif "traded" in st:                           orders_data["traded"].append(od)
+                elif "rejected" in st or "error" in st:        orders_data["rejected"].append(od)
+                elif "cancel" in st:                           orders_data["cancelled"].append(od)
+                else:                                          orders_data["others"].append(od)
         except Exception as e:
             print(f"❌ Error fetching orders for {client_id}: {e}")
-
     return dict(orders_data)
+
 
 @app.post("/cancel_order")
 async def cancel_order(request: Request, payload: dict = Body(...)):
     owner_userid = resolve_owner_userid(request, userid=payload.get("userid") or payload.get("user_id"))
     orders = (payload or {}).get("orders", [])
-    if not orders:
-        raise HTTPException(400, "No orders received.")
-
+    if not orders: raise HTTPException(400, "No orders received.")
     messages, threads, lock = [], [], threading.Lock()
 
     def find_sess(order):
-        cid = (order or {}).get("client_id") or (order or {}).get("userid") or ""
+        cid = (order or {}).get("client_id") or ""
         if cid:
             s = mofsl_sessions.get(cid)
-            if s and s.get("owner_userid","") == owner_userid:
-                return s
+            if s and s.get("owner_userid","") == owner_userid: return s
         nm = (order or {}).get("name","")
         for s in mofsl_sessions.values():
-            if s.get("owner_userid","") == owner_userid and s.get("name") == nm:
-                return s
+            if s.get("owner_userid","") == owner_userid and s.get("name") == nm: return s
         return None
 
     def cancel_one(order):
         oid  = order.get("order_id")
         sess = find_sess(order)
         if not sess:
-            with lock: messages.append(f"❌ Session not found for {order.get('name','?')}")
-            return
+            with lock: messages.append(f"❌ Session not found for {order.get('name','?')}"); return
         try:
             resp = sess["mofsl"].CancelOrder(oid, sess["userid"])
             msg  = (resp.get("message","") or "").lower()
@@ -1256,26 +1085,25 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
             if not isinstance(positions, list): continue
 
             for pos in positions:
-                bq = float(pos.get("buyquantity") or 0)
-                sq = float(pos.get("sellquantity") or 0)
+                bq  = float(pos.get("buyquantity") or 0)
+                sq  = float(pos.get("sellquantity") or 0)
                 qty = bq - sq
-                ba = float(pos.get("buyamount") or 0)
-                sa = float(pos.get("sellamount") or 0)
+                ba  = float(pos.get("buyamount") or 0)
+                sa  = float(pos.get("sellamount") or 0)
                 buy_avg  = (ba / bq) if bq else 0.0
                 sell_avg = (sa / sq) if sq else 0.0
                 ltp = float(pos.get("LTP") or 0)
                 bp  = float(pos.get("bookedprofitloss") or 0)
                 net = (ltp - buy_avg)*qty if qty > 0 else (sell_avg - buy_avg)*abs(qty) if qty < 0 else bp
 
-                symbol    = str(pos.get("symbol") or "")
-                exchange  = str(pos.get("exchange") or "")
-                token     = str(pos.get("symboltoken") or "")
-                product   = str(pos.get("productname") or "")
+                symbol   = str(pos.get("symbol") or "")
+                exchange = str(pos.get("exchange") or "")
+                token    = str(pos.get("symboltoken") or "")
+                product  = str(pos.get("productname") or "")
 
                 if qty != 0 and symbol:
                     new_meta[(uid, symbol)] = {"exchange": exchange, "symboltoken": token,
                                                "producttype": product, "client_id": uid}
-
                 row = {"name": name, "client_id": uid, "symbol": symbol, "quantity": qty,
                        "buy_avg": round(buy_avg, 2), "sell_avg": round(sell_avg, 2),
                        "net_profit": round(net, 2)}
@@ -1286,6 +1114,7 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
     with _position_meta_lock:
         position_meta = new_meta
     return positions_data
+
 
 @app.post("/close_position")
 async def close_position(request: Request, payload: dict = Body(...)):
@@ -1319,10 +1148,10 @@ async def close_position(request: Request, payload: dict = Body(...)):
         return "", None
 
     def close_one(pos):
-        name    = (pos or {}).get("name") or ""
-        symbol  = (pos or {}).get("symbol") or ""
-        qty     = float((pos or {}).get("quantity", 0) or 0)
-        txtype  = (pos or {}).get("transaction_type") or ""
+        name     = (pos or {}).get("name") or ""
+        symbol   = (pos or {}).get("symbol") or ""
+        qty      = float((pos or {}).get("quantity", 0) or 0)
+        txtype   = (pos or {}).get("transaction_type") or ""
         cid_hint = (pos or {}).get("client_id") or ""
         with _position_meta_lock:
             meta = position_meta.get((cid_hint, symbol)) or position_meta.get((name, symbol)) or {}
@@ -1355,16 +1184,14 @@ async def close_position(request: Request, payload: dict = Body(...)):
 
 
 # ─────────────────────────────────────────────────────────────
-# Holdings + Summary (fully independent)
+# Holdings + Summary
 # ─────────────────────────────────────────────────────────────
 summary_data_global: Dict = {}
-
 
 def get_available_margin(Mofsl, clientcode):
     try:
         r = Mofsl.GetReportMarginSummary(clientcode)
-        if r.get("status") != "SUCCESS":
-            return 0
+        if r.get("status") != "SUCCESS": return 0
         for item in r.get("data", []):
             if item.get("particulars") == "Total Available Margin for Cash":
                 return float(item.get("amount", 0))
@@ -1374,20 +1201,14 @@ def get_available_margin(Mofsl, clientcode):
 
 
 def _build_client_capital_map(owner_userid: str) -> Dict:
-    """Read capital values from all client JSON files for this owner."""
     capital_map: Dict = {}
     try:
-        for ent in (gh_list_dir(f"data/users/{owner_userid}/clients") or []):
-            if not isinstance(ent, dict) or ent.get("type") != "file":
-                continue
-            if not str(ent.get("name", "")).endswith(".json") or not ent.get("path"):
-                continue
-            co, _ = gh_get_json_cached(ent["path"])
-            if not isinstance(co, dict):
-                continue
-            cid = str(co.get("userid") or co.get("client_id") or "").strip()
-            nm  = str(co.get("name", "") or cid).strip()
-            cap = co.get("capital") or co.get("base_amount") or 0
+        rows = db_execute("SELECT userid, name, capital FROM clients WHERE owner_userid=%s",
+                          (owner_userid,), fetch="all") or []
+        for row in rows:
+            cid = str(row["userid"] or "").strip()
+            nm  = str(row["name"] or cid).strip()
+            cap = float(row.get("capital") or 0)
             if cid: capital_map[cid] = cap
             if nm:  capital_map[nm]  = cap
     except Exception as e:
@@ -1396,29 +1217,20 @@ def _build_client_capital_map(owner_userid: str) -> Dict:
 
 
 def _fetch_summary_for_owner(owner_userid: str) -> Dict:
-    """
-    Fetch margin + holdings PnL for every session belonging to owner.
-    Returns dict keyed by client name.
-    Does NOT require get_holdings to have been called first.
-    """
     capital_map  = _build_client_capital_map(owner_userid)
     summary_data: Dict = {}
 
     for client_id, sess in list(mofsl_sessions.items()):
         try:
-            if not isinstance(sess, dict):
-                continue
-            if str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
-                continue
-            name  = sess.get("name", "") or client_id
+            if not isinstance(sess, dict): continue
+            if str(sess.get("owner_userid","")).strip() != str(owner_userid).strip(): continue
+            name  = sess.get("name","") or client_id
             Mofsl = sess.get("mofsl")
             uid_  = sess.get("userid") or client_id
-            if not Mofsl or not uid_:
-                continue
+            if not Mofsl or not uid_: continue
 
-            # ── Holdings PnL ───────────────────────────────────
-            invested   = 0.0
-            total_pnl  = 0.0
+            invested  = 0.0
+            total_pnl = 0.0
             try:
                 resp = Mofsl.GetDPHolding(uid_)
                 if resp and resp.get("status") == "SUCCESS":
@@ -1426,14 +1238,9 @@ def _fetch_summary_for_owner(owner_userid: str) -> Dict:
                         qty     = float(h.get("dpquantity", 0) or 0)
                         buy_avg = float(h.get("buyavgprice", 0) or 0)
                         sc      = h.get("nsesymboltoken")
-                        if not sc or qty <= 0:
-                            continue
+                        if not sc or qty <= 0: continue
                         try:
-                            ltp_resp = Mofsl.GetLtp({
-                                "clientcode": uid_,
-                                "exchange":   "NSE",
-                                "scripcode":  int(sc),
-                            })
+                            ltp_resp = Mofsl.GetLtp({"clientcode": uid_, "exchange": "NSE", "scripcode": int(sc)})
                             ltp = float((ltp_resp or {}).get("data", {}).get("ltp", 0) or 0) / 100
                         except Exception:
                             ltp = 0.0
@@ -1442,11 +1249,9 @@ def _fetch_summary_for_owner(owner_userid: str) -> Dict:
             except Exception as e:
                 print(f"⚠️ Holdings fetch skipped for {name}: {e}")
 
-            # ── Available margin ───────────────────────────────
             available_margin = get_available_margin(Mofsl, uid_)
-
-            capital       = float(capital_map.get(uid_) or capital_map.get(name) or 0)
-            current_value = invested + total_pnl
+            capital          = float(capital_map.get(uid_) or capital_map.get(name) or 0)
+            current_value    = invested + total_pnl
 
             summary_data[name] = {
                 "name":             name,
@@ -1459,15 +1264,13 @@ def _fetch_summary_for_owner(owner_userid: str) -> Dict:
             }
         except Exception as e:
             print(f"❌ Summary error for {client_id}: {e}")
-
     return summary_data
 
 
 @app.get("/get_holdings")
 def get_holdings(request: Request, userid: str = None, user_id: str = None):
     owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
-    if not owner_userid:
-        return {"ok": False, "error": "userid missing"}
+    if not owner_userid: return {"ok": False, "error": "userid missing"}
 
     holdings_data: List = []
     capital_map   = _build_client_capital_map(owner_userid)
@@ -1475,19 +1278,15 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
 
     for client_id, sess in list(mofsl_sessions.items()):
         try:
-            if not isinstance(sess, dict):
-                continue
-            if str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
-                continue
-            name  = sess.get("name", "") or client_id
+            if not isinstance(sess, dict): continue
+            if str(sess.get("owner_userid","")).strip() != str(owner_userid).strip(): continue
+            name  = sess.get("name","") or client_id
             Mofsl = sess.get("mofsl")
             uid_  = sess.get("userid") or client_id
-            if not Mofsl or not uid_:
-                continue
+            if not Mofsl or not uid_: continue
 
             resp = Mofsl.GetDPHolding(uid_)
-            if not resp or resp.get("status") != "SUCCESS":
-                continue
+            if not resp or resp.get("status") != "SUCCESS": continue
 
             invested  = 0.0
             total_pnl = 0.0
@@ -1497,118 +1296,61 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
                 qty       = float(h.get("dpquantity", 0) or 0)
                 buy_avg   = float(h.get("buyavgprice", 0) or 0)
                 scripcode = h.get("nsesymboltoken")
-                if not scripcode or qty <= 0:
-                    continue
+                if not scripcode or qty <= 0: continue
                 try:
-                    ltp_resp = Mofsl.GetLtp({
-                        "clientcode": uid_,
-                        "exchange":   "NSE",
-                        "scripcode":  int(scripcode),
-                    })
+                    ltp_resp = Mofsl.GetLtp({"clientcode": uid_, "exchange": "NSE", "scripcode": int(scripcode)})
                     ltp = float((ltp_resp or {}).get("data", {}).get("ltp", 0) or 0) / 100
                 except Exception:
                     ltp = 0.0
                 pnl        = round((ltp - buy_avg) * qty, 2)
                 invested  += qty * buy_avg
                 total_pnl += pnl
-                holdings_data.append({
-                    "name":    name,
-                    "symbol":  symbol,
-                    "quantity": qty,
-                    "buy_avg": round(buy_avg, 2),
-                    "ltp":     round(ltp, 2),
-                    "pnl":     pnl,
-                })
+                holdings_data.append({"name": name, "symbol": symbol, "quantity": qty,
+                                       "buy_avg": round(buy_avg, 2), "ltp": round(ltp, 2), "pnl": pnl})
 
-            # Build summary alongside holdings (avoid double API call)
             available_margin = get_available_margin(Mofsl, uid_)
             capital          = float(capital_map.get(uid_) or capital_map.get(name) or 0)
             current_value    = invested + total_pnl
             summary_data[name] = {
-                "name":             name,
-                "capital":          round(capital, 2),
-                "invested":         round(invested, 2),
-                "pnl":              round(total_pnl, 2),
-                "current_value":    round(current_value, 2),
+                "name": name, "capital": round(capital, 2), "invested": round(invested, 2),
+                "pnl": round(total_pnl, 2), "current_value": round(current_value, 2),
                 "available_margin": round(available_margin, 2),
-                "net_gain":         round((current_value + available_margin) - capital, 2),
+                "net_gain": round((current_value + available_margin) - capital, 2),
             }
         except Exception as e:
             print(f"❌ Holdings error for {client_id}: {e}")
 
-    # Update global cache so /get_summary can serve from it
     global summary_data_global
     summary_data_global[str(owner_userid).strip()] = summary_data
-
     return {"holdings": holdings_data, "summary": list(summary_data.values())}
 
 
 @app.get("/get_summary")
 def get_summary(request: Request, userid: str = None, user_id: str = None):
-    """
-    Fully independent — fetches fresh margin + PnL data directly.
-    Does NOT require /get_holdings to have been called first.
-    Falls back to cached data only if a live fetch fails entirely.
-    """
     owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
-    if not owner_userid:
-        return {"ok": False, "error": "userid missing", "summary": []}
-
-    # Always fetch fresh data independently
+    if not owner_userid: return {"ok": False, "error": "userid missing", "summary": []}
     try:
         summary_data = _fetch_summary_for_owner(owner_userid)
     except Exception as e:
         print(f"❌ get_summary fetch error: {e}")
         summary_data = {}
-
     if summary_data:
-        # Update global cache with fresh data
         global summary_data_global
         summary_data_global[str(owner_userid).strip()] = summary_data
         return {"summary": list(summary_data.values())}
-
-    # Nothing came back from live fetch — serve stale cache if available
     cached = (summary_data_global or {}).get(str(owner_userid).strip(), {}) or {}
     if cached:
-        print(f"⚠️ get_summary serving stale cache for {owner_userid}")
         return {"summary": list(cached.values()), "stale": True}
+    return {"summary": []}
 
-    # No sessions active yet — return margin-only rows from sessions
-    rows = []
-    for client_id, sess in list(mofsl_sessions.items()):
-        try:
-            if not isinstance(sess, dict):
-                continue
-            if str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
-                continue
-            name  = sess.get("name", "") or client_id
-            Mofsl = sess.get("mofsl")
-            uid_  = sess.get("userid") or client_id
-            if not Mofsl or not uid_:
-                continue
-            available_margin = get_available_margin(Mofsl, uid_)
-            rows.append({
-                "name":             name,
-                "capital":          0,
-                "invested":         0,
-                "pnl":              0,
-                "current_value":    0,
-                "available_margin": round(available_margin, 2),
-                "net_gain":         0,
-            })
-        except Exception:
-            pass
-    return {"summary": rows}
 
 # ─────────────────────────────────────────────────────────────
 # Place Order
-# FIX 3: _load_client_from_github is now the MODULE-LEVEL one
-#         (no duplicate local definition inside place_order)
 # ─────────────────────────────────────────────────────────────
 def _parse_symbol_token(payload: dict):
-    symbol   = (payload.get("symbol") or "").strip()
-    exch     = (payload.get("exchange") or "NSE").strip().upper()
-    token    = payload.get("symboltoken") or payload.get("security_id") or payload.get("token")
+    symbol = (payload.get("symbol") or "").strip()
+    exch   = (payload.get("exchange") or "NSE").strip().upper()
+    token  = payload.get("symboltoken") or payload.get("security_id") or payload.get("token")
     if symbol and "|" in symbol:
         parts = symbol.split("|")
         if len(parts) >= 3:
@@ -1616,61 +1358,46 @@ def _parse_symbol_token(payload: dict):
             token = parts[2].strip()
     return exch, _safe_int(token, 0)
 
-def _get_group_members(owner_userid: str, group_name: str):
+def _get_group_members_from_db(owner_userid: str, group_name: str):
     try:
-        obj, _ = gh_get_json(user_group_file(owner_userid, group_name))
-        if not isinstance(obj, dict):
-            return [], 1.0
-        members = [str(m).strip() for m in (obj.get("members") or []) if str(m).strip()]
-        mult    = max(0.01, float(obj.get("multiplier", 1) or 1))
+        row = db_execute("SELECT multiplier, members FROM groups WHERE owner_userid=%s AND name=%s",
+                         (owner_userid, group_name), fetch="one")
+        if not row: return [], 1.0
+        members = row["members"] or []
+        mult    = max(0.01, float(row.get("multiplier") or 1))
         return members, mult
     except Exception:
         return [], 1.0
 
+
 @app.post("/place_order")
 async def place_order(request: Request, payload: dict = Body(...)):
     owner_userid = resolve_owner_userid(request, userid=payload.get("userid"), user_id=payload.get("user_id"))
-    if not owner_userid:
-        raise HTTPException(401, "Missing owner userid")
+    if not owner_userid: raise HTTPException(401, "Missing owner userid")
 
     data = payload or {}
-    try:
-        print("📦 /place_order RAW =", json.dumps(data, ensure_ascii=False, default=str))
-    except Exception:
-        print("📦 /place_order RAW =", data)
-
     exch, symboltoken = _parse_symbol_token(data)
-    if not symboltoken:
-        raise HTTPException(400, "Missing/invalid symbol token")
+    if not symboltoken: raise HTTPException(400, "Missing/invalid symbol token")
 
-    groupacc       = bool(data.get("groupacc", False))
-    groups_raw     = data.get("groups", []) or []
-    clients_raw    = data.get("clients", []) or []
-    diffQty        = bool(data.get("diffQty", False))
-    multiplier_on  = bool(data.get("multiplier", False))
-    quantityinlot  = _safe_int(data.get("quantityinlot", 0), 0)
-    perClientQty_raw = data.get("perClientQty", {}) or {}
-    action         = (data.get("action") or "").strip().upper()
-    ordertype      = (data.get("ordertype") or "").strip().upper()
-    producttype    = (data.get("producttype") or "").strip().upper()
-    orderduration  = (data.get("orderduration") or "").strip().upper()
-    price          = _safe_float(data.get("price", 0), 0.0)
-    triggerprice   = _safe_float(data.get("triggerprice", 0), 0.0)
+    groupacc          = bool(data.get("groupacc", False))
+    groups_raw        = data.get("groups", []) or []
+    clients_raw       = data.get("clients", []) or []
+    diffQty           = bool(data.get("diffQty", False))
+    multiplier_on     = bool(data.get("multiplier", False))
+    quantityinlot     = _safe_int(data.get("quantityinlot", 0), 0)
+    perClientQty_raw  = data.get("perClientQty", {}) or {}
+    action            = (data.get("action") or "").strip().upper()
+    ordertype         = (data.get("ordertype") or "").strip().upper()
+    producttype       = (data.get("producttype") or "").strip().upper()
+    orderduration     = (data.get("orderduration") or "").strip().upper()
+    price             = _safe_float(data.get("price", 0), 0.0)
+    triggerprice      = _safe_float(data.get("triggerprice", 0), 0.0)
     disclosedquantity = _safe_int(data.get("disclosedquantity", 0), 0)
-    amoorder       = (data.get("amoorder") or "N").strip().upper()
-
-    _re_uid1 = re.compile(r"(?:userid|client_id|client_code)'\s*:\s*'([^']+)'")
-    _re_uid2 = re.compile(r'(?:userid|client_id|client_code)"\s*:\s*"([^"]+)"')
+    amoorder          = (data.get("amoorder") or "N").strip().upper()
 
     def _extract_client_id(x) -> str:
         if isinstance(x, dict):
             return str(x.get("userid") or x.get("client_id") or x.get("client_code") or "").strip()
-        if isinstance(x, str):
-            s = x.strip()
-            if "{" in s and "}" in s and any(k in s for k in ("userid","client_id","client_code")):
-                m = _re_uid1.search(s) or _re_uid2.search(s)
-                if m: return m.group(1).strip()
-            return s
         return str(x or "").strip()
 
     def _extract_group_name(x) -> str:
@@ -1678,34 +1405,26 @@ async def place_order(request: Request, payload: dict = Body(...)):
             return str(x.get("name") or x.get("group") or x.get("group_name") or "").strip()
         return str(x or "").strip()
 
-    groups  = [_extract_group_name(g) for g in (groups_raw if isinstance(groups_raw, list) else []) if _extract_group_name(g)]
-    clients = [_extract_client_id(c) for c in (clients_raw if isinstance(clients_raw, list) else []) if _extract_client_id(c)]
+    groups       = [_extract_group_name(g) for g in groups_raw if _extract_group_name(g)]
+    clients      = [_extract_client_id(c) for c in clients_raw if _extract_client_id(c)]
     perClientQty = {_extract_client_id(k): _safe_int(v, quantityinlot)
-                    for k, v in (perClientQty_raw or {}).items() if _extract_client_id(k)}
+                    for k, v in perClientQty_raw.items() if _extract_client_id(k)}
 
-    print("✅ Normalized groups:", groups)
-    print("✅ Normalized clients:", clients)
-
-    # FIX 3: use module-level _load_client_from_github (no local redefinition)
     def _ensure_session(client_id: str) -> dict:
         cid = str(client_id or "").strip()
         if not cid: return {}
         sess = mofsl_sessions.get(cid)
-        if isinstance(sess, dict) and sess.get("mofsl"):
-            return sess
-        # Railway restart recovery — reload from GitHub and re-login
-        cobj = _load_client_from_github(owner_userid, cid)   # ← module-level function
-        if not isinstance(cobj, dict) or not cobj: return {}
-        local_client = dict(cobj)
-        local_client["owner_userid"] = str(owner_userid).strip()
-        return mofsl_sessions.get(cid) or {} if motilal_login(local_client) else {}
+        if isinstance(sess, dict) and sess.get("mofsl"): return sess
+        cobj = _load_client_from_db(owner_userid, cid)
+        if not cobj: return {}
+        cobj["owner_userid"] = owner_userid
+        return mofsl_sessions.get(cid) or {} if motilal_login(cobj) else {}
 
     targets = []
     if groupacc:
         for gname in groups:
-            members, gmult = _get_group_members(owner_userid, gname)
+            members, gmult = _get_group_members_from_db(owner_userid, gname)
             members_norm   = [_extract_client_id(m) for m in members if _extract_client_id(m)]
-            print(f"👥 group '{gname}' members={members_norm} gmult={gmult}")
             for cid in members_norm:
                 q = quantityinlot
                 if diffQty:     q = _safe_int(perClientQty.get(cid, q), q)
@@ -1719,9 +1438,7 @@ async def place_order(request: Request, payload: dict = Body(...)):
             if diffQty: q = _safe_int(perClientQty.get(cid, q), q)
             targets.append(("", cid, int(max(1, q))))
 
-    print("🎯 targets:", targets)
-    if not targets:
-        raise HTTPException(400, "No target clients/groups selected")
+    if not targets: raise HTTPException(400, "No target clients/groups selected")
 
     responses: Dict = {}
     lock    = threading.Lock()
@@ -1731,25 +1448,21 @@ async def place_order(request: Request, payload: dict = Body(...)):
         key  = f"{tag}:{client_id}" if tag else client_id
         sess = _ensure_session(client_id)
         if not isinstance(sess, dict) or not sess.get("mofsl"):
-            with lock: responses[key] = {"status": "ERROR", "message": "Session not found"}
-            return
+            with lock: responses[key] = {"status": "ERROR", "message": "Session not found"}; return
         sess_owner = (sess.get("owner_userid") or "").strip()
         if sess_owner and sess_owner != str(owner_userid).strip():
-            with lock: responses[key] = {"status": "ERROR", "message": "Session belongs to another user"}
-            return
-        mofsl_ = sess.get("mofsl")
-        uid_   = sess.get("userid") or client_id
+            with lock: responses[key] = {"status": "ERROR", "message": "Session belongs to another user"}; return
         order_payload = {
-            "clientcode": str(uid_), "exchange": exch, "symboltoken": int(symboltoken),
+            "clientcode": str(sess.get("userid") or client_id),
+            "exchange": exch, "symboltoken": int(symboltoken),
             "buyorsell": action, "ordertype": ordertype, "producttype": producttype,
             "orderduration": orderduration, "price": float(price),
             "triggerprice": float(triggerprice), "quantityinlot": int(max(1, qty)),
             "disclosedquantity": int(disclosedquantity), "amoorder": amoorder,
             "algoid": "", "goodtilldate": "", "tag": tag or "",
         }
-        print(f"🧾 Order payload for {key} =", order_payload)
         try:
-            resp = mofsl_.PlaceOrder(order_payload)
+            resp = sess["mofsl"].PlaceOrder(order_payload)
         except Exception as e:
             resp = {"status": "ERROR", "message": str(e)}
         with lock: responses[key] = resp
@@ -1771,16 +1484,14 @@ def now_ist_str() -> str:
 def modify_order(request: Request, payload: dict = Body(...)) -> Dict[str, Any]:
     owner_userid = resolve_owner_userid(request, userid=(payload or {}).get("userid"),
                                         user_id=(payload or {}).get("user_id"))
-    if not owner_userid:
-        raise HTTPException(401, "Missing owner userid")
+    if not owner_userid: raise HTTPException(401, "Missing owner userid")
 
     data   = payload or {}
     orders = data.get("orders")
     if not isinstance(orders, list) or not orders:
         one = data.get("order")
         orders = [one] if isinstance(one, dict) else None
-    if not orders:
-        raise HTTPException(400, "Missing order(s)")
+    if not orders: raise HTTPException(400, "Missing order(s)")
 
     messages: List[str] = []
 
@@ -1823,10 +1534,6 @@ def modify_order(request: Request, payload: dict = Body(...)) -> Dict[str, Any]:
             s = mofsl_sessions.get(cid)
             if isinstance(s, dict) and str(s.get("owner_userid","")).strip() == str(owner_userid).strip():
                 return s
-            for _, s in list(mofsl_sessions.items()):
-                if not isinstance(s, dict): continue
-                if str(s.get("owner_userid","")).strip() != str(owner_userid).strip(): continue
-                if str(s.get("userid") or "").strip() == cid: return s
         nm = (r.get("name") or "").strip().lower()
         if nm:
             for _, s in list(mofsl_sessions.items()):
@@ -1844,8 +1551,8 @@ def modify_order(request: Request, payload: dict = Body(...)) -> Dict[str, Any]:
             sess = _get_session_for_row(row)
             if not sess:
                 messages.append(f"❌ {name} ({oid}): session not available"); continue
-            uid  = str(sess.get("userid") or "").strip()
-            sdk  = sess.get("mofsl")
+            uid = str(sess.get("userid") or "").strip()
+            sdk = sess.get("mofsl")
             if not uid or not sdk:
                 messages.append(f"❌ {name} ({oid}): session not available"); continue
 
@@ -1853,7 +1560,6 @@ def modify_order(request: Request, payload: dict = Body(...)) -> Dict[str, Any]:
             trig_in  = row.get("triggerPrice", row.get("triggerprice"))
             qty_in   = _ni(row.get("quantity"))
 
-            # Try to get live order details
             snap = None
             try:
                 resp = sdk.GetOrderDetails({"clientcode": uid, "uniqueorderid": oid})
@@ -1876,7 +1582,7 @@ def modify_order(request: Request, payload: dict = Body(...)) -> Dict[str, Any]:
                 messages.append(f"❌ {name} ({oid}): cannot determine quantity"); continue
 
             last_mod = next((v for k in ("lastmodifiedtime","lastmodifieddatetime","recordinsertime",
-                                          "recordinserttime","modifydatetime")
+                                         "recordinserttime","modifydatetime")
                              if isinstance(snap.get(k), str) and snap[k].strip()
                              for v in [snap[k].strip()]), now_ist_str())
 
@@ -1914,99 +1620,65 @@ def modify_order(request: Request, payload: dict = Body(...)) -> Dict[str, Any]:
 
 # ─────────────────────────────────────────────────────────────
 # Copy Trading Engine
-# Logic mirrored from CT_FastAPI.py (desktop) — pure polling,
-# 1-second loop, 5-second order window, sessions by client_id.
-# No WebSocket (removed — was causing duplicate fires).
+# Mirrors desktop CT_FastAPI.py logic exactly:
+#   - Pure polling (no WebSocket)
+#   - 1 second loop
+#   - 5 second order window (recordinserttime must be < 5s old)
+#   - AMO flag auto-detected from order time
+#   - Qty: master_qty × multiplier ÷ min_lot_size
 # ─────────────────────────────────────────────────────────────
 order_mapping:                Dict = {}   # {setup_key: {master_oid: {child_id: child_oid}}}
 processed_order_ids_placed:   Dict = {}   # {setup_key: set()}
 processed_order_ids_canceled: Dict = {}   # {setup_key: set()}
 
-COPY_ORDER_WINDOW_SECONDS = 5    # identical to desktop: ignore orders older than 5s
-COPY_SETUPS_CACHE_TTL     = 10   # re-read GitHub setups every 10s (was 60s)
-POLL_INTERVAL_SECONDS     = 1    # identical to desktop: 1 second loop
+COPY_ORDER_WINDOW_SECONDS = 5    # orders older than 5s are ignored
+COPY_SETUPS_CACHE_TTL     = 30   # reload setups from DB every 30s
+POLL_INTERVAL_SECONDS     = 1    # GetOrderBook called every 1 second
 
-_copy_setups_cache:     list  = []
-_copy_setups_cache_ts:  float = 0.0
-_copy_setups_403_until: float = 0.0
+_copy_setups_cache:    list  = []
+_copy_setups_cache_ts: float = 0.0
+_copy_setups_lock = threading.Lock()
 
 
 def _norm_ordertype(s: str) -> str:
-    """Collapse STOP LOSS / STOP_LOSS / STOPLOSS → STOPLOSS. Pass others as-is."""
-    s = (s or "").strip().upper()
-    collapsed = s.replace("_", "").replace(" ", "").replace("-", "")
+    """Normalise STOP LOSS / STOP_LOSS / STOPLOSS → STOPLOSS. Pass others as-is."""
+    s        = (s or "").strip().upper()
+    collapsed = s.replace("_","").replace(" ","").replace("-","")
     return "STOPLOSS" if collapsed == "STOPLOSS" else s
 
-
 def _norm_producttype(raw: str) -> str:
-    v = str(raw or "").strip().upper()
-    _ALLOWED = {"NORMAL", "DELIVERY", "SELLFROMDP", "VALUEPLUS", "BTST", "MTF"}
-    _LEGACY  = {"CNC": "DELIVERY", "MIS": "NORMAL", "INTRADAY": "NORMAL", "MARGIN": "NORMAL"}
-    return v if v in _ALLOWED else _LEGACY.get(v, "DELIVERY")
-
+    v       = str(raw or "").strip().upper()
+    ALLOWED = {"NORMAL","DELIVERY","SELLFROMDP","VALUEPLUS","BTST","MTF"}
+    LEGACY  = {"CNC":"DELIVERY","MIS":"NORMAL","INTRADAY":"NORMAL","MARGIN":"NORMAL"}
+    return v if v in ALLOWED else LEGACY.get(v, "DELIVERY")
 
 def _norm_duration(raw: str) -> str:
     v = str(raw or "").strip().upper()
-    return "DAY" if v in ("DAY", "NORMAL", "D", "") else v
+    return "DAY" if v in ("DAY","NORMAL","D","") else v
 
 
 def load_active_copy_setups_all() -> list:
-    """Load all enabled copy setups from GitHub (with short cache)."""
-    global _copy_setups_cache, _copy_setups_cache_ts, _copy_setups_403_until
-
-    if time.time() < _copy_setups_403_until:
-        return _copy_setups_cache
-
-    if _copy_setups_cache and (time.time() - _copy_setups_cache_ts) < COPY_SETUPS_CACHE_TTL:
-        return _copy_setups_cache
-
-    setups = []
+    """Load all enabled copy setups from PostgreSQL (cached 30s)."""
+    global _copy_setups_cache, _copy_setups_cache_ts
+    with _copy_setups_lock:
+        if _copy_setups_cache and (time.time() - _copy_setups_cache_ts) < COPY_SETUPS_CACHE_TTL:
+            return list(_copy_setups_cache)
     try:
-        users = gh_list_dir("data/users") or []
-        for user in users:
-            if user.get("type") != "dir":
-                continue
-            owner = user.get("name", "")
-            if not owner:
-                continue
-            try:
-                files = gh_list_dir(f"data/users/{owner}/copytrading") or []
-            except GitHubStorageError as e:
-                if e.status_code == 403:
-                    _copy_setups_403_until = time.time() + 60
-                continue
-            except Exception:
-                continue
-            for f in files:
-                if f.get("type") != "file" or not f.get("name", "").endswith(".json"):
-                    continue
-                try:
-                    setup, _ = gh_get_json(f["path"])
-                except Exception:
-                    continue
-                if not setup or not setup.get("enabled", False):
-                    continue
-                setup = dict(setup)
-                setup["owner_userid"] = owner
-                setups.append(setup)
-    except GitHubStorageError as e:
-        if e.status_code == 403:
-            _copy_setups_403_until = time.time() + 60
+        rows = db_execute("SELECT * FROM copy_setups WHERE enabled=TRUE", fetch="all") or []
+        setups = [dict(r) for r in rows]
+        with _copy_setups_lock:
+            _copy_setups_cache    = setups
+            _copy_setups_cache_ts = time.time()
+        return setups
     except Exception as e:
-        print(f"❌ load_active_copy_setups_all error: {e}")
-
-    if setups:
-        _copy_setups_cache    = setups
-        _copy_setups_cache_ts = time.time()
-
-    return setups
+        print(f"❌ load_active_copy_setups_all: {e}")
+        return _copy_setups_cache
 
 
 def _fetch_master_orders(master_id: str, owner: str) -> list:
     """Fetch today's order book for master. Returns list of orders."""
     sess = _ensure_session_for_copy(owner, master_id)
     if not isinstance(sess, dict) or not sess.get("mofsl"):
-        print(f"❌ [COPY] Master session unavailable: {master_id}")
         return []
     try:
         today = datetime.now().strftime("%d-%b-%Y 09:00:00")
@@ -2015,7 +1687,6 @@ def _fetch_master_orders(master_id: str, owner: str) -> list:
             "datetimestamp": today,
         })
         if not resp or resp.get("status") != "SUCCESS":
-            print(f"⚠️ [COPY] GetOrderBook failed master={master_id}: {(resp or {}).get('message','')}")
             return []
         orders = resp.get("data") or []
         return orders if isinstance(orders, list) else []
@@ -2026,16 +1697,15 @@ def _fetch_master_orders(master_id: str, owner: str) -> list:
 
 def process_copy_order(order: dict, setup: dict):
     """
-    Mirror of desktop process_order().
-    Called per order per setup in a thread.
-    5-second window. Dedup by uniqueorderid per setup.
+    Core copy logic — mirrors desktop process_order() exactly.
+    Called per order per setup in its own thread.
     """
     owner      = str(setup.get("owner_userid") or "").strip()
-    setup_name = str(setup.get("name") or setup.get("id") or "setup")
-    setup_key  = f"{owner}:{setup.get('id') or setup_name}"
+    setup_name = str(setup.get("name") or "setup")
+    setup_key  = f"{owner}:{setup_name}"
     master_oid = str(order.get("uniqueorderid") or "").strip()
 
-    # Skip malformed
+    # Skip malformed orders
     if not master_oid or master_oid == "0":
         return
 
@@ -2043,25 +1713,23 @@ def process_copy_order(order: dict, setup: dict):
     if not order_time_str or order_time_str in ("", "0", None):
         return
 
-    # Parse order time and enforce 5-second window (identical to desktop)
+    # Parse order time and enforce 5-second window — same as desktop
     try:
         order_time_dt = datetime.strptime(order_time_str, "%d-%b-%Y %H:%M:%S")
         order_time    = int(order_time_dt.timestamp())
-        # AMO flag: outside market hours
-        t = order_time_dt.time()
-        market_open  = datetime.strptime("09:00:00", "%H:%M:%S").time()
-        market_close = datetime.strptime("15:30:00", "%H:%M:%S").time()
-        amo_flag = "N" if market_open <= t <= market_close else "Y"
+        t             = order_time_dt.time()
+        market_open   = datetime.strptime("09:00:00", "%H:%M:%S").time()
+        market_close  = datetime.strptime("15:30:00", "%H:%M:%S").time()
+        amo_flag      = "N" if market_open <= t <= market_close else "Y"
     except Exception as e:
         print(f"⚠️ [COPY] Bad recordinserttime='{order_time_str}' oid={master_oid}: {e}")
         return
 
-    current_time = int(time.time())
-    age          = current_time - order_time
+    age = int(time.time()) - order_time
     if age > COPY_ORDER_WINDOW_SECONDS:
-        return   # too old — desktop does the same check
+        return   # too old — same 5s window as desktop
 
-    # Init per-setup tracking dicts
+    # Init per-setup tracking
     processed_order_ids_placed.setdefault(setup_key, set())
     processed_order_ids_canceled.setdefault(setup_key, set())
     order_mapping.setdefault(setup_key, {})
@@ -2069,16 +1737,14 @@ def process_copy_order(order: dict, setup: dict):
     order_status = str(order.get("orderstatus") or "").strip().upper()
     order_type   = _norm_ordertype(order.get("ordertype") or "")
 
-    # ── PLACE path (mirrors desktop condition) ─────────────────
-    # Desktop: order_type == "MARKET" or order_status in ("CONFIRM","TRADED")
-    # We extend to cover all live statuses
     _PLACE_STATUSES = {
-        "CONFIRM", "CONFIRMED", "TRADED", "SENT", "OPEN", "PENDING",
-        "TRIGGER PENDING", "TRIGGERPENDING",
-        "AMO REQ RECEIVED", "PUT ORDER REQ RECEIVED",
-        "AFTER MARKET ORDER REQ RECEIVED", "MODIFIED", "MODIFY CONFIRM",
+        "CONFIRM","CONFIRMED","TRADED","SENT","OPEN","PENDING",
+        "TRIGGER PENDING","TRIGGERPENDING",
+        "AMO REQ RECEIVED","PUT ORDER REQ RECEIVED",
+        "AFTER MARKET ORDER REQ RECEIVED","MODIFIED","MODIFY CONFIRM",
     }
 
+    # ── PLACE path ─────────────────────────────────────────────
     if order_type == "MARKET" or order_status in _PLACE_STATUSES:
         if master_oid in processed_order_ids_placed[setup_key]:
             return
@@ -2102,22 +1768,19 @@ def process_copy_order(order: dict, setup: dict):
         master_qty = int(order.get("orderqty") or 1)
         min_qty    = max(1, _min_qty_from_symbol_db(symtok))
 
-        print(
-            f"🧬 [COPY] TRIGGERED setup={setup_name} oid={master_oid} "
-            f"side={side} ot={ot} pt={pt} status={order_status} "
-            f"master_qty={master_qty} min_qty={min_qty} age={age}s"
-        )
+        print(f"🧬 [COPY] TRIGGERED setup={setup_name} oid={master_oid} "
+              f"side={side} ot={ot} pt={pt} status={order_status} "
+              f"master_qty={master_qty} min_qty={min_qty} age={age}s")
 
         for child_id in children:
             child_id = str(child_id).strip()
-            if not child_id:
-                continue
+            if not child_id: continue
 
-            # Ensure child session (auto-login if needed)
+            # Ensure child session (auto re-login if needed)
             sess = mofsl_sessions.get(child_id)
             if not (isinstance(sess, dict) and sess.get("mofsl") and _session_fresh(sess)):
                 print(f"🔁 [COPY] Re-logging child={child_id}")
-                cobj = _load_client_from_github(owner, child_id)
+                cobj = _load_client_from_db(owner, child_id)
                 if cobj:
                     motilal_login(cobj)
                 sess = mofsl_sessions.get(child_id)
@@ -2126,10 +1789,11 @@ def process_copy_order(order: dict, setup: dict):
                 print(f"❌ [COPY] No session child={child_id} — skipping")
                 continue
 
-            # Quantity: desktop formula → total_qty = master_qty * mult, then // min_qty
-            mult       = float(multipliers.get(child_id, 1) or 1)
-            total_qty  = master_qty * mult
-            qty_lot    = max(1, int(total_qty // min_qty))
+            # Qty formula — identical to desktop:
+            # total_qty = master_qty × multiplier, then ÷ min_lot_size
+            mult      = float(multipliers.get(child_id, 1) or 1)
+            total_qty = master_qty * mult
+            qty_lot   = max(1, int(total_qty // min_qty))
 
             child_order = {
                 "clientcode":        sess["userid"],
@@ -2149,10 +1813,10 @@ def process_copy_order(order: dict, setup: dict):
                 "tag":               setup_name,
             }
 
-            print(f"📦 [COPY] Placing child={child_id} qty={qty_lot} payload={child_order}")
+            print(f"📦 [COPY] child={child_id} qty={qty_lot} payload={child_order}")
             try:
                 resp = sess["mofsl"].PlaceOrder(child_order)
-                print(f"📨 [COPY] Response child={child_id} resp={resp}")
+                print(f"📨 [COPY] child={child_id} resp={resp}")
                 coid = (resp or {}).get("uniqueorderid")
                 if coid:
                     order_mapping[setup_key].setdefault(master_oid, {})[child_id] = coid
@@ -2161,30 +1825,26 @@ def process_copy_order(order: dict, setup: dict):
             except Exception as e:
                 print(f"❌ [COPY] PlaceOrder exception child={child_id}: {e}")
 
-        # Mark as done AFTER all children placed (same as desktop line 391)
+        # Mark AFTER all children placed — same as desktop (line 391)
         processed_order_ids_placed[setup_key].add(master_oid)
 
-    # ── CANCEL path ────────────────────────────────────────────
+    # ── CANCEL path ─────────────────────────────────────────────
     elif "CANCEL" in order_status:
         if master_oid in processed_order_ids_canceled[setup_key]:
             return
-
         child_map = order_mapping.get(setup_key, {}).get(master_oid, {}) or {}
         if not child_map:
             print(f"ℹ️ [COPY] Cancel: no child mapping for oid={master_oid}")
             processed_order_ids_canceled[setup_key].add(master_oid)
             return
-
         for child_id, coid in child_map.items():
             sess = mofsl_sessions.get(child_id)
-            if not (isinstance(sess, dict) and sess.get("mofsl")):
-                continue
+            if not (isinstance(sess, dict) and sess.get("mofsl")): continue
             try:
                 resp = sess["mofsl"].CancelOrder(coid, sess["userid"])
                 print(f"✅ [COPY] Cancel propagated child={child_id} coid={coid} resp={resp}")
             except Exception as e:
                 print(f"❌ [COPY] Cancel error child={child_id}: {e}")
-
         processed_order_ids_canceled[setup_key].add(master_oid)
 
 
@@ -2202,18 +1862,12 @@ def synchronize_copy_trading():
         owner     = str(setup.get("owner_userid") or "").strip()
         if not master_id or not owner:
             return
-
         orders = _fetch_master_orders(master_id, owner)
         if not orders:
             return
-
         order_threads = []
         for order in orders:
-            t = threading.Thread(
-                target=process_copy_order,
-                args=(order, setup),
-                daemon=True,
-            )
+            t = threading.Thread(target=process_copy_order, args=(order, setup), daemon=True)
             t.start()
             order_threads.append(t)
         for t in order_threads:
@@ -2229,19 +1883,18 @@ def synchronize_copy_trading():
 
 
 def motilal_copy_trading_loop():
-    """Main loop — identical cadence to desktop (1 second)."""
-    print("✅ Copy Trading Engine running (polling, 1s loop)…")
+    """Main loop — 1 second cadence, identical to desktop."""
+    print("✅ Copy Trading Engine running (1s polling loop)…")
     last_enabled: set = set()
     while True:
         try:
             setups      = load_active_copy_setups_all()
-            enabled_now = {s.get("name", "") for s in setups}
+            enabled_now = {s.get("name","") for s in setups}
             for sname in enabled_now - last_enabled:
                 print(f"[COPY] Setup ENABLED: {sname}")
             for sname in last_enabled - enabled_now:
                 print(f"[COPY] Setup DISABLED: {sname}")
             last_enabled = enabled_now
-
             synchronize_copy_trading()
         except Exception as e:
             print(f"❌ Copy trading sync error: {e}")
