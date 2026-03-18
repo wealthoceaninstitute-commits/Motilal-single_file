@@ -5,13 +5,14 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# System dependencies (required for Playwright + Chromium)
+# System dependencies (gcc for psycopg2, libpq for PostgreSQL)
 RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
     curl \
     wget \
     ca-certificates \
+    libpq-dev \
     fonts-liberation \
     libnss3 \
     libatk-bridge2.0-0 \
@@ -31,13 +32,11 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-
 RUN pip install --upgrade pip \
     && pip install -r requirements.txt
 
-# 🔥 THIS IS THE CRITICAL LINE 🔥
 RUN playwright install chromium --with-deps
 
 COPY . .
 
-CMD ["uvicorn", "motilal_trader:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "motilal_trader:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
