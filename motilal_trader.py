@@ -518,43 +518,36 @@ _SYMBOL_SCHEDULER_STARTED = False
 IST_OFFSET_SECONDS = 5 * 3600 + 30 * 60
 
 # ── Instrument sets per exchange ──────────────────────────────
-_NSE_EQUITY = {"EQUITY", "INDEX"}
-_NSE_CD     = {"FUTCUR", "OPTCUR"}
+NSE_EQUITY = {"EQUITY", "INDEX"}
+_NSE_CD     = {"FUTCUR", "OPTCUR", "OPTFUT"}   # OPTFUT appears in NSE currency segment
 _NSE_FO     = {"FUTIDX", "FUTSTK", "OPTIDX", "OPTSTK", "FUTIVX"}
 _BSE_EQUITY = {"EQUITY", "INDEX"}
-_BSE_CD     = {"FUTCUR", "OPTCUR"}
+_BSE_CD     = {"FUTCUR", "OPTCUR", "OPTFUT"}   # same for BSE
 _BSE_FO     = {"FUTIDX", "FUTSTK", "OPTIDX", "OPTSTK"}
 _MCX_ALL    = {"FUTCOM", "FUTIDX", "OPTFUT", "OPTIDX", "OPTCOM"}
 
 
 def _classify_exchange(exch: str, instrument: str) -> Optional[str]:
-    """
-    Map Dhan (SEM_EXM_EXCH_ID, SEM_INSTRUMENT_NAME) → one of
-    NSE | NSECD | NSEFO | BSE | BSECD | BSEFO | MCX
-    Returns None for anything we don't support so it gets dropped.
-    """
     exch       = str(exch or "").strip().upper()
     instrument = str(instrument or "").strip().upper()
 
     if exch == "NSE":
-        if instrument in _NSE_EQUITY:  return "NSE"
-        if instrument in _NSE_CD:      return "NSECD"
-        if instrument in _NSE_FO:      return "NSEFO"
+        if instrument in _NSE_EQUITY: return "NSE"
+        if instrument in _NSE_CD:     return "NSECD"
+        if instrument in _NSE_FO:     return "NSEFO"
         return None
 
     if exch == "BSE":
-        if instrument in _BSE_EQUITY:  return "BSE"
-        if instrument in _BSE_CD:      return "BSECD"
-        if instrument in _BSE_FO:      return "BSEFO"
+        if instrument in _BSE_EQUITY: return "BSE"
+        if instrument in _BSE_CD:     return "BSECD"
+        if instrument in _BSE_FO:     return "BSEFO"
         return None
 
     if exch == "MCX":
-        if instrument in _MCX_ALL:     return "MCX"
+        if instrument in _MCX_ALL:    return "MCX"
         return None
 
-    # NCDEX, IDX, or anything else — skip
-    return None
-
+    return None  # NCDEX, IDX, anything else
 
 def _utc_now_ts() -> int:
     return int(time.time())
