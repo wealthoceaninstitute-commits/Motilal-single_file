@@ -2,7 +2,7 @@
 Motilal Single File - Railway Backend
 Storage: PostgreSQL
 Copy Engine: Pure polling, 1s loop, 5s order window
-Symbol Master: Dhan CSV -> PostgreSQL, daily 8:00 AM IST refresh
+Symbol Master: Motilal OpenAPI scrip CSVs (8 exchanges) -> PostgreSQL, daily 8:00 AM IST refresh
 """
 
 from __future__ import annotations
@@ -99,21 +99,21 @@ def _safe_float(x, default=0.0):
 # ─────────────────────────────────────────────────────────────
 # ENV config
 # ─────────────────────────────────────────────────────────────
-APP_NAME = os.getenv("APP_NAME", "Motilal Trader Backend")
-API_VERSION = os.getenv("API_VERSION", "2.0.0")
-SECRET_KEY = os.getenv("SECRET_KEY") or "CHANGE_ME_PLEASE_SET_SECRET_KEY"
+APP_NAME           = os.getenv("APP_NAME", "Motilal Trader Backend")
+API_VERSION        = os.getenv("API_VERSION", "2.0.0")
+SECRET_KEY         = os.getenv("SECRET_KEY") or "CHANGE_ME_PLEASE_SET_SECRET_KEY"
 TOKEN_EXPIRE_HOURS = int(os.getenv("TOKEN_EXPIRE_HOURS", "24"))
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+DATABASE_URL       = os.getenv("DATABASE_URL", "")
 
 cors_origins_raw = (os.getenv("CORS_ORIGINS") or "").strip()
 if cors_origins_raw == "*":
-    allow_origins = ["*"]
+    allow_origins     = ["*"]
     allow_credentials = False
 elif cors_origins_raw:
-    allow_origins = [o.strip().rstrip("/") for o in cors_origins_raw.split(",") if o.strip()]
+    allow_origins     = [o.strip().rstrip("/") for o in cors_origins_raw.split(",") if o.strip()]
     allow_credentials = True
 else:
-    allow_origins = [
+    allow_origins     = [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "https://woi-mosl-trader.vercel.app",
@@ -185,9 +185,9 @@ def _safe_filename(s: str) -> str:
 # ─────────────────────────────────────────────────────────────
 # PostgreSQL connection pool
 # ─────────────────────────────────────────────────────────────
-_pg_lock = threading.Lock()
+_pg_lock      = threading.Lock()
 _pg_pool: List = []
-_PG_POOL_SIZE = 5
+_PG_POOL_SIZE  = 5
 
 
 def _make_pg_conn():
@@ -296,28 +296,24 @@ CREATE TABLE IF NOT EXISTS copy_setups (
 );
 
 CREATE TABLE IF NOT EXISTS symbol_master (
-    security_id      TEXT NOT NULL PRIMARY KEY,
-    exchange         TEXT NOT NULL,
-    stock_symbol     TEXT NOT NULL,
-    min_qty          INTEGER NOT NULL DEFAULT 1,
-    raw_exchange     TEXT DEFAULT '',
-    raw_instrument   TEXT DEFAULT '',
-    updated_at       TIMESTAMPTZ DEFAULT NOW()
+    security_id  TEXT NOT NULL PRIMARY KEY,
+    exchange     TEXT NOT NULL,
+    stock_symbol TEXT NOT NULL,
+    min_qty      INTEGER NOT NULL DEFAULT 1,
+    updated_at   TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_symbol_master_exchange
+CREATE INDEX IF NOT EXISTS idx_sm_exchange
     ON symbol_master (exchange);
-
-CREATE INDEX IF NOT EXISTS idx_symbol_master_symbol
+CREATE INDEX IF NOT EXISTS idx_sm_symbol
     ON symbol_master (stock_symbol);
-
-CREATE INDEX IF NOT EXISTS idx_symbol_master_symbol_lower
+CREATE INDEX IF NOT EXISTS idx_sm_symbol_lower
     ON symbol_master ((LOWER(stock_symbol)));
 
 CREATE TABLE IF NOT EXISTS app_meta (
-    key         TEXT PRIMARY KEY,
-    value       TEXT NOT NULL,
-    updated_at  TIMESTAMPTZ DEFAULT NOW()
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 """
 
@@ -343,7 +339,7 @@ def get_current_user(
         raise HTTPException(401, "Missing token")
     try:
         payload = jwt_decode(credentials.credentials, SECRET_KEY)
-        userid = (payload.get("userid") or "").strip()
+        userid  = (payload.get("userid") or "").strip()
         if not userid:
             raise HTTPException(401, "Invalid token")
         return userid
@@ -359,7 +355,7 @@ def resolve_owner_userid(
     try:
         auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""
         if auth.lower().startswith("bearer "):
-            payload = jwt_decode(auth.split(" ", 1)[1].strip(), SECRET_KEY)
+            payload    = jwt_decode(auth.split(" ", 1)[1].strip(), SECRET_KEY)
             token_user = payload.get("userid") or ""
     except Exception:
         pass
@@ -377,13 +373,13 @@ def resolve_owner_userid(
 # ─────────────────────────────────────────────────────────────
 # Motilal session store
 # ─────────────────────────────────────────────────────────────
-Base_Url = "https://openapi.motilaloswal.com"
-SourceID = "Desktop"
-browsername = "chrome"
+Base_Url       = "https://openapi.motilaloswal.com"
+SourceID       = "Desktop"
+browsername    = "chrome"
 browserversion = "104"
 
 mofsl_sessions: Dict[str, Dict[str, Any]] = {}
-position_meta: Dict = {}
+position_meta:  Dict = {}
 _position_meta_lock = threading.Lock()
 
 _SESSION_TTL_SECONDS = int(os.getenv("MO_SESSION_TTL_SECONDS", "21600"))
@@ -406,12 +402,12 @@ def _session_fresh(sess: dict) -> bool:
 
 
 def motilal_login(client: dict) -> bool:
-    name = client.get("name", "")
-    userid = str(client.get("userid", "") or client.get("client_id", "") or "").strip()
-    password = client.get("password", "")
-    pan = client.get("pan", "")
-    apikey = client.get("apikey", "")
-    totpkey = client.get("totpkey", "")
+    name         = client.get("name", "")
+    userid       = str(client.get("userid", "") or client.get("client_id", "") or "").strip()
+    password     = client.get("password", "")
+    pan          = client.get("pan", "")
+    apikey       = client.get("apikey", "")
+    totpkey      = client.get("totpkey", "")
     owner_userid = _norm_uid(client.get("owner_userid", "") or "")
 
     if not userid:
@@ -428,15 +424,15 @@ def motilal_login(client: dict) -> bool:
         if existing and _session_fresh(existing) and _norm_uid(existing.get("owner_userid", "")) == owner_userid:
             return True
         try:
-            totp = pyotp.TOTP(totpkey).now() if totpkey else ""
+            totp  = pyotp.TOTP(totpkey).now() if totpkey else ""
             mofsl = MOFSLOPENAPI(apikey, Base_Url, None, SourceID, browsername, browserversion)
-            resp = mofsl.login(userid, password, pan, totp, userid)
+            resp  = mofsl.login(userid, password, pan, totp, userid)
             if isinstance(resp, dict) and resp.get("status") == "SUCCESS":
                 mofsl_sessions[userid] = {
-                    "name": name,
-                    "userid": userid,
-                    "mofsl": mofsl,
-                    "login_ts": int(time.time()),
+                    "name":         name,
+                    "userid":       userid,
+                    "mofsl":        mofsl,
+                    "login_ts":     int(time.time()),
                     "owner_userid": owner_userid,
                 }
                 print(f"✅ Logged in: {name} ({userid})")
@@ -462,7 +458,7 @@ def _load_client_from_db(owner: str, client_userid: str) -> Optional[dict]:
 
 
 def _ensure_session_for_copy(owner: str, client_id: str) -> Optional[dict]:
-    owner = str(owner or "").strip()
+    owner     = str(owner or "").strip()
     client_id = str(client_id or "").strip()
     if not owner or not client_id:
         return None
@@ -491,74 +487,40 @@ def _ensure_session_for_copy(owner: str, client_id: str) -> Optional[dict]:
 
 
 # ─────────────────────────────────────────────────────────────
-# Symbol master — Dhan CSV → PostgreSQL
-# Daily refresh at 08:00 AM IST
+# Symbol Master — Motilal OpenAPI scrip CSVs
 #
-# Exchange mapping (from Dhan SEM_EXM_EXCH_ID + SEM_INSTRUMENT_NAME):
-#   NSE  + EQUITY, INDEX          → NSE
-#   NSE  + FUTCUR, OPTCUR         → NSECD
-#   NSE  + FUTIDX, FUTSTK,
-#           OPTIDX, OPTSTK,
-#           FUTIVX                → NSEFO
-#   BSE  + EQUITY, INDEX          → BSE
-#   BSE  + FUTCUR, OPTCUR         → BSECD
-#   BSE  + FUTIDX, FUTSTK,
-#           OPTIDX, OPTSTK        → BSEFO
-#   MCX  + FUTCOM, FUTIDX,
-#           OPTFUT, OPTIDX,
-#           OPTCOM                → MCX
-#   Everything else               → dropped (NCDEX, unknown, etc.)
+# Download URL: https://openapi.motilaloswal.com/getscripmastercsv?name=<EXCHANGE>
+#
+# 8 exchanges downloaded in parallel every day at 08:00 IST:
+#   NSE, BSE, NSEFO, NSECD, MCX, BSEFO, BSECD, NCDEX
+#
+# Column mapping from Motilal CSV:
+#   exchangename  → exchange      (already correct — no translation needed)
+#   scripcode     → security_id
+#   scripname     → stock_symbol
+#   marketlot     → min_qty
+#
+# No complex instrument-type mapping needed at all.
 # ─────────────────────────────────────────────────────────────
-DHAN_SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 
-_SYMBOL_REFRESH_LOCK = threading.Lock()
-_SYMBOL_REFRESH_META_KEY = "dhan_scrip_master"
+MOSL_SCRIP_BASE_URL = "https://openapi.motilaloswal.com/getscripmastercsv?name="
+
+# All 8 exchanges. NCDEX is kept — the UI dropdown already shows it (image 4).
+MOSL_EXCHANGES = ["NSE", "BSE", "NSEFO", "NSECD", "MCX", "BSEFO", "BSECD", "NCDEX"]
+
+_SYMBOL_REFRESH_LOCK      = threading.Lock()
+_SYMBOL_REFRESH_META_KEY  = "mosl_scrip_master"
 _SYMBOL_SCHEDULER_STARTED = False
 
 IST_OFFSET_SECONDS = 5 * 3600 + 30 * 60
 
-# ── Instrument sets per exchange ──────────────────────────────
-NSE_EQUITY = {"EQUITY", "INDEX"}
-_NSE_CD     = {"FUTCUR", "OPTCUR", "OPTFUT"}   # OPTFUT appears in NSE currency segment
-_NSE_FO     = {"FUTIDX", "FUTSTK", "OPTIDX", "OPTSTK", "FUTIVX"}
-_BSE_EQUITY = {"EQUITY", "INDEX"}
-_BSE_CD     = {"FUTCUR", "OPTCUR", "OPTFUT"}   # same for BSE
-_BSE_FO     = {"FUTIDX", "FUTSTK", "OPTIDX", "OPTSTK"}
-_MCX_ALL    = {"FUTCOM", "FUTIDX", "OPTFUT", "OPTIDX", "OPTCOM"}
-
-
-def _classify_exchange(exch: str, instrument: str) -> Optional[str]:
-    exch       = str(exch or "").strip().upper()
-    instrument = str(instrument or "").strip().upper()
-
-    if exch == "NSE":
-        if instrument in _NSE_EQUITY: return "NSE"
-        if instrument in _NSE_CD:     return "NSECD"
-        if instrument in _NSE_FO:     return "NSEFO"
-        return None
-
-    if exch == "BSE":
-        if instrument in _BSE_EQUITY: return "BSE"
-        if instrument in _BSE_CD:     return "BSECD"
-        if instrument in _BSE_FO:     return "BSEFO"
-        return None
-
-    if exch == "MCX":
-        if instrument in _MCX_ALL:    return "MCX"
-        return None
-
-    return None  # NCDEX, IDX, anything else
 
 def _utc_now_ts() -> int:
     return int(time.time())
 
 
-def _ist_now_epoch() -> int:
-    return _utc_now_ts() + IST_OFFSET_SECONDS
-
-
 def _ist_datetime_now() -> datetime:
-    return datetime.utcfromtimestamp(_ist_now_epoch())
+    return datetime.utcfromtimestamp(_utc_now_ts() + IST_OFFSET_SECONDS)
 
 
 def _today_ist_str() -> str:
@@ -569,35 +531,32 @@ def _next_8am_ist_epoch() -> int:
     now_ist = _ist_datetime_now()
     target  = now_ist.replace(hour=8, minute=0, second=0, microsecond=0)
     if now_ist >= target:
-        target = target + timedelta(days=1)
+        target += timedelta(days=1)
     return int(target.timestamp()) - IST_OFFSET_SECONDS
 
 
 def _ensure_symbol_tables():
-    ddl = """
-    CREATE TABLE IF NOT EXISTS symbol_master (
-        security_id      TEXT NOT NULL PRIMARY KEY,
-        exchange         TEXT NOT NULL,
-        stock_symbol     TEXT NOT NULL,
-        min_qty          INTEGER NOT NULL DEFAULT 1,
-        raw_exchange     TEXT DEFAULT '',
-        raw_instrument   TEXT DEFAULT '',
-        updated_at       TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_sm_exchange
-        ON symbol_master (exchange);
-    CREATE INDEX IF NOT EXISTS idx_sm_symbol
-        ON symbol_master (stock_symbol);
-    CREATE INDEX IF NOT EXISTS idx_sm_symbol_lower
-        ON symbol_master ((LOWER(stock_symbol)));
-    CREATE TABLE IF NOT EXISTS app_meta (
-        key        TEXT PRIMARY KEY,
-        value      TEXT NOT NULL,
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    """
     with get_db() as conn:
-        conn.cursor().execute(ddl)
+        conn.cursor().execute("""
+            CREATE TABLE IF NOT EXISTS symbol_master (
+                security_id  TEXT NOT NULL PRIMARY KEY,
+                exchange     TEXT NOT NULL,
+                stock_symbol TEXT NOT NULL,
+                min_qty      INTEGER NOT NULL DEFAULT 1,
+                updated_at   TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_sm_exchange
+                ON symbol_master (exchange);
+            CREATE INDEX IF NOT EXISTS idx_sm_symbol
+                ON symbol_master (stock_symbol);
+            CREATE INDEX IF NOT EXISTS idx_sm_symbol_lower
+                ON symbol_master ((LOWER(stock_symbol)));
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key        TEXT PRIMARY KEY,
+                value      TEXT NOT NULL,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
 
 
 def _get_symbol_refresh_meta() -> dict:
@@ -630,14 +589,77 @@ def _symbols_are_fresh_for_today_ist() -> bool:
     return _get_symbol_refresh_meta().get("trade_date_ist") == _today_ist_str()
 
 
+def _download_exchange_csv(exchange: str) -> pd.DataFrame:
+    """
+    Download one Motilal exchange scrip CSV.
+    Returns clean DataFrame with columns: security_id, exchange, stock_symbol, min_qty
+    Returns empty DataFrame on any error so the caller can continue with other exchanges.
+    """
+    url = f"{MOSL_SCRIP_BASE_URL}{exchange}"
+    try:
+        resp = requests.get(url, timeout=60)
+        resp.raise_for_status()
+
+        text = resp.content.decode("utf-8", errors="replace")
+        df   = pd.read_csv(StringIO(text), dtype=str, low_memory=False).fillna("")
+
+        if df.empty:
+            print(f"⚠️  [{exchange}] Empty CSV")
+            return pd.DataFrame()
+
+        # Case-insensitive column lookup
+        col_lower = {c.strip().lower(): c for c in df.columns}
+
+        def _col(*names) -> Optional[str]:
+            for n in names:
+                if n.lower() in col_lower:
+                    return col_lower[n.lower()]
+            return None
+
+        scrip_col = _col("scripcode", "security_id", "securityid", "token")
+        name_col  = _col("scripname",  "stock_symbol", "symbol", "name")
+        lot_col   = _col("marketlot",  "min_qty", "lotsize", "lot_size", "lot")
+        exch_col  = _col("exchangename", "exchange", "exch")
+
+        if not scrip_col or not name_col:
+            print(f"⚠️  [{exchange}] Missing required columns. Got: {list(df.columns)}")
+            return pd.DataFrame()
+
+        result = pd.DataFrame()
+        result["security_id"]  = (
+            df[scrip_col].astype(str).str.strip()
+            .str.replace(r"\.0$", "", regex=True)
+        )
+        result["stock_symbol"] = df[name_col].astype(str).str.strip()
+        result["exchange"]     = (
+            df[exch_col].astype(str).str.strip().str.upper()
+            if exch_col else exchange.upper()
+        )
+        result["min_qty"]      = (
+            df[lot_col].apply(lambda x: max(1, _safe_int(x, 1)))
+            if lot_col else 1
+        )
+
+        # Drop rows with blank / zero security_id or stock_symbol
+        result = result[
+            (result["security_id"]  != "") &
+            (result["security_id"]  != "0") &
+            (result["stock_symbol"] != "")
+        ].copy()
+
+        print(f"   [{exchange}] {len(result):,} rows")
+        return result
+
+    except Exception as e:
+        print(f"❌ [{exchange}] Download failed: {e}")
+        return pd.DataFrame()
+
+
 def refresh_symbol_db_from_dhan(force: bool = False) -> Dict[str, Any]:
     """
-    Downloads the full Dhan scrip master CSV (~35 MB, ~270k rows),
-    maps each row to our 7-exchange taxonomy, drops everything else
-    (NCDEX, unknown instruments), then does an atomic TRUNCATE+INSERT
-    into symbol_master.
-
-    Expect ~130k–160k rows after filtering.
+    Entry point (name kept for API backward-compat with /refresh_symbols).
+    Downloads all 8 Motilal exchange CSVs in parallel, merges, deduplicates,
+    and atomically replaces symbol_master in PostgreSQL.
     """
     with _SYMBOL_REFRESH_LOCK:
         _ensure_symbol_tables()
@@ -651,114 +673,52 @@ def refresh_symbol_db_from_dhan(force: bool = False) -> Dict[str, Any]:
                 "trade_date_ist": _today_ist_str(),
             }
 
-        print(f"⬇️  [SYMBOLS] Downloading Dhan scrip master…")
+        print(f"⬇️  [SYMBOLS] Downloading {len(MOSL_EXCHANGES)} Motilal exchange CSVs in parallel…")
         t0 = time.time()
 
-        # Stream download — avoids holding 35 MB twice in memory
-        resp = requests.get(DHAN_SCRIP_MASTER_URL, timeout=120, stream=True)
-        resp.raise_for_status()
+        # ── Parallel downloads ───────────────────────────────
+        frames:      List[pd.DataFrame] = []
+        dl_counts:   Dict[str, int]     = {}
+        dl_errors:   List[str]          = []
+        frames_lock  = threading.Lock()
 
-        chunks, downloaded = [], 0
-        for chunk in resp.iter_content(chunk_size=256 * 1024):
-            if chunk:
-                chunks.append(chunk)
-                downloaded += len(chunk)
-        raw_bytes = b"".join(chunks)
-        print(f"   Downloaded {downloaded / 1024 / 1024:.1f} MB in {time.time() - t0:.1f}s")
+        def _dl(exch: str):
+            df = _download_exchange_csv(exch)
+            with frames_lock:
+                if df.empty:
+                    dl_errors.append(exch)
+                else:
+                    dl_counts[exch] = len(df)
+                    frames.append(df)
 
-        # ── Parse ────────────────────────────────────────────
-        df = pd.read_csv(
-            BytesIO(raw_bytes),
-            dtype=str,
-            low_memory=False,
-            on_bad_lines="skip",
-        ).fillna("")
+        threads = [threading.Thread(target=_dl, args=(e,), daemon=True) for e in MOSL_EXCHANGES]
+        for t in threads: t.start()
+        for t in threads: t.join()
 
-        total_raw = len(df)
-        print(f"   Raw rows : {total_raw:,}")
-        print(f"   Columns  : {list(df.columns)}")
+        elapsed = time.time() - t0
+        print(f"   Downloads finished in {elapsed:.1f}s")
+        if dl_errors:
+            print(f"   ⚠️  Failed: {dl_errors}")
+        if not frames:
+            raise RuntimeError("All exchange downloads failed — aborting")
 
-        # ── Validate required columns ────────────────────────
-        required = [
-            "SEM_EXM_EXCH_ID",
-            "SEM_INSTRUMENT_NAME",
-            "SEM_TRADING_SYMBOL",
-            "SEM_SMST_SECURITY_ID",
-            "SEM_LOT_UNITS",
-        ]
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            raise RuntimeError(f"Dhan CSV missing columns: {missing}")
+        # ── Merge ────────────────────────────────────────────
+        combined = pd.concat(frames, ignore_index=True)
+        raw_count = len(combined)
 
-        # Strip whitespace on key columns before classify
-        for col in required:
-            df[col] = df[col].astype(str).str.strip()
+        # Deduplicate on security_id (keep first occurrence)
+        combined = combined.drop_duplicates(subset=["security_id"], keep="first")
+        final_count = len(combined)
+        if raw_count != final_count:
+            print(f"   Removed {raw_count - final_count:,} duplicate security_ids")
 
-        # ── Classify exchange (vectorised via list-comp) ─────
-        print("   Classifying exchanges…")
-        df["mapped_exchange"] = [
-            _classify_exchange(e, i)
-            for e, i in zip(df["SEM_EXM_EXCH_ID"], df["SEM_INSTRUMENT_NAME"])
-        ]
+        print(f"   Total rows to insert: {final_count:,}")
 
-        classified   = int(df["mapped_exchange"].notna().sum())
-        dropped_rows = total_raw - classified
-        print(f"   Classified: {classified:,}  |  Dropped: {dropped_rows:,}")
-
-        # Per-exchange breakdown — helpful for debugging
-        breakdown = (
-            df[df["mapped_exchange"].notna()]["mapped_exchange"]
-            .value_counts()
-            .to_dict()
-        )
-        for exch, cnt in sorted(breakdown.items()):
-            print(f"     {exch}: {cnt:,}")
-
-        # Log top dropped combos so we can catch new instrument types
-        dropped_df = df[df["mapped_exchange"].isna()]
-        if not dropped_df.empty:
-            top_dropped = (
-                (dropped_df["SEM_EXM_EXCH_ID"] + "/" + dropped_df["SEM_INSTRUMENT_NAME"])
-                .value_counts()
-                .head(15)
-                .to_dict()
-            )
-            print("   Top dropped exchange/instrument combos:")
-            for combo, cnt in top_dropped.items():
-                print(f"     {combo}: {cnt:,}")
-
-        # ── Filter & build final columns ─────────────────────
-        df = df[df["mapped_exchange"].notna()].copy()
-
-        df["security_id"] = (
-            df["SEM_SMST_SECURITY_ID"]
-            .str.replace(r"\.0$", "", regex=True)
-            .str.strip()
-        )
-        df["stock_symbol"] = df["SEM_TRADING_SYMBOL"].str.strip()
-        df["min_qty"] = df["SEM_LOT_UNITS"].apply(lambda x: max(1, _safe_int(x, 1)))
-
-        # Drop rows with empty security_id or stock_symbol
-        df = df[(df["security_id"] != "") & (df["stock_symbol"] != "")].copy()
-
-        # Deduplicate on security_id — keep first occurrence
-        before_dedup = len(df)
-        df = df.drop_duplicates(subset=["security_id"], keep="first")
-        deduped = before_dedup - len(df)
-        if deduped:
-            print(f"   Removed {deduped:,} duplicate security_ids")
-
-        final_rows = len(df)
-        print(f"   Final rows to insert: {final_rows:,}")
-
-        # ── Build tuples for batch insert ────────────────────
         records = list(zip(
-            df["security_id"],
-            df["mapped_exchange"],
-            df["stock_symbol"],
-            df["min_qty"].astype(int),
-            df["SEM_EXM_EXCH_ID"],
-            df["SEM_INSTRUMENT_NAME"],
+            combined["security_id"],
+            combined["exchange"],
+            combined["stock_symbol"],
+            combined["min_qty"].astype(int),
         ))
 
         # ── Atomic TRUNCATE + INSERT ─────────────────────────
@@ -772,9 +732,8 @@ def refresh_symbol_db_from_dhan(force: bool = False) -> Dict[str, Any]:
                     cur,
                     """
                     INSERT INTO symbol_master
-                        (security_id, exchange, stock_symbol, min_qty,
-                         raw_exchange, raw_instrument, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                        (security_id, exchange, stock_symbol, min_qty, updated_at)
+                    VALUES (%s, %s, %s, %s, NOW())
                     """,
                     records,
                     page_size=5000,
@@ -784,18 +743,16 @@ def refresh_symbol_db_from_dhan(force: bool = False) -> Dict[str, Any]:
         meta = {
             "trade_date_ist":   _today_ist_str(),
             "refreshed_at_utc": utcnow_iso(),
-            "row_count":        final_rows,
-            "total_raw_rows":   total_raw,
-            "dropped_rows":     dropped_rows,
-            "by_exchange":      breakdown,
-            "source":           DHAN_SCRIP_MASTER_URL,
+            "row_count":        final_count,
+            "by_exchange":      dl_counts,
+            "failed_exchanges": dl_errors,
+            "source":           MOSL_SCRIP_BASE_URL,
         }
         _set_symbol_refresh_meta(meta)
 
         print(
-            f"✅ [SYMBOLS] Done — {final_rows:,} rows in DB "
-            f"(from {total_raw:,} raw, dropped {dropped_rows:,}) "
-            f"date={meta['trade_date_ist']}"
+            f"✅ [SYMBOLS] Done — {final_count:,} rows  "
+            f"by_exchange={dl_counts}  date={meta['trade_date_ist']}"
         )
         return {"status": "success", **meta}
 
@@ -834,13 +791,13 @@ def symbol_refresh_scheduler_loop():
         try:
             secs    = _seconds_until_next_8am_ist()
             next_dt = _ist_datetime_now() + timedelta(seconds=secs)
-            print(f"⏳ [SYMBOLS] Next refresh at {next_dt.strftime('%Y-%m-%d %H:%M')} IST ({secs / 3600:.1f}h away)")
+            print(f"⏳ [SYMBOLS] Next refresh at {next_dt.strftime('%Y-%m-%d %H:%M')} IST ({secs/3600:.1f}h away)")
             time.sleep(secs)
             print("🔄 [SYMBOLS] Daily 08:00 IST refresh starting…")
             refresh_symbol_db_from_dhan(force=True)
         except Exception as e:
             print(f"❌ [SYMBOLS] Daily refresh error: {e}")
-            time.sleep(300)   # retry in 5 min on failure
+            time.sleep(300)
 
 
 def start_symbol_refresh_thread():
@@ -1071,7 +1028,8 @@ def get_clients(request: Request, userid: str = None, user_id: str = None):
 
     try:
         rows = db_execute(
-            "SELECT * FROM clients WHERE owner_userid=%s ORDER BY name", (uid,), fetch="all"
+            "SELECT * FROM clients WHERE owner_userid=%s ORDER BY name",
+            (uid,), fetch="all",
         ) or []
     except Exception as e:
         return {"clients": [], "error": str(e)}
@@ -1080,7 +1038,7 @@ def get_clients(request: Request, userid: str = None, user_id: str = None):
     for row in rows:
         client_id = row["userid"]
         sess = mofsl_sessions.get(client_id)
-        sa = bool(
+        sa   = bool(
             sess
             and _norm_uid(sess.get("owner_userid", "")) == uid
             and _session_fresh(sess)
@@ -1116,8 +1074,7 @@ async def delete_client(request: Request, payload: dict = Body(...)):
                 (owner_userid, cuid), fetch="one",
             )
             if not row:
-                missing.append(cuid)
-                continue
+                missing.append(cuid); continue
             db_execute("DELETE FROM clients WHERE owner_userid=%s AND userid=%s", (owner_userid, cuid))
             mofsl_sessions.pop(cuid, None)
             deleted.append(cuid)
@@ -1182,9 +1139,9 @@ def search_symbols(q: str = Query(""), exchange: str = Query("")):
     sql = f"""
         SELECT exchange, stock_symbol, security_id,
             CASE
-                WHEN LOWER(stock_symbol) = %s          THEN 0
-                WHEN LOWER(stock_symbol) LIKE %s        THEN 1
-                WHEN LOWER(stock_symbol) LIKE %s        THEN 2
+                WHEN LOWER(stock_symbol) = %s         THEN 0
+                WHEN LOWER(stock_symbol) LIKE %s       THEN 1
+                WHEN LOWER(stock_symbol) LIKE %s       THEN 2
                 ELSE 3
             END AS rank_score
         FROM symbol_master
@@ -1477,15 +1434,13 @@ def get_orders(request: Request, userid: str = None, user_id: str = None):
 
     for client_id, sess in list(mofsl_sessions.items()):
         try:
-            if not isinstance(sess, dict):
-                continue
+            if not isinstance(sess, dict): continue
             if owner_userid and str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
                 continue
             name  = sess.get("name", "") or client_id
             mofsl = sess.get("mofsl")
             uid   = sess.get("userid", client_id)
-            if not mofsl or not uid:
-                continue
+            if not mofsl or not uid: continue
 
             today = datetime.now().strftime("%d-%b-%Y 09:00:00")
             resp  = mofsl.GetOrderBook({"clientcode": uid, "datetimestamp": today})
@@ -1544,9 +1499,7 @@ async def cancel_order(request: Request, payload: dict = Body(...)):
         oid  = order.get("order_id")
         sess = find_sess(order)
         if not sess:
-            with lock:
-                messages.append(f"❌ Session not found for {order.get('name', '?')}")
-            return
+            with lock: messages.append(f"❌ Session not found for {order.get('name', '?')}"); return
         try:
             resp = sess["mofsl"].CancelOrder(oid, sess["userid"])
             msg  = (resp.get("message", "") or "").lower()
@@ -1556,13 +1509,11 @@ async def cancel_order(request: Request, payload: dict = Body(...)):
                     f"{oid} for {sess.get('name', '')}: {resp.get('message', '')}"
                 )
         except Exception as e:
-            with lock:
-                messages.append(f"❌ Error cancelling {oid}: {e}")
+            with lock: messages.append(f"❌ Error cancelling {oid}: {e}")
 
     for o in orders:
         t = threading.Thread(target=cancel_one, args=(o,)); t.start(); threads.append(t)
-    for t in threads:
-        t.join()
+    for t in threads: t.join()
     return {"message": messages}
 
 
@@ -1578,22 +1529,18 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
 
     for client_id, sess in list(mofsl_sessions.items()):
         try:
-            if not isinstance(sess, dict):
-                continue
+            if not isinstance(sess, dict): continue
             if owner_userid and str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
                 continue
             name  = str(sess.get("name", "") or client_id)
             mofsl = sess.get("mofsl")
             uid   = str(sess.get("userid", client_id))
-            if not mofsl or not uid:
-                continue
+            if not mofsl or not uid: continue
 
             resp = mofsl.GetPosition()
-            if not resp or resp.get("status") != "SUCCESS":
-                continue
+            if not resp or resp.get("status") != "SUCCESS": continue
             positions = resp.get("data") or []
-            if not isinstance(positions, list):
-                continue
+            if not isinstance(positions, list): continue
 
             for pos in positions:
                 bq       = float(pos.get("buyquantity") or 0)
@@ -1702,8 +1649,7 @@ async def close_position(request: Request, payload: dict = Body(...)):
 
     for p in positions:
         t = threading.Thread(target=close_one, args=(p,)); t.start(); threads.append(t)
-    for t in threads:
-        t.join()
+    for t in threads: t.join()
     return {"message": messages}
 
 
@@ -1816,7 +1762,6 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
             if not resp or resp.get("status") != "SUCCESS": continue
 
             invested = 0.0; total_pnl = 0.0
-
             for h in (resp.get("data") or []):
                 symbol    = (h.get("scripname") or "").strip()
                 qty       = float(h.get("dpquantity", 0) or 0)
@@ -1995,21 +1940,21 @@ async def place_order(request: Request, payload: dict = Body(...)):
         if sess_owner and sess_owner != str(owner_userid).strip():
             with lock: responses[key] = {"status": "ERROR", "message": "Session belongs to another user"}; return
         order_payload = {
-            "clientcode":       str(sess.get("userid") or client_id),
-            "exchange":         exch,
-            "symboltoken":      int(symboltoken),
-            "buyorsell":        action,
-            "ordertype":        ordertype,
-            "producttype":      producttype,
-            "orderduration":    orderduration,
-            "price":            float(price),
-            "triggerprice":     float(triggerprice),
-            "quantityinlot":    int(max(1, qty)),
+            "clientcode":        str(sess.get("userid") or client_id),
+            "exchange":          exch,
+            "symboltoken":       int(symboltoken),
+            "buyorsell":         action,
+            "ordertype":         ordertype,
+            "producttype":       producttype,
+            "orderduration":     orderduration,
+            "price":             float(price),
+            "triggerprice":      float(triggerprice),
+            "quantityinlot":     int(max(1, qty)),
             "disclosedquantity": int(disclosedquantity),
-            "amoorder":         amoorder,
-            "algoid":           "",
-            "goodtilldate":     "",
-            "tag":              tag or "",
+            "amoorder":          amoorder,
+            "algoid":            "",
+            "goodtilldate":      "",
+            "tag":               tag or "",
         }
         try:
             resp = sess["mofsl"].PlaceOrder(order_payload)
@@ -2019,8 +1964,7 @@ async def place_order(request: Request, payload: dict = Body(...)):
 
     for (tag, cid, q) in targets:
         t = threading.Thread(target=_place_one, args=(tag, cid, q)); t.start(); threads.append(t)
-    for t in threads:
-        t.join()
+    for t in threads: t.join()
     return {"success": True, "responses": responses}
 
 
@@ -2125,8 +2069,7 @@ def modify_order(request: Request, payload: dict = Body(...)) -> Dict[str, Any]:
                 if isinstance(resp, dict) and resp.get("status") == "SUCCESS":
                     d    = resp.get("data")
                     snap = d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else None)
-            except Exception:
-                pass
+            except Exception: pass
             if not snap:
                 try:
                     ts = now_ist_str().split(" ")[0] + " 09:00:00"
@@ -2134,8 +2077,7 @@ def modify_order(request: Request, payload: dict = Body(...)) -> Dict[str, Any]:
                     for r2 in ((ob.get("data") or []) if isinstance(ob, dict) else []):
                         if str(r2.get("uniqueorderid", "")) == str(oid):
                             snap = r2; break
-                except Exception:
-                    pass
+                except Exception: pass
             snap = snap or {}
 
             shares = qty_in if _pos(qty_in) else (_ni(snap.get("orderqty")) or 0)
@@ -2157,13 +2099,13 @@ def modify_order(request: Request, payload: dict = Body(...)) -> Dict[str, Any]:
 
             ui_type = _ui_to_mo(row.get("orderType") or row.get("ordertype")) or _infer_type(snap)
             out = {
-                "clientcode":          uid,
-                "uniqueorderid":       oid,
-                "newordertype":        ui_type or "MARKET",
-                "neworderduration":    str(row.get("validity") or "DAY").upper(),
+                "clientcode":           uid,
+                "uniqueorderid":        oid,
+                "newordertype":         ui_type or "MARKET",
+                "neworderduration":     str(row.get("validity") or "DAY").upper(),
                 "newdisclosedquantity": 0,
-                "lastmodifiedtime":    last_mod,
-                "newquantityinlot":    lots,
+                "lastmodifiedtime":     last_mod,
+                "newquantityinlot":     lots,
             }
             if _pos(_nf(price_in)): out["newprice"]        = float(price_in)
             if _pos(_nf(trig_in)):  out["newtriggerprice"] = float(trig_in)
@@ -2192,8 +2134,7 @@ def modify_order(request: Request, payload: dict = Body(...)) -> Dict[str, Any]:
 
 
 # ─────────────────────────────────────────────────────────────
-# Copy Trading Engine
-# Pure polling, 1s loop, 5s order window
+# Copy Trading Engine — pure polling, 1s loop, 5s order window
 # ─────────────────────────────────────────────────────────────
 order_mapping:                Dict = {}
 processed_order_ids_placed:   Dict = {}
@@ -2334,24 +2275,21 @@ def process_copy_order(order: dict, setup: dict):
 
         for child_id in children:
             child_id = str(child_id).strip()
-            if not child_id:
-                continue
+            if not child_id: continue
 
             sess = mofsl_sessions.get(child_id)
             if not (isinstance(sess, dict) and sess.get("mofsl") and _session_fresh(sess)):
                 print(f"🔁 [COPY] Re-logging child={child_id}")
                 cobj = _load_client_from_db(owner, child_id)
-                if cobj:
-                    motilal_login(cobj)
+                if cobj: motilal_login(cobj)
                 sess = mofsl_sessions.get(child_id)
 
             if not (isinstance(sess, dict) and sess.get("mofsl")):
-                print(f"❌ [COPY] No session child={child_id} — skipping")
-                continue
+                print(f"❌ [COPY] No session child={child_id} — skipping"); continue
 
-            mult     = float(multipliers.get(child_id, 1) or 1)
+            mult      = float(multipliers.get(child_id, 1) or 1)
             total_qty = master_qty * mult
-            qty_lot  = max(1, int(total_qty // min_qty))
+            qty_lot   = max(1, int(total_qty // min_qty))
 
             child_order = {
                 "clientcode":        sess["userid"],
@@ -2395,8 +2333,7 @@ def process_copy_order(order: dict, setup: dict):
             return
         for child_id, coid in child_map.items():
             sess = mofsl_sessions.get(child_id)
-            if not (isinstance(sess, dict) and sess.get("mofsl")):
-                continue
+            if not (isinstance(sess, dict) and sess.get("mofsl")): continue
             try:
                 resp = sess["mofsl"].CancelOrder(coid, sess["userid"])
                 print(f"✅ [COPY] Cancel propagated child={child_id} coid={coid} resp={resp}")
@@ -2413,24 +2350,20 @@ def synchronize_copy_trading():
     def handle_setup(setup):
         master_id = str(setup.get("master") or "").strip()
         owner     = str(setup.get("owner_userid") or "").strip()
-        if not master_id or not owner:
-            return
+        if not master_id or not owner: return
         orders = _fetch_master_orders(master_id, owner)
-        if not orders:
-            return
+        if not orders: return
         order_threads = []
         for order in orders:
             t = threading.Thread(target=process_copy_order, args=(order, setup), daemon=True)
             t.start(); order_threads.append(t)
-        for t in order_threads:
-            t.join()
+        for t in order_threads: t.join()
 
     setup_threads = []
     for setup in setups:
         t = threading.Thread(target=handle_setup, args=(setup,), daemon=True)
         t.start(); setup_threads.append(t)
-    for t in setup_threads:
-        t.join()
+    for t in setup_threads: t.join()
 
 
 def motilal_copy_trading_loop():
