@@ -1708,6 +1708,79 @@ def debug_positions_raw(request: Request, userid: str = None, user_id: str = Non
 
     return {"count": len(result), "positions": result}
 
+
+@app.get("/debug_full_positions")
+def debug_full_positions(request: Request, userid: str = None, user_id: str = None):
+    owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
+    positions_data = {"open": [], "closed": []}
+
+    for client_id, sess in list(mofsl_sessions.items()):
+        try:
+            if not isinstance(sess, dict):
+                continue
+            if owner_userid and str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
+                continue
+            mofsl = sess.get("mofsl")
+            uid   = str(sess.get("userid", client_id))
+            name  = str(sess.get("name", "") or client_id)
+            if not mofsl or not uid:
+                continue
+
+            response  = mofsl.GetPosition()
+            positions = (response or {}).get("data", [])
+            if not isinstance(positions, list):
+                positions = []
+
+            for pos in positions:
+                bq = _safe_float(pos.get("buyquantity"),  0.0)
+                sq = _safe_float(pos.get("sellquantity"), 0.0)
+                ba = _safe_float(pos.get("buyamount"),    0.0)
+                sa = _safe_float(pos.get("sellamount"),   0.0)
+
+                if bq == 0 and sq == 0:
+                    bq = _safe_float(pos.get("daybuyquantity"),  0.0)
+                    sq = _safe_float(pos.get("daysellquantity"), 0.0)
+                    ba = _safe_float(pos.get("daybuyamount"),    0.0)
+                    sa = _safe_float(pos.get("daysellamount"),   0.0)
+
+                quantity = int(round(bq - sq))
+                buy_avg  = round(ba / bq, 2) if bq > 0 else 0.0
+                sell_avg = round(sa / sq, 2) if sq > 0 else 0.0
+                ltp      = _safe_float(pos.get("LTP"), 0.0)
+
+                if quantity > 0:
+                    net_profit = round((ltp - buy_avg) * quantity, 2) if ltp else 0.0
+                elif quantity < 0:
+                    net_profit = round((sell_avg - ltp) * abs(quantity), 2) if ltp else 0.0
+                else:
+                    net_profit = _safe_float(
+                        pos.get("actualbookedprofitloss") or pos.get("bookedprofitloss"), 0.0
+                    )
+                    if net_profit == 0 and bq > 0 and sq > 0:
+                        net_profit = round((sell_avg - buy_avg) * min(bq, sq), 2)
+
+                bucket = "closed" if quantity == 0 else "open"
+
+                positions_data[bucket].append({
+                    "name":       name,
+                    "client_id":  uid,
+                    "symbol":     pos.get("symbol"),
+                    "quantity":   quantity,
+                    "buy_avg":    buy_avg,
+                    "sell_avg":   sell_avg,
+                    "net_profit": net_profit,
+                    "bucket":     bucket,
+                })
+
+        except Exception as e:
+            positions_data.setdefault("errors", []).append(f"{client_id}: {e}")
+
+    return {
+        "open_count":   len(positions_data["open"]),
+        "closed_count": len(positions_data["closed"]),
+        "positions":    positions_data,
+
+
     
 
 @app.post("/close_position")
