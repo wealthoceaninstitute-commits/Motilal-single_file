@@ -1543,50 +1543,103 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
             if not isinstance(positions, list): continue
 
             for pos in positions:
-                bq       = float(pos.get("buyquantity") or 0)
-                sq       = float(pos.get("sellquantity") or 0)
-                qty      = bq - sq
-                ba       = float(pos.get("buyamount") or 0)
-                sa       = float(pos.get("sellamount") or 0)
-                buy_avg  = (ba / bq) if bq else 0.0
-                sell_avg = (sa / sq) if sq else 0.0
-                ltp      = float(pos.get("LTP") or 0)
-                bp       = float(pos.get("bookedprofitloss") or 0)
-                symbol   = str(pos.get("symbol") or "")
-                exchange = str(pos.get("exchange") or "")
+                # ── net quantities (carry-forward + day) ──────────────────
+                bq   = float(pos.get("buyquantity")  or 0)
+                sq   = float(pos.get("sellquantity") or 0)
+
+                # ── day-only quantities ───────────────────────────────────
+                dbq  = float(pos.get("daybuyquantity")  or 0)
+                dsq  = float(pos.get("daysellquantity") or 0)
+
+                # ── carry-forward quantities ──────────────────────────────
+                cfbq = float(pos.get("cfbuyquantity")  or 0)
+                cfsq = float(pos.get("cfsellquantity") or 0)
+
+                # ── amounts ───────────────────────────────────────────────
+                ba   = float(pos.get("buyamount")  or 0)
+                sa   = float(pos.get("sellamount") or 0)
+
+                # ── day amounts ───────────────────────────────────────────
+                dba  = float(pos.get("daybuyamount")  or 0)
+                dsa  = float(pos.get("daysellamount") or 0)
+
+                # ── P&L fields ────────────────────────────────────────────
+                bp   = float(pos.get("actualbookedprofitloss") or pos.get("bookedprofitloss") or 0)
+                mtm  = float(pos.get("actualmarktomarket")     or pos.get("marktomarket")     or 0)
+
+                ltp  = float(pos.get("LTP") or 0)
+
+                symbol   = str(pos.get("symbol")      or "")
+                exchange = str(pos.get("exchange")    or "")
                 token    = str(pos.get("symboltoken") or "")
                 product  = str(pos.get("productname") or "")
 
-                # FIX 1: net_profit for closed positions — use actual traded amounts
-                # instead of bookedprofitloss which is often 0 from the API.
-                # Closed = bq > 0 and sq > 0 and qty == 0 (fully squared off).
-                if qty > 0:
-                    net = (ltp - buy_avg) * qty
-                elif qty < 0:
-                    net = (sell_avg - buy_avg) * abs(qty)
-                else:
-                    # qty == 0: position is closed
-                    # Prefer (sell_avg - buy_avg) * traded_qty when we have both sides,
-                    # fall back to bookedprofitloss if only one side exists (edge case).
-                    if bq > 0 and sq > 0:
-                        net = (sell_avg - buy_avg) * bq
-                    else:
-                        net = bp
+                # ── net open quantity: what you are still holding ─────────
+                # MOSL: buyquantity and sellquantity already represent
+                # the net open qty (positive=long, negative=short).
+                # For a fully squared-off intraday trade both are 0.
+                net_qty = bq - sq
 
-                # FIX 2: also save meta for closed positions so they can be
-                # re-used if needed, keyed by (uid, symbol).
+                # ── averages ──────────────────────────────────────────────
+                # Use day amounts when net amounts are 0 (pure intraday)
+                eff_bq = bq if bq else dbq
+                eff_sq = sq if sq else dsq
+                eff_ba = ba if ba else dba
+                eff_sa = sa if sa else dsa
+
+                buy_avg  = (eff_ba / eff_bq) if eff_bq else 0.0
+                sell_avg = (eff_sa / eff_sq) if eff_sq else 0.0
+
+                # ── was anything traded today at all? ─────────────────────
+                any_day_traded = (dbq > 0 or dsq > 0)
+
+                # ── net profit calculation ────────────────────────────────
+                if net_qty > 0:
+                    # Still long — unrealised P&L using LTP
+                    net = (ltp - buy_avg) * net_qty if ltp else mtm
+                elif net_qty < 0:
+                    # Still short — unrealised P&L using LTP
+                    net = (sell_avg - ltp) * abs(net_qty) if ltp else mtm
+                else:
+                    # Fully closed (net_qty == 0)
+                    # Priority 1: actualbookedprofitloss (most reliable when API fills it)
+                    # Priority 2: reconstruct from day traded amounts (intraday square-off)
+                    # Priority 3: reconstruct from net amounts (CF square-off)
+                    if bp != 0:
+                        net = bp
+                    elif dbq > 0 and dsq > 0:
+                        # Pure intraday: sold what was bought today
+                        traded_qty = min(dbq, dsq)
+                        net = (sell_avg - buy_avg) * traded_qty
+                    elif cfbq > 0 or cfsq > 0:
+                        # CF position squared off today
+                        traded_qty = max(cfbq, cfsq, dbq, dsq)
+                        net = (sell_avg - buy_avg) * traded_qty if traded_qty else bp
+                    else:
+                        net = bp  # fallback
+
+                # ── save meta for ALL positions (open & closed) ───────────
                 if symbol:
                     new_meta[(uid, symbol)] = {
-                        "exchange": exchange, "symboltoken": token,
-                        "producttype": product, "client_id": uid,
+                        "exchange":    exchange,
+                        "symboltoken": token,
+                        "producttype": product,
+                        "client_id":   uid,
                     }
 
                 row = {
-                    "name": name, "client_id": uid, "symbol": symbol,
-                    "quantity": qty, "buy_avg": round(buy_avg, 2),
-                    "sell_avg": round(sell_avg, 2), "net_profit": round(net, 2),
+                    "name":       name,
+                    "client_id":  uid,
+                    "symbol":     symbol,
+                    "quantity":   net_qty,
+                    "buy_avg":    round(buy_avg,  2),
+                    "sell_avg":   round(sell_avg, 2),
+                    "net_profit": round(net,      2),
                 }
-                (positions_data["closed"] if qty == 0 else positions_data["open"]).append(row)
+
+                bucket = "open" if net_qty != 0 else "closed"
+                positions_data[bucket].append(row)
+
         except Exception as e:
             print(f"❌ Error fetching positions for {client_id}: {e}")
 
