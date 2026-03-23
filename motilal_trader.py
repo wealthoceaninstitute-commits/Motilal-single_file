@@ -1529,132 +1529,81 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
 
     for client_id, sess in list(mofsl_sessions.items()):
         try:
-            if not isinstance(sess, dict): 
-                continue
-
+            if not isinstance(sess, dict): continue
             if owner_userid and str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
                 continue
-
             name  = str(sess.get("name", "") or client_id)
             mofsl = sess.get("mofsl")
             uid   = str(sess.get("userid", client_id))
+            if not mofsl or not uid: continue
 
-            if not mofsl or not uid:
+            # ── Exact same call as working desktop app ────────
+            response = mofsl.GetPosition()
+            if response and response.get("status") != "SUCCESS":
                 continue
-
-            # Fetch positions
-            try:
-                resp = mofsl.GetPosition(uid)
-            except TypeError:
-                resp = mofsl.GetPosition()
-
-            if not resp or resp.get("status") != "SUCCESS":
-                print(f"⚠️ [POS] {name} ({uid}): Failed")
-                continue
-
-            positions = resp.get("data") or []
+            positions = response.get("data", []) if response else []
             if not isinstance(positions, list):
-                continue
-
-            print(f"✅ [POS] {name} ({uid}): {len(positions)} rows")
+                positions = []
 
             for pos in positions:
-                try:
-                    # ---- Raw values ----
-                    bq   = float(pos.get("buyquantity") or 0)
-                    sq   = float(pos.get("sellquantity") or 0)
+                # ── Desktop app logic (proven to work) ────────
+                bq = float(pos.get("buyquantity") or 0)
+                sq = float(pos.get("sellquantity") or 0)
+                quantity = int(round(bq - sq))
 
-                    dbq  = float(pos.get("daybuyquantity") or 0)
-                    dsq  = float(pos.get("daysellquantity") or 0)
+                ba = float(pos.get("buyamount") or 0)
+                sa = float(pos.get("sellamount") or 0)
 
-                    cfbq = float(pos.get("cfbuyquantity") or 0)
-                    cfsq = float(pos.get("cfsellquantity") or 0)
+                buy_avg  = (ba / bq) if bq > 0 else 0.0
+                sell_avg = (sa / sq) if sq > 0 else 0.0
 
-                    ba   = float(pos.get("buyamount") or 0)
-                    sa   = float(pos.get("sellamount") or 0)
+                ltp          = float(pos.get("LTP") or 0)
+                booked_profit = float(
+                    pos.get("actualbookedprofitloss")
+                    or pos.get("bookedprofitloss")
+                    or 0
+                )
 
-                    ltp  = float(pos.get("LTP") or 0)
+                if quantity > 0:
+                    net_profit = (ltp - buy_avg) * quantity
+                elif quantity < 0:
+                    net_profit = (sell_avg - buy_avg) * abs(quantity)
+                else:
+                    net_profit = booked_profit
 
-                    bp   = float(
-                        pos.get("actualbookedprofitloss")
-                        or pos.get("bookedprofitloss")
-                        or 0
-                    )
+                symbol      = str(pos.get("symbol")      or "")
+                exchange    = str(pos.get("exchange")    or "")
+                token       = str(pos.get("symboltoken") or "")
+                producttype = str(pos.get("productname") or "")
 
-                    mtm  = float(
-                        pos.get("actualmarktomarket")
-                        or pos.get("marktomarket")
-                        or 0
-                    )
-
-                    symbol   = str(pos.get("symbol") or "")
-                    exchange = str(pos.get("exchange") or "")
-                    token    = str(pos.get("symboltoken") or "")
-                    product  = str(pos.get("productname") or "")
-
-                    if not symbol:
-                        continue
-
-                    # ---- FIX 1: Use TOTAL qty (more reliable than CF+DAY sum) ----
-                    net_qty_raw = bq - sq
-
-                    # ---- FIX 2: eliminate float garbage ----
-                    net_qty = int(round(net_qty_raw))
-
-                    total_buy_qty = max(bq, cfbq + dbq)
-                    total_sel_qty = max(sq, cfsq + dsq)
-
-                    buy_avg  = (ba / total_buy_qty) if total_buy_qty else 0.0
-                    sell_avg = (sa / total_sel_qty) if total_sel_qty else 0.0
-
-                    # ---- PnL Calculation ----
-                    if net_qty > 0:
-                        net = (ltp - buy_avg) * net_qty if ltp else mtm
-
-                    elif net_qty < 0:
-                        net = (sell_avg - ltp) * abs(net_qty) if ltp else mtm
-
-                    else:
-                        # CLOSED POSITION
-                        if bp != 0:
-                            net = bp
-                        else:
-                            closed_qty = min(total_buy_qty, total_sel_qty)
-                            net = (sell_avg - buy_avg) * closed_qty if closed_qty else 0.0
-
-                    bucket = "open" if net_qty != 0 else "closed"
-
-                    print(f"   {symbol} → net_qty={net_qty} → {bucket}")
-
-                    # ---- Store meta for close_position ----
+                if symbol:
                     new_meta[(uid, symbol)] = {
                         "exchange":    exchange,
                         "symboltoken": token,
-                        "producttype": product,
+                        "producttype": producttype,
                         "client_id":   uid,
                     }
 
-                    positions_data[bucket].append({
-                        "name":       name,
-                        "client_id":  uid,
-                        "symbol":     symbol,
-                        "quantity":   net_qty,
-                        "buy_avg":    round(buy_avg, 2),
-                        "sell_avg":   round(sell_avg, 2),
-                        "net_profit": round(net, 2),
-                    })
+                row = {
+                    "name":       name,
+                    "client_id":  uid,
+                    "symbol":     symbol,
+                    "quantity":   quantity,
+                    "buy_avg":    round(buy_avg,    2),
+                    "sell_avg":   round(sell_avg,   2),
+                    "net_profit": round(net_profit, 2),
+                }
 
-                except Exception as inner_e:
-                    print(f"❌ Row error: {inner_e}")
+                if quantity == 0:
+                    positions_data["closed"].append(row)
+                else:
+                    positions_data["open"].append(row)
 
         except Exception as e:
-            print(f"❌ [POS] Error for {client_id}: {e}")
-
-    print(f"[POS] Done — open={len(positions_data['open'])} closed={len(positions_data['closed'])}")
+            print(f"❌ Error fetching positions for {client_id}: {e}")
 
     with _position_meta_lock:
         position_meta = new_meta
-
     return positions_data
     
 
