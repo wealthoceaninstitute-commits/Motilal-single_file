@@ -1547,16 +1547,18 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
 
     for client_id, sess in list(mofsl_sessions.items()):
         try:
-            if not isinstance(sess, dict): continue
+            if not isinstance(sess, dict):
+                continue
             if owner_userid and str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
                 continue
             name  = str(sess.get("name", "") or client_id)
             mofsl = sess.get("mofsl")
             uid   = str(sess.get("userid", client_id))
-            if not mofsl or not uid: continue
+            if not mofsl or not uid:
+                continue
 
             response = mofsl.GetPosition()
-            if response and response.get("status") != "SUCCESS":
+            if not response or response.get("status") != "SUCCESS":
                 continue
             positions = response.get("data", []) if response else []
             if not isinstance(positions, list):
@@ -1564,11 +1566,26 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
 
             for pos in positions:
                 try:
-                    # ── Cast everything explicitly — API may return strings ──
+                    symbol      = str(pos.get("symbol")      or "")
+                    exchange    = str(pos.get("exchange")     or "")
+                    token       = str(pos.get("symboltoken")  or "")
+                    producttype = str(pos.get("productname")  or "")
+
+                    if not symbol:
+                        continue
+
+                    # ── Use gross buy/sell quantities (includes CF + day) ──
                     bq = _safe_float(pos.get("buyquantity"),  0.0)
                     sq = _safe_float(pos.get("sellquantity"), 0.0)
                     ba = _safe_float(pos.get("buyamount"),    0.0)
                     sa = _safe_float(pos.get("sellamount"),   0.0)
+
+                    # Fallback to day quantities if gross fields are missing/zero
+                    if bq == 0 and sq == 0:
+                        bq = _safe_float(pos.get("daybuyquantity"),  0.0)
+                        sq = _safe_float(pos.get("daysellquantity"), 0.0)
+                        ba = _safe_float(pos.get("daybuyamount"),    0.0)
+                        sa = _safe_float(pos.get("daysellamount"),   0.0)
 
                     quantity = int(round(bq - sq))
 
@@ -1576,31 +1593,36 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
                     sell_avg = (sa / sq) if sq > 0 else 0.0
 
                     ltp = _safe_float(pos.get("LTP"), 0.0)
-                    bp  = _safe_float(
-                        pos.get("actualbookedprofitloss")
-                        or pos.get("bookedprofitloss"), 0.0
-                    )
-                    mtm = _safe_float(
-                        pos.get("actualmarktomarket")
-                        or pos.get("marktomarket"), 0.0
-                    )
 
+                    # ── P&L calculation per bucket ──
                     if quantity > 0:
-                        net_profit = (ltp - buy_avg) * quantity if ltp else mtm
-                    elif quantity < 0:
-                        net_profit = (sell_avg - ltp) * abs(quantity) if ltp else mtm
-                    else:
-                        net_profit = bp if bp != 0 else (
-                            (sell_avg - buy_avg) * min(bq, sq) if min(bq, sq) else 0.0
+                        # Long open position
+                        net_profit = (ltp - buy_avg) * quantity if ltp else _safe_float(
+                            pos.get("actualmarktomarket") or pos.get("marktomarket"), 0.0
                         )
+                    elif quantity < 0:
+                        # Short open position
+                        net_profit = (sell_avg - ltp) * abs(quantity) if ltp else _safe_float(
+                            pos.get("actualmarktomarket") or pos.get("marktomarket"), 0.0
+                        )
+                    else:
+                        # Fully squared off — use booked P&L directly
+                        net_profit = _safe_float(
+                            pos.get("actualbookedprofitloss")
+                            or pos.get("bookedprofitloss"),
+                            0.0
+                        )
+                        # Secondary fallback: compute from avg prices
+                        if net_profit == 0 and bq > 0 and sq > 0:
+                            traded_qty = min(bq, sq)
+                            net_profit = (sell_avg - buy_avg) * traded_qty
 
-                    symbol      = str(pos.get("symbol")      or "")
-                    exchange    = str(pos.get("exchange")    or "")
-                    token       = str(pos.get("symboltoken") or "")
-                    producttype = str(pos.get("productname") or "")
+                    bucket = "closed" if quantity == 0 else "open"
 
-                    if not symbol:
-                        continue
+                    print(
+                        f"   {name} | {symbol} | bq={bq} sq={sq} | "
+                        f"qty={quantity} → {bucket} | pnl={round(net_profit, 2)}"
+                    )
 
                     new_meta[(uid, symbol)] = {
                         "exchange":    exchange,
@@ -1608,9 +1630,6 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
                         "producttype": producttype,
                         "client_id":   uid,
                     }
-
-                    bucket = "closed" if quantity == 0 else "open"
-                    print(f"   {name} | {symbol} | bq={bq} sq={sq} | qty={quantity} → {bucket} | pnl={round(net_profit,2)}")
 
                     positions_data[bucket].append({
                         "name":       name,
@@ -1623,7 +1642,7 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
                     })
 
                 except Exception as row_e:
-                    print(f"❌ Row error {name} {pos.get('symbol','?')}: {row_e}")
+                    print(f"❌ Row error {name} {pos.get('symbol', '?')}: {row_e}")
 
         except Exception as e:
             print(f"❌ Error fetching positions for {client_id}: {e}")
