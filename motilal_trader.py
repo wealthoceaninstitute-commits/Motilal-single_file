@@ -1662,46 +1662,44 @@ def debug_positions_raw(request: Request, userid: str = None, user_id: str = Non
 
     for client_id, sess in list(mofsl_sessions.items()):
         try:
-            if not isinstance(sess, dict): continue
+            if not isinstance(sess, dict):
+                continue
             if owner_userid and str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
                 continue
             name  = str(sess.get("name", "") or client_id)
             mofsl = sess.get("mofsl")
             uid   = str(sess.get("userid", client_id))
-            if not mofsl or not uid: continue
+            if not mofsl or not uid:
+                continue
 
             resp = mofsl.GetPosition()
             positions = (resp or {}).get("data") or []
 
             for pos in (positions if isinstance(positions, list) else []):
                 symbol = str(pos.get("symbol") or "")
-                # Only show Reliance to keep output small
                 if "RELIANCE" not in symbol.upper():
                     continue
+                raw_copy = dict(pos)
                 result.append({
-                    "client":          name,
-                    "uid":             uid,
-                    "symbol":          symbol,
-                    # ── the key quantity fields ──
-                    "buyquantity":     pos.get("buyquantity"),
-                    "sellquantity":    pos.get("sellquantity"),
-                    "daybuyquantity":  pos.get("daybuyquantity"),
-                    "daysellquantity": pos.get("daysellquantity"),
-                    "cfbuyquantity":   pos.get("cfbuyquantity"),
-                    "cfsellquantity":  pos.get("cfsellquantity"),
-                    # ── amounts ──
-                    "buyamount":       pos.get("buyamount"),
-                    "sellamount":      pos.get("sellamount"),
-                    "daybuyamount":    pos.get("daybuyamount"),
-                    "daysellamount":   pos.get("daysellamount"),
-                    # ── P&L fields ──
+                    "client":                 name,
+                    "uid":                    uid,
+                    "symbol":                 symbol,
+                    "buyquantity":            pos.get("buyquantity"),
+                    "sellquantity":           pos.get("sellquantity"),
+                    "daybuyquantity":         pos.get("daybuyquantity"),
+                    "daysellquantity":        pos.get("daysellquantity"),
+                    "cfbuyquantity":          pos.get("cfbuyquantity"),
+                    "cfsellquantity":         pos.get("cfsellquantity"),
+                    "buyamount":              pos.get("buyamount"),
+                    "sellamount":             pos.get("sellamount"),
+                    "daybuyamount":           pos.get("daybuyamount"),
+                    "daysellamount":          pos.get("daysellamount"),
                     "bookedprofitloss":       pos.get("bookedprofitloss"),
                     "actualbookedprofitloss": pos.get("actualbookedprofitloss"),
                     "marktomarket":           pos.get("marktomarket"),
                     "actualmarktomarket":     pos.get("actualmarktomarket"),
                     "LTP":                    pos.get("LTP"),
-                    # ── raw full record ──
-                    "_raw": dict(pos),
+                    "raw":                    raw_copy,
                 })
         except Exception as e:
             result.append({"client": client_id, "error": str(e)})
