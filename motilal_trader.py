@@ -914,6 +914,24 @@ def auth_login(payload: dict = Body(...)):
 def me(userid: str = Depends(get_current_user)):
     return {"success": True, "userid": userid}
 
+@app.get("/debug_sessions")
+def debug_sessions(request: Request, userid: str = None, user_id: str = None):
+    owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
+    result = []
+    for client_id, sess in list(mofsl_sessions.items()):
+        if not isinstance(sess, dict): continue
+        sess_owner = str(sess.get("owner_userid", "")).strip()
+        matched = (sess_owner == str(owner_userid).strip())
+        result.append({
+            "client_id":    client_id,
+            "name":         sess.get("name"),
+            "sess_owner":   sess_owner,
+            "req_owner":    owner_userid,
+            "match":        matched,
+            "has_mofsl":    bool(sess.get("mofsl")),
+        })
+    return {"resolved_owner": owner_userid, "sessions": result}
+
 
 # ─────────────────────────────────────────────────────────────
 # Client CRUD
