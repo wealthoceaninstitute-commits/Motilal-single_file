@@ -1574,32 +1574,16 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
                     if not symbol:
                         continue
 
-                    # ── Day quantities (today's trades only) ──
-                    day_bq = _safe_float(pos.get("daybuyquantity"),  0.0)
-                    day_sq = _safe_float(pos.get("daysellquantity"), 0.0)
-                    day_ba = _safe_float(pos.get("daybuyamount"),    0.0)
-                    day_sa = _safe_float(pos.get("daysellamount"),   0.0)
+                    # ── Gross quantities ──
+                    bq = _safe_float(pos.get("buyquantity"),  0.0)
+                    sq = _safe_float(pos.get("sellquantity"), 0.0)
+                    ba = _safe_float(pos.get("buyamount"),    0.0)
+                    sa = _safe_float(pos.get("sellamount"),   0.0)
 
-                    # ── Carryforward quantities (from previous days) ──
-                    cf_bq  = _safe_float(pos.get("cfbuyquantity"),  0.0)
-                    cf_sq  = _safe_float(pos.get("cfsellquantity"), 0.0)
-                    cf_ba  = _safe_float(pos.get("cfbuyamount"),    0.0)
-                    cf_sa  = _safe_float(pos.get("cfsellamount"),   0.0)
+                    quantity = int(round(bq - sq))
 
-                    # ── Net open quantity = CF net + day net ──
-                    # e.g. cfbuy=500 yesterday + daysell=500 today → net=0 (closed)
-                    # e.g. daysell=175, no CF               → net=-175 (short open)
-                    net_qty  = (cf_bq - cf_sq) + (day_bq - day_sq)
-                    quantity = int(round(net_qty))
-
-                    # ── Avg prices across CF + day ──
-                    total_bq = cf_bq + day_bq
-                    total_sq = cf_sq + day_sq
-                    total_ba = cf_ba + day_ba
-                    total_sa = cf_sa + day_sa
-
-                    buy_avg  = (total_ba / total_bq) if total_bq > 0 else 0.0
-                    sell_avg = (total_sa / total_sq) if total_sq > 0 else 0.0
+                    buy_avg  = (ba / bq) if bq > 0 else 0.0
+                    sell_avg = (sa / sq) if sq > 0 else 0.0
 
                     ltp = _safe_float(pos.get("LTP"), 0.0)
 
@@ -1619,15 +1603,15 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
                             or pos.get("bookedprofitloss"),
                             0.0
                         )
-                        if net_profit == 0 and total_bq > 0 and total_sq > 0:
-                            net_profit = (sell_avg - buy_avg) * min(total_bq, total_sq)
+                        if net_profit == 0 and bq > 0 and sq > 0:
+                            net_profit = (sell_avg - buy_avg) * min(bq, sq)
 
                     bucket = "closed" if quantity == 0 else "open"
 
                     print(
                         f"   {name} | {symbol} | "
-                        f"cf_bq={cf_bq} cf_sq={cf_sq} day_bq={day_bq} day_sq={day_sq} | "
-                        f"net_qty={quantity} → {bucket} | pnl={round(net_profit, 2)}"
+                        f"bq={bq} sq={sq} qty={quantity} → {bucket} | "
+                        f"pnl={round(net_profit, 2)}"
                     )
 
                     new_meta[(uid, symbol)] = {
