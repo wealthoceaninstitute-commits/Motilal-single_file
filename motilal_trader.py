@@ -1702,11 +1702,7 @@ def debug_positions_raw(request: Request, userid: str = None, user_id: str = Non
             result.append({"client": client_id, "error": str(e)})
 
     return {"count": len(result), "positions": result}
-```
 
-**Deploy this, then hit:**
-```
-GET https://your-backend.railway.app/debug_positions_raw
     
 
 @app.post("/close_position")
