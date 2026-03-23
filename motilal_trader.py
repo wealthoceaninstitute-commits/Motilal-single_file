@@ -1777,9 +1777,9 @@ def debug_full_positions(request: Request, userid: str = None, user_id: str = No
         "open_count":   len(positions_data["open"]),
         "closed_count": len(positions_data["closed"]),
         "positions":    positions_data,
+    }
 
 
-    
 
 @app.post("/close_position")
 async def close_position(request: Request, payload: dict = Body(...)):
