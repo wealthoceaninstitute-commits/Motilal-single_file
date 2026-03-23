@@ -1631,7 +1631,7 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
     print(f"[POS] open={len(positions_data['open'])} closed={len(positions_data['closed'])}")
     with _position_meta_lock:
         position_meta = new_meta
-    return positions_data    
+    return positions_data
 
 # ─────────────────────────────────────────────────────────────
 # DEBUG — remove after diagnosis
