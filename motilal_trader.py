@@ -1662,39 +1662,46 @@ def debug_positions_raw(request: Request, userid: str = None, user_id: str = Non
             if not mofsl or not uid:
                 continue
 
-            resp = mofsl.GetPosition()
+            resp      = mofsl.GetPosition()
             positions = (resp or {}).get("data") or []
 
             for pos in (positions if isinstance(positions, list) else []):
-                symbol = str(pos.get("symbol") or "")
-                if "RELIANCE" not in symbol.upper():
-                    continue
-                raw_copy = dict(pos)
+                bq = float(pos.get("buyquantity")  or 0)
+                sq = float(pos.get("sellquantity") or 0)
+                quantity = int(round(bq - sq))
+                bucket   = "closed" if quantity == 0 else "open"
+
                 result.append({
                     "client":                 name,
                     "uid":                    uid,
-                    "symbol":                 symbol,
-                    "buyquantity":            pos.get("buyquantity"),
-                    "sellquantity":           pos.get("sellquantity"),
+                    "symbol":                 str(pos.get("symbol") or ""),
+                    "bucket":                 bucket,
+                    "quantity":               quantity,
+                    "buyquantity":            bq,
+                    "sellquantity":           sq,
                     "daybuyquantity":         pos.get("daybuyquantity"),
                     "daysellquantity":        pos.get("daysellquantity"),
                     "cfbuyquantity":          pos.get("cfbuyquantity"),
                     "cfsellquantity":         pos.get("cfsellquantity"),
                     "buyamount":              pos.get("buyamount"),
                     "sellamount":             pos.get("sellamount"),
-                    "daybuyamount":           pos.get("daybuyamount"),
-                    "daysellamount":          pos.get("daysellamount"),
-                    "bookedprofitloss":       pos.get("bookedprofitloss"),
                     "actualbookedprofitloss": pos.get("actualbookedprofitloss"),
-                    "marktomarket":           pos.get("marktomarket"),
-                    "actualmarktomarket":     pos.get("actualmarktomarket"),
+                    "bookedprofitloss":       pos.get("bookedprofitloss"),
                     "LTP":                    pos.get("LTP"),
-                    "raw":                    raw_copy,
                 })
+
         except Exception as e:
             result.append({"client": client_id, "error": str(e)})
 
-    return {"count": len(result), "positions": result}
+    open_count   = sum(1 for r in result if r.get("bucket") == "open")
+    closed_count = sum(1 for r in result if r.get("bucket") == "closed")
+
+    return {
+        "total":        len(result),
+        "open_count":   open_count,
+        "closed_count": closed_count,
+        "positions":    result,
+    }
 
 
 @app.get("/debug_full_positions")
