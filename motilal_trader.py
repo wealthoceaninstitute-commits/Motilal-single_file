@@ -1539,112 +1539,124 @@ async def cancel_order(request: Request, payload: dict = Body(...)):
 # Positions  
 # ─────────────────────────────────────────────────────────────
 @app.get("/get_positions")
-def get_positions() -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Fetch Motilal positions for all logged-in clients and bucketize:
-    { open:[], closed:[] }
+def get_positions(request: Request, userid: str = None, user_id: str = None):
+    owner_userid   = resolve_owner_userid(request, userid=userid, user_id=user_id)
+    positions_data = {"open": [], "closed": []}
+    new_meta: Dict = {}
+    global position_meta
 
-    Uses CF + day quantities to correctly detect squared-off positions:
-      net_qty = (cfbuyquantity - cfsellquantity) + (daybuyquantity - daysellquantity)
-
-    This handles the common case where stock was bought yesterday (CF)
-    and sold today (day) — gross buyquantity==sellquantity but it shows
-    as open with the old logic.
-    """
-    data: Dict[str, List[Dict[str, Any]]] = {"open": [], "closed": []}
-
-    for c in _read_clients():
-        name = c.get("name") or c.get("display_name") or c.get("userid") or c.get("client_id") or ""
-        uid  = str(c.get("userid") or c.get("client_id") or "").strip()
-        sdk  = _ensure_session(c)
-        if not sdk or not uid:
-            logging.error("[MO] get_positions: no session/userid for %s", name)
-            continue
-
+    for client_id, sess in list(mofsl_sessions.items()):
         try:
-            resp = sdk.GetPosition()
-            if resp and resp.get("status") != "SUCCESS":
-                logging.error("❌ Error fetching positions for %s: %s",
-                              name, resp.get("message", "No message"))
-            rows = resp.get("data", []) if isinstance(resp, dict) else []
-            if not isinstance(rows, list):
-                rows = []
-        except Exception as e:
-            logging.error("[MO] get_positions error for %s: %s", name, e)
-            rows = []
-
-        for pos in rows:
-            symbol = str(pos.get("symbol") or "")
-            if not symbol:
+            if not isinstance(sess, dict):
+                continue
+            if owner_userid and str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
+                continue
+            name  = str(sess.get("name", "") or client_id)
+            mofsl = sess.get("mofsl")
+            uid   = str(sess.get("userid", client_id))
+            if not mofsl or not uid:
                 continue
 
-            # ── Day quantities (today's trades only) ──
-            day_bq = float(pos.get("daybuyquantity")  or 0)
-            day_sq = float(pos.get("daysellquantity") or 0)
-            day_ba = float(pos.get("daybuyamount")    or 0)
-            day_sa = float(pos.get("daysellamount")   or 0)
+            response = mofsl.GetPosition()
+            if not response or response.get("status") != "SUCCESS":
+                continue
+            positions = response.get("data", []) if response else []
+            if not isinstance(positions, list):
+                positions = []
 
-            # ── Carryforward quantities (from previous days) ──
-            cf_bq  = float(pos.get("cfbuyquantity")   or 0)
-            cf_sq  = float(pos.get("cfsellquantity")  or 0)
-            cf_ba  = float(pos.get("cfbuyamount")     or 0)
-            cf_sa  = float(pos.get("cfsellamount")    or 0)
+            for pos in positions:
+                try:
+                    symbol      = str(pos.get("symbol")     or "")
+                    exchange    = str(pos.get("exchange")    or "")
+                    token       = str(pos.get("symboltoken") or "")
+                    producttype = str(pos.get("productname") or "")
 
-            # ── Net open quantity = CF net + day net ──
-            # e.g. cfbuy=500 yesterday + daysell=500 today → net=0 (closed)
-            # e.g. daysell=175, no CF               → net=-175 (short open)
-            net_qty  = (cf_bq - cf_sq) + (day_bq - day_sq)
-            quantity = int(round(net_qty))
+                    if not symbol:
+                        continue
 
-            # ── Avg prices across CF + day ──
-            total_bq = cf_bq + day_bq
-            total_sq = cf_sq + day_sq
-            total_ba = cf_ba + day_ba
-            total_sa = cf_sa + day_sa
+                    # ── Day quantities (today's trades only) ──
+                    day_bq = _safe_float(pos.get("daybuyquantity"),  0.0)
+                    day_sq = _safe_float(pos.get("daysellquantity"), 0.0)
+                    day_ba = _safe_float(pos.get("daybuyamount"),    0.0)
+                    day_sa = _safe_float(pos.get("daysellamount"),   0.0)
 
-            buy_avg  = (total_ba / total_bq) if total_bq > 0 else 0.0
-            sell_avg = (total_sa / total_sq) if total_sq > 0 else 0.0
+                    # ── Carryforward quantities (from previous days) ──
+                    cf_bq  = _safe_float(pos.get("cfbuyquantity"),  0.0)
+                    cf_sq  = _safe_float(pos.get("cfsellquantity"), 0.0)
+                    cf_ba  = _safe_float(pos.get("cfbuyamount"),    0.0)
+                    cf_sa  = _safe_float(pos.get("cfsellamount"),   0.0)
 
-            ltp = float(pos.get("LTP") or 0)
+                    # ── Net open quantity = CF net + day net ──
+                    # e.g. cfbuy=500 yesterday + daysell=500 today → net=0 (closed)
+                    # e.g. daysell=175, no CF               → net=-175 (short open)
+                    net_qty  = (cf_bq - cf_sq) + (day_bq - day_sq)
+                    quantity = int(round(net_qty))
 
-            # ── P&L ──
-            if quantity > 0:
-                # Long open position
-                net_pnl = (ltp - buy_avg) * quantity if ltp else float(
-                    pos.get("actualmarktomarket") or pos.get("marktomarket") or 0
-                )
-            elif quantity < 0:
-                # Short open position
-                net_pnl = (sell_avg - ltp) * abs(quantity) if ltp else float(
-                    pos.get("actualmarktomarket") or pos.get("marktomarket") or 0
-                )
-            else:
-                # Fully squared off — use booked P&L (includes CF P&L)
-                net_pnl = float(
-                    pos.get("actualbookedprofitloss")
-                    or pos.get("bookedprofitloss")
-                    or 0
-                )
-                # Fallback: compute from avg prices if booked P&L is 0
-                if net_pnl == 0 and total_bq > 0 and total_sq > 0:
-                    net_pnl = (sell_avg - buy_avg) * min(total_bq, total_sq)
+                    # ── Avg prices across CF + day ──
+                    total_bq = cf_bq + day_bq
+                    total_sq = cf_sq + day_sq
+                    total_ba = cf_ba + day_ba
+                    total_sa = cf_sa + day_sa
 
-            row = {
-                "name":       name,
-                "symbol":     symbol,
-                "quantity":   quantity,
-                "buy_avg":    round(buy_avg,  2),
-                "sell_avg":   round(sell_avg, 2),
-                "net_profit": round(net_pnl,  2),
-            }
+                    buy_avg  = (total_ba / total_bq) if total_bq > 0 else 0.0
+                    sell_avg = (total_sa / total_sq) if total_sq > 0 else 0.0
 
-            if quantity == 0:
-                data["closed"].append(row)
-            else:
-                data["open"].append(row)
+                    ltp = _safe_float(pos.get("LTP"), 0.0)
 
-    return data
+                    # ── P&L ──
+                    if quantity > 0:
+                        net_profit = (ltp - buy_avg) * quantity if ltp else _safe_float(
+                            pos.get("actualmarktomarket") or pos.get("marktomarket"), 0.0
+                        )
+                    elif quantity < 0:
+                        net_profit = (sell_avg - ltp) * abs(quantity) if ltp else _safe_float(
+                            pos.get("actualmarktomarket") or pos.get("marktomarket"), 0.0
+                        )
+                    else:
+                        # Fully squared off — use booked P&L
+                        net_profit = _safe_float(
+                            pos.get("actualbookedprofitloss")
+                            or pos.get("bookedprofitloss"),
+                            0.0
+                        )
+                        if net_profit == 0 and total_bq > 0 and total_sq > 0:
+                            net_profit = (sell_avg - buy_avg) * min(total_bq, total_sq)
 
+                    bucket = "closed" if quantity == 0 else "open"
+
+                    print(
+                        f"   {name} | {symbol} | "
+                        f"cf_bq={cf_bq} cf_sq={cf_sq} day_bq={day_bq} day_sq={day_sq} | "
+                        f"net_qty={quantity} → {bucket} | pnl={round(net_profit, 2)}"
+                    )
+
+                    new_meta[(uid, symbol)] = {
+                        "exchange":    exchange,
+                        "symboltoken": token,
+                        "producttype": producttype,
+                        "client_id":   uid,
+                    }
+
+                    positions_data[bucket].append({
+                        "name":       name,
+                        "client_id":  uid,
+                        "symbol":     symbol,
+                        "quantity":   quantity,
+                        "buy_avg":    round(buy_avg,    2),
+                        "sell_avg":   round(sell_avg,   2),
+                        "net_profit": round(net_profit, 2),
+                    })
+
+                except Exception as row_e:
+                    print(f"❌ Row error {name} {pos.get('symbol', '?')}: {row_e}")
+
+        except Exception as e:
+            print(f"❌ Error fetching positions for {client_id}: {e}")
+
+    print(f"[POS] open={len(positions_data['open'])} closed={len(positions_data['closed'])}")
+    with _position_meta_lock:
+        position_meta = new_meta
+    return positions_data
 # ─────────────────────────────────────────────────────────────
 # DEBUG — remove after diagnosis
 # ─────────────────────────────────────────────────────────────
