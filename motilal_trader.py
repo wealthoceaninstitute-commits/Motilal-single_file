@@ -1543,82 +1543,63 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
             if not isinstance(positions, list): continue
 
             for pos in positions:
-                # ── net quantities (carry-forward + day) ──────────────────
-                bq   = float(pos.get("buyquantity")  or 0)
-                sq   = float(pos.get("sellquantity") or 0)
+                # ── raw fields from API ───────────────────────────────────
+                bq   = float(pos.get("buyquantity")    or 0)  # gross total buy
+                sq   = float(pos.get("sellquantity")   or 0)  # gross total sell
+                dbq  = float(pos.get("daybuyquantity") or 0)  # today buy
+                dsq  = float(pos.get("daysellquantity")or 0)  # today sell
+                cfbq = float(pos.get("cfbuyquantity")  or 0)  # carry-fwd buy
+                cfsq = float(pos.get("cfsellquantity") or 0)  # carry-fwd sell
+                ba   = float(pos.get("buyamount")      or 0)
+                sa   = float(pos.get("sellamount")     or 0)
+                dba  = float(pos.get("daybuyamount")   or 0)
+                dsa  = float(pos.get("daysellamount")  or 0)
+                ltp  = float(pos.get("LTP")            or 0)
 
-                # ── day-only quantities ───────────────────────────────────
-                dbq  = float(pos.get("daybuyquantity")  or 0)
-                dsq  = float(pos.get("daysellquantity") or 0)
-
-                # ── carry-forward quantities ──────────────────────────────
-                cfbq = float(pos.get("cfbuyquantity")  or 0)
-                cfsq = float(pos.get("cfsellquantity") or 0)
-
-                # ── amounts ───────────────────────────────────────────────
-                ba   = float(pos.get("buyamount")  or 0)
-                sa   = float(pos.get("sellamount") or 0)
-
-                # ── day amounts ───────────────────────────────────────────
-                dba  = float(pos.get("daybuyamount")  or 0)
-                dsa  = float(pos.get("daysellamount") or 0)
-
-                # ── P&L fields ────────────────────────────────────────────
-                bp   = float(pos.get("actualbookedprofitloss") or pos.get("bookedprofitloss") or 0)
-                mtm  = float(pos.get("actualmarktomarket")     or pos.get("marktomarket")     or 0)
-
-                ltp  = float(pos.get("LTP") or 0)
+                # actualbookedprofitloss is reliably populated by MOSL
+                # (confirmed from debug output: -14683.2 for closed Reliance)
+                bp  = float(pos.get("actualbookedprofitloss") or
+                            pos.get("bookedprofitloss")       or 0)
+                mtm = float(pos.get("actualmarktomarket") or
+                            pos.get("marktomarket")       or 0)
 
                 symbol   = str(pos.get("symbol")      or "")
                 exchange = str(pos.get("exchange")    or "")
                 token    = str(pos.get("symboltoken") or "")
                 product  = str(pos.get("productname") or "")
 
-                # ── net open quantity: what you are still holding ─────────
-                # MOSL: buyquantity and sellquantity already represent
-                # the net open qty (positive=long, negative=short).
-                # For a fully squared-off intraday trade both are 0.
-                net_qty = bq - sq
+                # ── TRUE net open quantity ────────────────────────────────
+                # MOSL returns GROSS totals in buyquantity/sellquantity.
+                # Real open qty = CF net + day net.
+                # Confirmed from debug: Reliance bq=500 sq=500 but it IS
+                # closed — cfbq=500 was bought CF, dsq=500 sold today → net=0
+                net_qty = (cfbq - cfsq) + (dbq - dsq)
 
                 # ── averages ──────────────────────────────────────────────
-                # Use day amounts when net amounts are 0 (pure intraday)
-                eff_bq = bq if bq else dbq
-                eff_sq = sq if sq else dsq
-                eff_ba = ba if ba else dba
-                eff_sa = sa if sa else dsa
+                # For buy_avg: use CF buy price if position was carried fwd,
+                # else use day buy. For sell_avg: prefer day sell amount.
+                total_buy_qty = cfbq + dbq
+                total_sel_qty = cfsq + dsq
+                buy_avg  = (ba / total_buy_qty) if total_buy_qty else 0.0
+                sell_avg = (sa / total_sel_qty) if total_sel_qty else 0.0
 
-                buy_avg  = (eff_ba / eff_bq) if eff_bq else 0.0
-                sell_avg = (eff_sa / eff_sq) if eff_sq else 0.0
-
-                # ── was anything traded today at all? ─────────────────────
-                any_day_traded = (dbq > 0 or dsq > 0)
-
-                # ── net profit calculation ────────────────────────────────
+                # ── net profit ────────────────────────────────────────────
                 if net_qty > 0:
-                    # Still long — unrealised P&L using LTP
+                    # Still long — mark to market
                     net = (ltp - buy_avg) * net_qty if ltp else mtm
                 elif net_qty < 0:
-                    # Still short — unrealised P&L using LTP
+                    # Still short — mark to market
                     net = (sell_avg - ltp) * abs(net_qty) if ltp else mtm
                 else:
-                    # Fully closed (net_qty == 0)
-                    # Priority 1: actualbookedprofitloss (most reliable when API fills it)
-                    # Priority 2: reconstruct from day traded amounts (intraday square-off)
-                    # Priority 3: reconstruct from net amounts (CF square-off)
+                    # Fully closed — use actualbookedprofitloss (confirmed populated)
+                    # Fallback: reconstruct from amounts if bp is 0
                     if bp != 0:
                         net = bp
-                    elif dbq > 0 and dsq > 0:
-                        # Pure intraday: sold what was bought today
-                        traded_qty = min(dbq, dsq)
-                        net = (sell_avg - buy_avg) * traded_qty
-                    elif cfbq > 0 or cfsq > 0:
-                        # CF position squared off today
-                        traded_qty = max(cfbq, cfsq, dbq, dsq)
-                        net = (sell_avg - buy_avg) * traded_qty if traded_qty else bp
                     else:
-                        net = bp  # fallback
+                        closed_qty = min(total_buy_qty, total_sel_qty)
+                        net = (sell_avg - buy_avg) * closed_qty if closed_qty else 0.0
 
-                # ── save meta for ALL positions (open & closed) ───────────
+                # ── save meta for all positions ───────────────────────────
                 if symbol:
                     new_meta[(uid, symbol)] = {
                         "exchange":    exchange,
