@@ -1536,7 +1536,7 @@ async def cancel_order(request: Request, payload: dict = Body(...)):
 
 
 # ─────────────────────────────────────────────────────────────
-# Positions  
+# Positions
 # ─────────────────────────────────────────────────────────────
 @app.get("/get_positions")
 def get_positions(request: Request, userid: str = None, user_id: str = None):
@@ -1657,6 +1657,7 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
     with _position_meta_lock:
         position_meta = new_meta
     return positions_data
+    
 # ─────────────────────────────────────────────────────────────
 # DEBUG — remove after diagnosis
 # ─────────────────────────────────────────────────────────────
