@@ -1537,20 +1537,23 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
             uid   = str(sess.get("userid", client_id))
             if not mofsl or not uid: continue
 
-            # ── Pass clientcode explicitly — MOSL API requires it ─────────
-            resp = mofsl.GetPosition(uid)
+            # Try with clientcode first, fall back to no-arg if SDK doesn't accept it
+            try:
+                resp = mofsl.GetPosition(uid)
+            except TypeError:
+                resp = mofsl.GetPosition()
+
             if not resp or resp.get("status") != "SUCCESS":
-                print(f"⚠️ [POSITIONS] GetPosition failed for {name} ({uid}): status={resp.get('status') if resp else 'None'} msg={resp.get('message','') if resp else ''}")
+                print(f"⚠️ [POS] {name} ({uid}): {resp.get('status') if resp else 'None'} — {resp.get('message','') if resp else ''}")
                 continue
+
             positions = resp.get("data") or []
             if not isinstance(positions, list):
-                print(f"⚠️ [POSITIONS] data not a list for {name} ({uid}): {type(positions)}")
                 continue
 
-            print(f"✅ [POSITIONS] {name} ({uid}): {len(positions)} positions")
+            print(f"✅ [POS] {name} ({uid}): {len(positions)} rows")
 
             for pos in positions:
-                # ── raw fields ────────────────────────────────────────────
                 bq   = float(pos.get("buyquantity")     or 0)
                 sq   = float(pos.get("sellquantity")    or 0)
                 dbq  = float(pos.get("daybuyquantity")  or 0)
@@ -1570,16 +1573,14 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
                 token    = str(pos.get("symboltoken") or "")
                 product  = str(pos.get("productname") or "")
 
-                # ── net open qty: CF net + day net ────────────────────────
+                # Net open qty = CF net + day net
                 net_qty = (cfbq - cfsq) + (dbq - dsq)
 
-                # ── averages ──────────────────────────────────────────────
                 total_buy_qty = cfbq + dbq
                 total_sel_qty = cfsq + dsq
                 buy_avg  = (ba / total_buy_qty) if total_buy_qty else 0.0
                 sell_avg = (sa / total_sel_qty) if total_sel_qty else 0.0
 
-                # ── P&L ───────────────────────────────────────────────────
                 if net_qty > 0:
                     net = (ltp - buy_avg) * net_qty if ltp else mtm
                 elif net_qty < 0:
@@ -1591,7 +1592,8 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
                         closed_qty = min(total_buy_qty, total_sel_qty)
                         net = (sell_avg - buy_avg) * closed_qty if closed_qty else 0.0
 
-                print(f"   pos: {symbol} net_qty={net_qty} bq={bq} sq={sq} cfbq={cfbq} cfsq={cfsq} dbq={dbq} dsq={dsq} → bucket={'closed' if net_qty==0 else 'open'}")
+                bucket = "open" if net_qty != 0 else "closed"
+                print(f"   {symbol} cfbq={cfbq} cfsq={cfsq} dbq={dbq} dsq={dsq} net_qty={net_qty} → {bucket}")
 
                 if symbol:
                     new_meta[(uid, symbol)] = {
@@ -1601,7 +1603,7 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
                         "client_id":   uid,
                     }
 
-                row = {
+                positions_data[bucket].append({
                     "name":       name,
                     "client_id":  uid,
                     "symbol":     symbol,
@@ -1609,19 +1611,17 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
                     "buy_avg":    round(buy_avg,  2),
                     "sell_avg":   round(sell_avg, 2),
                     "net_profit": round(net,      2),
-                }
-
-                bucket = "open" if net_qty != 0 else "closed"
-                positions_data[bucket].append(row)
+                })
 
         except Exception as e:
-            print(f"❌ Error fetching positions for {client_id}: {e}")
+            print(f"❌ [POS] Error for {client_id}: {e}")
 
-    print(f"[POSITIONS] Final: open={len(positions_data['open'])} closed={len(positions_data['closed'])}")
+    print(f"[POS] Done — open={len(positions_data['open'])} closed={len(positions_data['closed'])}")
     with _position_meta_lock:
         position_meta = new_meta
     return positions_data
     
+
 # ─────────────────────────────────────────────────────────────
 # DEBUG — remove after diagnosis
 # ─────────────────────────────────────────────────────────────
