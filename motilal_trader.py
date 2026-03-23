@@ -1536,7 +1536,7 @@ async def cancel_order(request: Request, payload: dict = Body(...)):
 
 
 # ─────────────────────────────────────────────────────────────
-# Positions
+# Positions  
 # ─────────────────────────────────────────────────────────────
 @app.get("/get_positions")
 def get_positions(request: Request, userid: str = None, user_id: str = None):
@@ -1555,7 +1555,6 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
             uid   = str(sess.get("userid", client_id))
             if not mofsl or not uid: continue
 
-            # ── Exact same call as working desktop app ────────
             response = mofsl.GetPosition()
             if response and response.get("status") != "SUCCESS":
                 continue
@@ -1564,37 +1563,45 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
                 positions = []
 
             for pos in positions:
-                # ── Desktop app logic (proven to work) ────────
-                bq = float(pos.get("buyquantity") or 0)
-                sq = float(pos.get("sellquantity") or 0)
-                quantity = int(round(bq - sq))
+                try:
+                    # ── Cast everything explicitly — API may return strings ──
+                    bq = _safe_float(pos.get("buyquantity"),  0.0)
+                    sq = _safe_float(pos.get("sellquantity"), 0.0)
+                    ba = _safe_float(pos.get("buyamount"),    0.0)
+                    sa = _safe_float(pos.get("sellamount"),   0.0)
 
-                ba = float(pos.get("buyamount") or 0)
-                sa = float(pos.get("sellamount") or 0)
+                    quantity = int(round(bq - sq))
 
-                buy_avg  = (ba / bq) if bq > 0 else 0.0
-                sell_avg = (sa / sq) if sq > 0 else 0.0
+                    buy_avg  = (ba / bq) if bq > 0 else 0.0
+                    sell_avg = (sa / sq) if sq > 0 else 0.0
 
-                ltp          = float(pos.get("LTP") or 0)
-                booked_profit = float(
-                    pos.get("actualbookedprofitloss")
-                    or pos.get("bookedprofitloss")
-                    or 0
-                )
+                    ltp = _safe_float(pos.get("LTP"), 0.0)
+                    bp  = _safe_float(
+                        pos.get("actualbookedprofitloss")
+                        or pos.get("bookedprofitloss"), 0.0
+                    )
+                    mtm = _safe_float(
+                        pos.get("actualmarktomarket")
+                        or pos.get("marktomarket"), 0.0
+                    )
 
-                if quantity > 0:
-                    net_profit = (ltp - buy_avg) * quantity
-                elif quantity < 0:
-                    net_profit = (sell_avg - buy_avg) * abs(quantity)
-                else:
-                    net_profit = booked_profit
+                    if quantity > 0:
+                        net_profit = (ltp - buy_avg) * quantity if ltp else mtm
+                    elif quantity < 0:
+                        net_profit = (sell_avg - ltp) * abs(quantity) if ltp else mtm
+                    else:
+                        net_profit = bp if bp != 0 else (
+                            (sell_avg - buy_avg) * min(bq, sq) if min(bq, sq) else 0.0
+                        )
 
-                symbol      = str(pos.get("symbol")      or "")
-                exchange    = str(pos.get("exchange")    or "")
-                token       = str(pos.get("symboltoken") or "")
-                producttype = str(pos.get("productname") or "")
+                    symbol      = str(pos.get("symbol")      or "")
+                    exchange    = str(pos.get("exchange")    or "")
+                    token       = str(pos.get("symboltoken") or "")
+                    producttype = str(pos.get("productname") or "")
 
-                if symbol:
+                    if not symbol:
+                        continue
+
                     new_meta[(uid, symbol)] = {
                         "exchange":    exchange,
                         "symboltoken": token,
@@ -1602,28 +1609,29 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
                         "client_id":   uid,
                     }
 
-                row = {
-                    "name":       name,
-                    "client_id":  uid,
-                    "symbol":     symbol,
-                    "quantity":   quantity,
-                    "buy_avg":    round(buy_avg,    2),
-                    "sell_avg":   round(sell_avg,   2),
-                    "net_profit": round(net_profit, 2),
-                }
+                    bucket = "closed" if quantity == 0 else "open"
+                    print(f"   {name} | {symbol} | bq={bq} sq={sq} | qty={quantity} → {bucket} | pnl={round(net_profit,2)}")
 
-                if quantity == 0:
-                    positions_data["closed"].append(row)
-                else:
-                    positions_data["open"].append(row)
+                    positions_data[bucket].append({
+                        "name":       name,
+                        "client_id":  uid,
+                        "symbol":     symbol,
+                        "quantity":   quantity,
+                        "buy_avg":    round(buy_avg,    2),
+                        "sell_avg":   round(sell_avg,   2),
+                        "net_profit": round(net_profit, 2),
+                    })
+
+                except Exception as row_e:
+                    print(f"❌ Row error {name} {pos.get('symbol','?')}: {row_e}")
 
         except Exception as e:
             print(f"❌ Error fetching positions for {client_id}: {e}")
 
+    print(f"[POS] open={len(positions_data['open'])} closed={len(positions_data['closed'])}")
     with _position_meta_lock:
         position_meta = new_meta
-    return positions_data
-    
+    return positions_data    
 
 # ─────────────────────────────────────────────────────────────
 # DEBUG — remove after diagnosis
