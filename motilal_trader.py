@@ -1529,22 +1529,27 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
 
     for client_id, sess in list(mofsl_sessions.items()):
         try:
-            if not isinstance(sess, dict): continue
+            if not isinstance(sess, dict): 
+                continue
+
             if owner_userid and str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip():
                 continue
+
             name  = str(sess.get("name", "") or client_id)
             mofsl = sess.get("mofsl")
             uid   = str(sess.get("userid", client_id))
-            if not mofsl or not uid: continue
 
-            # Try with clientcode first, fall back to no-arg if SDK doesn't accept it
+            if not mofsl or not uid:
+                continue
+
+            # Fetch positions
             try:
                 resp = mofsl.GetPosition(uid)
             except TypeError:
                 resp = mofsl.GetPosition()
 
             if not resp or resp.get("status") != "SUCCESS":
-                print(f"⚠️ [POS] {name} ({uid}): {resp.get('status') if resp else 'None'} — {resp.get('message','') if resp else ''}")
+                print(f"⚠️ [POS] {name} ({uid}): Failed")
                 continue
 
             positions = resp.get("data") or []
@@ -1554,48 +1559,74 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
             print(f"✅ [POS] {name} ({uid}): {len(positions)} rows")
 
             for pos in positions:
-                bq   = float(pos.get("buyquantity")     or 0)
-                sq   = float(pos.get("sellquantity")    or 0)
-                dbq  = float(pos.get("daybuyquantity")  or 0)
-                dsq  = float(pos.get("daysellquantity") or 0)
-                cfbq = float(pos.get("cfbuyquantity")   or 0)
-                cfsq = float(pos.get("cfsellquantity")  or 0)
-                ba   = float(pos.get("buyamount")       or 0)
-                sa   = float(pos.get("sellamount")      or 0)
-                ltp  = float(pos.get("LTP")             or 0)
-                bp   = float(pos.get("actualbookedprofitloss") or
-                             pos.get("bookedprofitloss")       or 0)
-                mtm  = float(pos.get("actualmarktomarket") or
-                             pos.get("marktomarket")       or 0)
+                try:
+                    # ---- Raw values ----
+                    bq   = float(pos.get("buyquantity") or 0)
+                    sq   = float(pos.get("sellquantity") or 0)
 
-                symbol   = str(pos.get("symbol")      or "")
-                exchange = str(pos.get("exchange")    or "")
-                token    = str(pos.get("symboltoken") or "")
-                product  = str(pos.get("productname") or "")
+                    dbq  = float(pos.get("daybuyquantity") or 0)
+                    dsq  = float(pos.get("daysellquantity") or 0)
 
-                # Net open qty = CF net + day net
-                net_qty = (cfbq - cfsq) + (dbq - dsq)
+                    cfbq = float(pos.get("cfbuyquantity") or 0)
+                    cfsq = float(pos.get("cfsellquantity") or 0)
 
-                total_buy_qty = cfbq + dbq
-                total_sel_qty = cfsq + dsq
-                buy_avg  = (ba / total_buy_qty) if total_buy_qty else 0.0
-                sell_avg = (sa / total_sel_qty) if total_sel_qty else 0.0
+                    ba   = float(pos.get("buyamount") or 0)
+                    sa   = float(pos.get("sellamount") or 0)
 
-                if net_qty > 0:
-                    net = (ltp - buy_avg) * net_qty if ltp else mtm
-                elif net_qty < 0:
-                    net = (sell_avg - ltp) * abs(net_qty) if ltp else mtm
-                else:
-                    if bp != 0:
-                        net = bp
+                    ltp  = float(pos.get("LTP") or 0)
+
+                    bp   = float(
+                        pos.get("actualbookedprofitloss")
+                        or pos.get("bookedprofitloss")
+                        or 0
+                    )
+
+                    mtm  = float(
+                        pos.get("actualmarktomarket")
+                        or pos.get("marktomarket")
+                        or 0
+                    )
+
+                    symbol   = str(pos.get("symbol") or "")
+                    exchange = str(pos.get("exchange") or "")
+                    token    = str(pos.get("symboltoken") or "")
+                    product  = str(pos.get("productname") or "")
+
+                    if not symbol:
+                        continue
+
+                    # ---- FIX 1: Use TOTAL qty (more reliable than CF+DAY sum) ----
+                    net_qty_raw = bq - sq
+
+                    # ---- FIX 2: eliminate float garbage ----
+                    net_qty = int(round(net_qty_raw))
+
+                    total_buy_qty = max(bq, cfbq + dbq)
+                    total_sel_qty = max(sq, cfsq + dsq)
+
+                    buy_avg  = (ba / total_buy_qty) if total_buy_qty else 0.0
+                    sell_avg = (sa / total_sel_qty) if total_sel_qty else 0.0
+
+                    # ---- PnL Calculation ----
+                    if net_qty > 0:
+                        net = (ltp - buy_avg) * net_qty if ltp else mtm
+
+                    elif net_qty < 0:
+                        net = (sell_avg - ltp) * abs(net_qty) if ltp else mtm
+
                     else:
-                        closed_qty = min(total_buy_qty, total_sel_qty)
-                        net = (sell_avg - buy_avg) * closed_qty if closed_qty else 0.0
+                        # CLOSED POSITION
+                        if bp != 0:
+                            net = bp
+                        else:
+                            closed_qty = min(total_buy_qty, total_sel_qty)
+                            net = (sell_avg - buy_avg) * closed_qty if closed_qty else 0.0
 
-                bucket = "open" if net_qty != 0 else "closed"
-                print(f"   {symbol} cfbq={cfbq} cfsq={cfsq} dbq={dbq} dsq={dsq} net_qty={net_qty} → {bucket}")
+                    bucket = "open" if net_qty != 0 else "closed"
 
-                if symbol:
+                    print(f"   {symbol} → net_qty={net_qty} → {bucket}")
+
+                    # ---- Store meta for close_position ----
                     new_meta[(uid, symbol)] = {
                         "exchange":    exchange,
                         "symboltoken": token,
@@ -1603,22 +1634,27 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
                         "client_id":   uid,
                     }
 
-                positions_data[bucket].append({
-                    "name":       name,
-                    "client_id":  uid,
-                    "symbol":     symbol,
-                    "quantity":   net_qty,
-                    "buy_avg":    round(buy_avg,  2),
-                    "sell_avg":   round(sell_avg, 2),
-                    "net_profit": round(net,      2),
-                })
+                    positions_data[bucket].append({
+                        "name":       name,
+                        "client_id":  uid,
+                        "symbol":     symbol,
+                        "quantity":   net_qty,
+                        "buy_avg":    round(buy_avg, 2),
+                        "sell_avg":   round(sell_avg, 2),
+                        "net_profit": round(net, 2),
+                    })
+
+                except Exception as inner_e:
+                    print(f"❌ Row error: {inner_e}")
 
         except Exception as e:
             print(f"❌ [POS] Error for {client_id}: {e}")
 
     print(f"[POS] Done — open={len(positions_data['open'])} closed={len(positions_data['closed'])}")
+
     with _position_meta_lock:
         position_meta = new_meta
+
     return positions_data
     
 
