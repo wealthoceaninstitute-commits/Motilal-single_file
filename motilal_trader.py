@@ -1574,54 +1574,65 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
                     if not symbol:
                         continue
 
-                    # ── Use gross buy/sell quantities (includes CF + day) ──
-                    bq = _safe_float(pos.get("buyquantity"),  0.0)
-                    sq = _safe_float(pos.get("sellquantity"), 0.0)
-                    ba = _safe_float(pos.get("buyamount"),    0.0)
-                    sa = _safe_float(pos.get("sellamount"),   0.0)
+                    # ── Day quantities (today's trades only) ──
+                    day_bq = _safe_float(pos.get("daybuyquantity"),  0.0)
+                    day_sq = _safe_float(pos.get("daysellquantity"), 0.0)
+                    day_ba = _safe_float(pos.get("daybuyamount"),    0.0)
+                    day_sa = _safe_float(pos.get("daysellamount"),   0.0)
 
-                    # Fallback to day quantities if gross fields are missing/zero
-                    if bq == 0 and sq == 0:
-                        bq = _safe_float(pos.get("daybuyquantity"),  0.0)
-                        sq = _safe_float(pos.get("daysellquantity"), 0.0)
-                        ba = _safe_float(pos.get("daybuyamount"),    0.0)
-                        sa = _safe_float(pos.get("daysellamount"),   0.0)
+                    # ── Carryforward quantities (from prev days) ──
+                    cf_bq  = _safe_float(pos.get("cfbuyquantity"),   0.0)
+                    cf_sq  = _safe_float(pos.get("cfsellquantity"),  0.0)
+                    cf_ba  = _safe_float(pos.get("cfbuyamount"),     0.0)
+                    cf_sa  = _safe_float(pos.get("cfsellamount"),    0.0)
 
-                    quantity = int(round(bq - sq))
+                    # ── Net open quantity: CF net + day net ──
+                    # e.g. CF bought 500 yesterday, sold 500 today → net = 0 (closed)
+                    # e.g. Sold 175 today, no CF → net = -175 (short open)
+                    net_qty  = (cf_bq - cf_sq) + (day_bq - day_sq)
+                    quantity = int(round(net_qty))
 
-                    buy_avg  = (ba / bq) if bq > 0 else 0.0
-                    sell_avg = (sa / sq) if sq > 0 else 0.0
+                    # ── Avg prices ──
+                    # Total buy: CF buys + day buys
+                    total_bq = cf_bq + day_bq
+                    total_sq = cf_sq + day_sq
+                    total_ba = cf_ba + day_ba
+                    total_sa = cf_sa + day_sa
+
+                    buy_avg  = (total_ba / total_bq) if total_bq > 0 else 0.0
+                    sell_avg = (total_sa / total_sq) if total_sq > 0 else 0.0
 
                     ltp = _safe_float(pos.get("LTP"), 0.0)
 
-                    # ── P&L calculation per bucket ──
+                    # ── P&L calculation ──
                     if quantity > 0:
-                        # Long open position
+                        # Long open
                         net_profit = (ltp - buy_avg) * quantity if ltp else _safe_float(
                             pos.get("actualmarktomarket") or pos.get("marktomarket"), 0.0
                         )
                     elif quantity < 0:
-                        # Short open position
+                        # Short open
                         net_profit = (sell_avg - ltp) * abs(quantity) if ltp else _safe_float(
                             pos.get("actualmarktomarket") or pos.get("marktomarket"), 0.0
                         )
                     else:
-                        # Fully squared off — use booked P&L directly
+                        # Fully squared off — use booked P&L (includes CF P&L)
                         net_profit = _safe_float(
                             pos.get("actualbookedprofitloss")
                             or pos.get("bookedprofitloss"),
                             0.0
                         )
-                        # Secondary fallback: compute from avg prices
-                        if net_profit == 0 and bq > 0 and sq > 0:
-                            traded_qty = min(bq, sq)
+                        # Fallback: compute from avg prices if booked P&L is 0
+                        if net_profit == 0 and total_bq > 0 and total_sq > 0:
+                            traded_qty = min(total_bq, total_sq)
                             net_profit = (sell_avg - buy_avg) * traded_qty
 
                     bucket = "closed" if quantity == 0 else "open"
 
                     print(
-                        f"   {name} | {symbol} | bq={bq} sq={sq} | "
-                        f"qty={quantity} → {bucket} | pnl={round(net_profit, 2)}"
+                        f"   {name} | {symbol} | "
+                        f"cf_bq={cf_bq} cf_sq={cf_sq} day_bq={day_bq} day_sq={day_sq} | "
+                        f"net_qty={quantity} → {bucket} | pnl={round(net_profit, 2)}"
                     )
 
                     new_meta[(uid, symbol)] = {
