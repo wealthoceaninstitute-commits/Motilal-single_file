@@ -1552,21 +1552,35 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
                 sell_avg = (sa / sq) if sq else 0.0
                 ltp      = float(pos.get("LTP") or 0)
                 bp       = float(pos.get("bookedprofitloss") or 0)
-                net      = (
-                    (ltp - buy_avg) * qty if qty > 0
-                    else (sell_avg - buy_avg) * abs(qty) if qty < 0
-                    else bp
-                )
                 symbol   = str(pos.get("symbol") or "")
                 exchange = str(pos.get("exchange") or "")
                 token    = str(pos.get("symboltoken") or "")
                 product  = str(pos.get("productname") or "")
 
-                if qty != 0 and symbol:
+                # FIX 1: net_profit for closed positions — use actual traded amounts
+                # instead of bookedprofitloss which is often 0 from the API.
+                # Closed = bq > 0 and sq > 0 and qty == 0 (fully squared off).
+                if qty > 0:
+                    net = (ltp - buy_avg) * qty
+                elif qty < 0:
+                    net = (sell_avg - buy_avg) * abs(qty)
+                else:
+                    # qty == 0: position is closed
+                    # Prefer (sell_avg - buy_avg) * traded_qty when we have both sides,
+                    # fall back to bookedprofitloss if only one side exists (edge case).
+                    if bq > 0 and sq > 0:
+                        net = (sell_avg - buy_avg) * bq
+                    else:
+                        net = bp
+
+                # FIX 2: also save meta for closed positions so they can be
+                # re-used if needed, keyed by (uid, symbol).
+                if symbol:
                     new_meta[(uid, symbol)] = {
                         "exchange": exchange, "symboltoken": token,
                         "producttype": product, "client_id": uid,
                     }
+
                 row = {
                     "name": name, "client_id": uid, "symbol": symbol,
                     "quantity": qty, "buy_avg": round(buy_avg, 2),
@@ -1579,7 +1593,6 @@ def get_positions(request: Request, userid: str = None, user_id: str = None):
     with _position_meta_lock:
         position_meta = new_meta
     return positions_data
-
 
 @app.post("/close_position")
 async def close_position(request: Request, payload: dict = Body(...)):
