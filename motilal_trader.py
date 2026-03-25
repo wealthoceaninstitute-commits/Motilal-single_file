@@ -1059,6 +1059,55 @@ def auth_login(payload: dict = Body(...)):
         ph   = row["password_hash"]
         if not salt or not ph or password_hash(password, salt) != ph:
             return {"success": False}
+
+        # ── Kick off a background session-refresh for this user's clients ──
+        # This ensures that when the user reaches the Clients page, their
+        # clients are already (re)logged into Motilal, even after an overnight
+        # server restart or session expiry.
+        def _refresh_on_login(owner: str):
+            try:
+                clients = db_execute(
+                    "SELECT * FROM clients WHERE owner_userid=%s",
+                    (owner,), fetch="all",
+                ) or []
+                stale = [
+                    dict(c) for c in clients
+                    if not _session_fresh(
+                        mofsl_sessions.get(str(c.get("userid") or "").strip())
+                    )
+                ]
+                if not stale:
+                    print(f"✅ [LOGIN-REFRESH] All sessions fresh for owner={owner}")
+                    return
+                print(f"🔑 [LOGIN-REFRESH] Re-logging {len(stale)} stale client(s) for owner={owner}")
+                for client in stale:
+                    client["owner_userid"] = owner
+                    try:
+                        ok  = motilal_login(client)
+                        msg = "Login successful" if ok else "Login failed"
+                        db_execute(
+                            "UPDATE clients SET session_active=%s, last_login_ts=%s, last_login_msg=%s "
+                            "WHERE owner_userid=%s AND userid=%s",
+                            (ok, int(time.time()), msg, owner,
+                             str(client.get("userid") or "").strip()),
+                        )
+                    except Exception as e:
+                        print(f"❌ [LOGIN-REFRESH] {client.get('userid')}: {e}")
+                logged = sum(
+                    1 for c in clients
+                    if _session_fresh(mofsl_sessions.get(str(c.get("userid") or "").strip()))
+                )
+                print(f"✅ [LOGIN-REFRESH] {logged}/{len(clients)} sessions active for owner={owner}")
+            except Exception as e:
+                print(f"❌ [LOGIN-REFRESH] owner={owner}: {e}")
+
+        threading.Thread(
+            target=_refresh_on_login,
+            args=(userid,),
+            daemon=True,
+            name=f"login-refresh-{userid}",
+        ).start()
+
         return {"success": True, "userid": userid, "access_token": create_token(userid)}
     except Exception as e:
         return {"success": False, "error": str(e)}
