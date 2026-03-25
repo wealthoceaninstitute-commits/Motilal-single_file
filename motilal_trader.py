@@ -843,37 +843,24 @@ def _startup_login_all_clients():
 
 
 # ─────────────────────────────────────────────────────────────
-# Auto-Relogin Scheduler
+# Auto-Relogin — Session Watchdog
 #
-# Two mechanisms to keep all clients always logged in:
+# Runs every SESSION_WATCHDOG_INTERVAL_SECONDS (default 30 min)
+# and re-logs only clients whose in-memory session has expired or
+# is missing. This is a safety net for mid-day session dropouts.
 #
-#  1. DAILY MORNING LOGIN at 08:30 IST — fires every morning after
-#     the symbol master refresh (08:00), force-renews ALL sessions
-#     so clients are ready before market open (09:00 IST).
-#
-#  2. PERIODIC SESSION WATCHDOG every SESSION_WATCHDOG_INTERVAL_SECONDS
-#     (default 30 min) — re-logs only clients whose in-memory session
-#     has expired or is missing, catching any mid-day dropouts.
-#
-# Both loops are independent daemon threads so one crashing never
-# affects the other.
+# Primary relogin is triggered on user login (see /auth/login),
+# so this watchdog handles edge cases like copy-trading clients
+# that are active but the owner hasn't logged in recently.
 # ─────────────────────────────────────────────────────────────
 
-# How often the watchdog checks for stale sessions (seconds). Override via env.
-_SESSION_WATCHDOG_INTERVAL = int(os.getenv("SESSION_WATCHDOG_INTERVAL_SECONDS", "1800"))
-
-# IST time at which daily morning force-relogin fires (default 08:30).
-_MORNING_LOGIN_HOUR_IST   = int(os.getenv("MORNING_LOGIN_HOUR_IST",   "8"))
-_MORNING_LOGIN_MINUTE_IST = int(os.getenv("MORNING_LOGIN_MINUTE_IST", "30"))
-
+_SESSION_WATCHDOG_INTERVAL      = int(os.getenv("SESSION_WATCHDOG_INTERVAL_SECONDS", "1800"))   # 30 min during market hours
+_SESSION_WATCHDOG_AMO_INTERVAL  = int(os.getenv("SESSION_WATCHDOG_AMO_INTERVAL_SECONDS", "7200")) # 2 hrs outside market hours
 _AUTO_RELOGIN_SCHEDULER_STARTED = False
 
 
-def _relogin_all_clients(label: str = "WATCHDOG", force: bool = False):
-    """
-    Re-login every client that is stale or missing.
-    If force=True, clears all sessions first (full morning refresh).
-    """
+def _relogin_stale_clients(label: str = "WATCHDOG"):
+    """Re-login every client whose session is missing or expired."""
     try:
         rows = db_execute("SELECT * FROM clients", fetch="all") or []
     except Exception as e:
@@ -883,26 +870,21 @@ def _relogin_all_clients(label: str = "WATCHDOG", force: bool = False):
     if not rows:
         return
 
-    if force:
-        print(f"🔄 [{label}] Force-clearing all sessions for morning relogin…")
-        for row in rows:
-            mofsl_sessions.pop(str(row.get("userid") or "").strip(), None)
-
     stale = [
         dict(row) for row in rows
-        if force or not _session_fresh(mofsl_sessions.get(str(row.get("userid") or "").strip()))
+        if not _session_fresh(mofsl_sessions.get(str(row.get("userid") or "").strip()))
     ]
 
     if not stale:
         print(f"✅ [{label}] All {len(rows)} sessions are fresh — nothing to do.")
         return
 
-    print(f"🔑 [{label}] Re-logging {len(stale)}/{len(rows)} clients…")
+    print(f"🔑 [{label}] Re-logging {len(stale)}/{len(rows)} stale client(s)…")
 
     def _login_one(client: dict):
         uid = str(client.get("userid") or "").strip()
         try:
-            ok = motilal_login(client)
+            ok  = motilal_login(client)
             msg = "Login successful" if ok else "Login failed"
             try:
                 db_execute(
@@ -925,57 +907,38 @@ def _relogin_all_clients(label: str = "WATCHDOG", force: bool = False):
     print(f"✅ [{label}] Done — {logged}/{len(rows)} clients now active.")
 
 
-def _next_morning_login_ist_epoch() -> int:
-    """Return UTC epoch of the next MORNING_LOGIN_HOUR_IST:MORNING_LOGIN_MINUTE_IST in IST."""
-    now_ist = _ist_datetime_now()
-    target  = now_ist.replace(
-        hour=_MORNING_LOGIN_HOUR_IST,
-        minute=_MORNING_LOGIN_MINUTE_IST,
-        second=0,
-        microsecond=0,
-    )
-    if now_ist >= target:
-        target += timedelta(days=1)
-    # Convert IST back to UTC epoch
-    return int(target.timestamp()) - IST_OFFSET_SECONDS
-
-
-def _morning_relogin_scheduler_loop():
-    """Fires once per day at MORNING_LOGIN_HOUR_IST:MORNING_LOGIN_MINUTE_IST IST."""
-    print(
-        f"🌅 [MORNING-LOGIN] Scheduler started — daily relogin at "
-        f"{_MORNING_LOGIN_HOUR_IST:02d}:{_MORNING_LOGIN_MINUTE_IST:02d} IST"
-    )
-    while True:
-        try:
-            secs    = max(5, _next_morning_login_ist_epoch() - _utc_now_ts())
-            next_dt = _ist_datetime_now() + timedelta(seconds=secs)
-            print(
-                f"⏳ [MORNING-LOGIN] Next run at "
-                f"{next_dt.strftime('%Y-%m-%d %H:%M')} IST ({secs / 3600:.1f}h away)"
-            )
-            time.sleep(secs)
-            print("🔄 [MORNING-LOGIN] Daily morning relogin starting…")
-            _relogin_all_clients(label="MORNING-LOGIN", force=True)
-        except Exception as e:
-            print(f"❌ [MORNING-LOGIN] Error: {e}")
-            time.sleep(300)
+def _is_market_hours_ist() -> bool:
+    """Mon-Fri, 08:45-15:45 IST."""
+    from datetime import time as dtime
+    now = _ist_datetime_now()
+    if now.weekday() >= 5:
+        return False
+    return dtime(8, 45) <= now.time() <= dtime(15, 45)
 
 
 def _session_watchdog_loop():
-    """Runs every _SESSION_WATCHDOG_INTERVAL seconds and re-logs stale sessions."""
+    """
+    Runs 24/7 to support both live orders and AMO (After Market Orders).
+    - Market hours (Mon-Fri 08:45-15:45 IST): checks every SESSION_WATCHDOG_INTERVAL_SECONDS (default 30 min).
+    - Off-hours: checks every SESSION_WATCHDOG_AMO_INTERVAL_SECONDS (default 2 hrs) so
+      stale sessions are caught before someone places an AMO order.
+    """
     print(
         f"🔍 [WATCHDOG] Session watchdog started "
-        f"(check interval: {_SESSION_WATCHDOG_INTERVAL}s)"
+        f"(market hours: every {_SESSION_WATCHDOG_INTERVAL}s | "
+        f"off-hours/AMO: every {_SESSION_WATCHDOG_AMO_INTERVAL}s)"
     )
-    # Offset slightly from startup to avoid racing with _startup_login_all_clients
-    time.sleep(60)
+    time.sleep(60)  # slight offset from startup login
     while True:
         try:
-            _relogin_all_clients(label="WATCHDOG", force=False)
+            in_market = _is_market_hours_ist()
+            interval  = _SESSION_WATCHDOG_INTERVAL if in_market else _SESSION_WATCHDOG_AMO_INTERVAL
+            label     = "WATCHDOG" if in_market else "WATCHDOG-AMO"
+            _relogin_stale_clients(label=label)
+            time.sleep(interval)
         except Exception as e:
             print(f"❌ [WATCHDOG] Error: {e}")
-        time.sleep(_SESSION_WATCHDOG_INTERVAL)
+            time.sleep(60)
 
 
 def start_auto_relogin_threads():
@@ -983,11 +946,6 @@ def start_auto_relogin_threads():
     if _AUTO_RELOGIN_SCHEDULER_STARTED:
         return
     _AUTO_RELOGIN_SCHEDULER_STARTED = True
-    threading.Thread(
-        target=_morning_relogin_scheduler_loop,
-        daemon=True,
-        name="morning-relogin",
-    ).start()
     threading.Thread(
         target=_session_watchdog_loop,
         daemon=True,
@@ -1061,9 +1019,8 @@ def auth_login(payload: dict = Body(...)):
             return {"success": False}
 
         # ── Kick off a background session-refresh for this user's clients ──
-        # This ensures that when the user reaches the Clients page, their
-        # clients are already (re)logged into Motilal, even after an overnight
-        # server restart or session expiry.
+        # Re-logs any stale Motilal sessions immediately on login so the
+        # Clients page shows correct status right away.
         def _refresh_on_login(owner: str):
             try:
                 clients = db_execute(
