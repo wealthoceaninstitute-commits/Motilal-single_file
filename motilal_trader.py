@@ -2236,6 +2236,7 @@ async def place_order(request: Request, payload: dict = Body(...)):
     triggerprice      = _safe_float(data.get("triggerprice", 0), 0.0)
     disclosedquantity = _safe_int(data.get("disclosedquantity", 0), 0)
     amoorder          = (data.get("amoorder") or "N").strip().upper()
+    goodtilldate      = (data.get("goodtilldate") or "").strip()
 
     def _extract_client_id(x) -> str:
         if isinstance(x, dict):
@@ -2310,7 +2311,7 @@ async def place_order(request: Request, payload: dict = Body(...)):
             "disclosedquantity": int(disclosedquantity),
             "amoorder":          amoorder,
             "algoid":            "",
-            "goodtilldate":      "",
+            "goodtilldate":     goodtilldate if orderduration == "GTD" else "",
             "tag":               tag or "",
         }
         try:
