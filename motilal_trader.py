@@ -105,6 +105,9 @@ SECRET_KEY         = os.getenv("SECRET_KEY") or "CHANGE_ME_PLEASE_SET_SECRET_KEY
 TOKEN_EXPIRE_HOURS = int(os.getenv("TOKEN_EXPIRE_HOURS", "24"))
 DATABASE_URL       = os.getenv("DATABASE_URL", "")
 
+# Telegram alert config (per-user bot tokens stored in DB — see /set_telegram_config)
+TELEGRAM_DEFAULT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+
 cors_origins_raw = (os.getenv("CORS_ORIGINS") or "").strip()
 if cors_origins_raw == "*":
     allow_origins     = ["*"]
@@ -180,6 +183,94 @@ def create_token(userid: str) -> str:
 def _safe_filename(s: str) -> str:
     s = (s or "").strip().replace(" ", "_")
     return re.sub(r"[^A-Za-z0-9_\-]", "_", s)[:80] or "item"
+
+
+def _log_order(label: str, client_name: str, client_id: str, payload: dict, resp: dict):
+    """Structured Railway log line for every order attempt."""
+    status  = (resp.get("status") or "").upper()
+    oid     = resp.get("uniqueorderid") or resp.get("order_id") or "—"
+    msg_txt = resp.get("message") or resp.get("Message") or ""
+    icon    = "✅" if status == "SUCCESS" else "❌"
+    print(
+        f"{icon} [ORDER] [{label}] "
+        f"client={client_name}({client_id}) "
+        f"side={payload.get('buyorsell','')} "
+        f"qty={payload.get('quantityinlot','')} "
+        f"type={payload.get('ordertype','')}/{payload.get('producttype','')} "
+        f"exch={payload.get('exchange','')} "
+        f"token={payload.get('symboltoken','')} "
+        f"price={payload.get('price',0)} "
+        f"trig={payload.get('triggerprice',0)} "
+        f"amo={payload.get('amoorder','N')} "
+        f"status={status} oid={oid}"
+        + (f" msg={msg_txt}" if msg_txt else "")
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Telegram alert helpers
+# ─────────────────────────────────────────────────────────────
+def _get_telegram_config(owner_userid: str) -> dict:
+    """Load bot_token + chat_id for a specific user from DB."""
+    try:
+        row = db_execute(
+            "SELECT bot_token, chat_id, enabled FROM telegram_config WHERE owner_userid=%s",
+            (owner_userid,), fetch="one",
+        )
+        if row and row.get("enabled"):
+            return {"bot_token": row["bot_token"] or "", "chat_id": row["chat_id"] or ""}
+    except Exception:
+        pass
+    # Fall back to global env token if set
+    if TELEGRAM_DEFAULT_TOKEN:
+        return {"bot_token": TELEGRAM_DEFAULT_TOKEN, "chat_id": ""}
+    return {}
+
+
+def send_telegram(owner_userid: str, message: str, chat_id: str = ""):
+    """
+    Send a Telegram message for a specific user.
+    Uses user's own bot_token + chat_id stored in DB.
+    Non-blocking — fires in background thread.
+    """
+    def _send():
+        try:
+            cfg = _get_telegram_config(owner_userid)
+            token   = cfg.get("bot_token", "")
+            cid     = chat_id or cfg.get("chat_id", "")
+            if not token or not cid:
+                return
+            url  = f"https://api.telegram.org/bot{token}/sendMessage"
+            resp = requests.post(url, json={"chat_id": cid, "text": message, "parse_mode": "HTML"}, timeout=10)
+            if not resp.ok:
+                print(f"⚠️ [TELEGRAM] Send failed for {owner_userid}: {resp.text[:200]}")
+        except Exception as e:
+            print(f"⚠️ [TELEGRAM] Exception for {owner_userid}: {e}")
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def _tg_order_msg(label: str, client_name: str, payload: dict, resp: dict) -> str:
+    """Format a clean Telegram message for an order event."""
+    status  = (resp.get("status") or "").upper()
+    oid     = resp.get("uniqueorderid") or resp.get("order_id") or "—"
+    msg_txt = resp.get("message") or resp.get("Message") or ""
+    icon    = "✅" if status == "SUCCESS" else "❌"
+    side    = payload.get("buyorsell", "")
+    qty     = payload.get("quantityinlot", "")
+    exch    = payload.get("exchange", "")
+    tok     = payload.get("symboltoken", "")
+    ot      = payload.get("ordertype", "")
+    pt      = payload.get("producttype", "")
+    lines = [
+        f"{icon} <b>{label}</b>",
+        f"Client: {client_name}",
+        f"Side: {side}  Qty: {qty}  Type: {ot}/{pt}",
+        f"Exchange: {exch}  Token: {tok}",
+        f"Status: {status}  OID: {oid}",
+    ]
+    if msg_txt:
+        lines.append(f"Msg: {msg_txt}")
+    return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -309,6 +400,14 @@ CREATE INDEX IF NOT EXISTS idx_sm_symbol
     ON symbol_master (stock_symbol);
 CREATE INDEX IF NOT EXISTS idx_sm_symbol_lower
     ON symbol_master ((LOWER(stock_symbol)));
+
+CREATE TABLE IF NOT EXISTS telegram_config (
+    owner_userid TEXT PRIMARY KEY,
+    bot_token    TEXT NOT NULL DEFAULT '',
+    chat_id      TEXT NOT NULL DEFAULT '',
+    enabled      BOOLEAN DEFAULT TRUE,
+    updated_at   TIMESTAMPTZ DEFAULT NOW()
+);
 
 CREATE TABLE IF NOT EXISTS app_meta (
     key        TEXT PRIMARY KEY,
@@ -844,19 +943,21 @@ def _startup_login_all_clients():
 
 # ─────────────────────────────────────────────────────────────
 # Auto-Relogin — Session Watchdog
-#
-# Runs every SESSION_WATCHDOG_INTERVAL_SECONDS (default 30 min)
-# and re-logs only clients whose in-memory session has expired or
-# is missing. This is a safety net for mid-day session dropouts.
-#
-# Primary relogin is triggered on user login (see /auth/login),
-# so this watchdog handles edge cases like copy-trading clients
-# that are active but the owner hasn't logged in recently.
+# Runs 24/7 but throttled outside market hours (AMO support).
+# Primary relogin is triggered on user login (see /auth/login).
 # ─────────────────────────────────────────────────────────────
+_SESSION_WATCHDOG_INTERVAL     = int(os.getenv("SESSION_WATCHDOG_INTERVAL_SECONDS", "1800"))   # 30 min market hours
+_SESSION_WATCHDOG_AMO_INTERVAL = int(os.getenv("SESSION_WATCHDOG_AMO_INTERVAL_SECONDS", "7200")) # 2 hrs off-hours
+_AUTO_RELOGIN_STARTED          = False
 
-_SESSION_WATCHDOG_INTERVAL      = int(os.getenv("SESSION_WATCHDOG_INTERVAL_SECONDS", "1800"))   # 30 min during market hours
-_SESSION_WATCHDOG_AMO_INTERVAL  = int(os.getenv("SESSION_WATCHDOG_AMO_INTERVAL_SECONDS", "7200")) # 2 hrs outside market hours
-_AUTO_RELOGIN_SCHEDULER_STARTED = False
+
+def _is_market_hours_ist() -> bool:
+    """Mon-Fri, 08:45-15:45 IST."""
+    from datetime import time as dtime
+    now = _ist_datetime_now()
+    if now.weekday() >= 5:
+        return False
+    return dtime(8, 45) <= now.time() <= dtime(15, 45)
 
 
 def _relogin_stale_clients(label: str = "WATCHDOG"):
@@ -864,23 +965,14 @@ def _relogin_stale_clients(label: str = "WATCHDOG"):
     try:
         rows = db_execute("SELECT * FROM clients", fetch="all") or []
     except Exception as e:
-        print(f"❌ [{label}] DB read failed: {e}")
-        return
-
-    if not rows:
-        return
-
+        print(f"❌ [{label}] DB read failed: {e}"); return
     stale = [
         dict(row) for row in rows
         if not _session_fresh(mofsl_sessions.get(str(row.get("userid") or "").strip()))
     ]
-
     if not stale:
-        print(f"✅ [{label}] All {len(rows)} sessions are fresh — nothing to do.")
-        return
-
+        print(f"✅ [{label}] All {len(rows)} sessions fresh."); return
     print(f"🔑 [{label}] Re-logging {len(stale)}/{len(rows)} stale client(s)…")
-
     def _login_one(client: dict):
         uid = str(client.get("userid") or "").strip()
         try:
@@ -893,42 +985,24 @@ def _relogin_stale_clients(label: str = "WATCHDOG"):
                     (ok, int(time.time()), msg,
                      str(client.get("owner_userid") or "").strip(), uid),
                 )
-            except Exception:
-                pass
-            if not ok:
-                print(f"⚠️ [{label}] Login failed: {uid}")
+            except Exception: pass
+            if not ok: print(f"⚠️ [{label}] Login failed: {uid}")
         except Exception as e:
             print(f"❌ [{label}] Login error {uid}: {e}")
-
     with ThreadPoolExecutor(max_workers=20) as ex:
         list(ex.map(_login_one, stale))
-
     logged = sum(1 for s in mofsl_sessions.values() if _session_fresh(s))
-    print(f"✅ [{label}] Done — {logged}/{len(rows)} clients now active.")
-
-
-def _is_market_hours_ist() -> bool:
-    """Mon-Fri, 08:45-15:45 IST."""
-    from datetime import time as dtime
-    now = _ist_datetime_now()
-    if now.weekday() >= 5:
-        return False
-    return dtime(8, 45) <= now.time() <= dtime(15, 45)
+    print(f"✅ [{label}] Done — {logged}/{len(rows)} clients active.")
 
 
 def _session_watchdog_loop():
     """
-    Runs 24/7 to support both live orders and AMO (After Market Orders).
-    - Market hours (Mon-Fri 08:45-15:45 IST): checks every SESSION_WATCHDOG_INTERVAL_SECONDS (default 30 min).
-    - Off-hours: checks every SESSION_WATCHDOG_AMO_INTERVAL_SECONDS (default 2 hrs) so
-      stale sessions are caught before someone places an AMO order.
+    Runs 24/7 (supports live orders + AMO).
+    Market hours (Mon-Fri 08:45-15:45 IST): every 30 min.
+    Off-hours: every 2 hrs.
     """
-    print(
-        f"🔍 [WATCHDOG] Session watchdog started "
-        f"(market hours: every {_SESSION_WATCHDOG_INTERVAL}s | "
-        f"off-hours/AMO: every {_SESSION_WATCHDOG_AMO_INTERVAL}s)"
-    )
-    time.sleep(60)  # slight offset from startup login
+    print(f"🔍 [WATCHDOG] Started (market:{_SESSION_WATCHDOG_INTERVAL}s | amo:{_SESSION_WATCHDOG_AMO_INTERVAL}s)")
+    time.sleep(60)
     while True:
         try:
             in_market = _is_market_hours_ist()
@@ -942,15 +1016,10 @@ def _session_watchdog_loop():
 
 
 def start_auto_relogin_threads():
-    global _AUTO_RELOGIN_SCHEDULER_STARTED
-    if _AUTO_RELOGIN_SCHEDULER_STARTED:
-        return
-    _AUTO_RELOGIN_SCHEDULER_STARTED = True
-    threading.Thread(
-        target=_session_watchdog_loop,
-        daemon=True,
-        name="session-watchdog",
-    ).start()
+    global _AUTO_RELOGIN_STARTED
+    if _AUTO_RELOGIN_STARTED: return
+    _AUTO_RELOGIN_STARTED = True
+    threading.Thread(target=_session_watchdog_loop, daemon=True, name="session-watchdog").start()
 
 
 @app.on_event("startup")
@@ -1017,25 +1086,18 @@ def auth_login(payload: dict = Body(...)):
         ph   = row["password_hash"]
         if not salt or not ph or password_hash(password, salt) != ph:
             return {"success": False}
-
-        # ── Kick off a background session-refresh for this user's clients ──
-        # Re-logs any stale Motilal sessions immediately on login so the
-        # Clients page shows correct status right away.
+        # ── Kick off background session-refresh for this user's clients ──
         def _refresh_on_login(owner: str):
             try:
                 clients = db_execute(
-                    "SELECT * FROM clients WHERE owner_userid=%s",
-                    (owner,), fetch="all",
+                    "SELECT * FROM clients WHERE owner_userid=%s", (owner,), fetch="all",
                 ) or []
                 stale = [
                     dict(c) for c in clients
-                    if not _session_fresh(
-                        mofsl_sessions.get(str(c.get("userid") or "").strip())
-                    )
+                    if not _session_fresh(mofsl_sessions.get(str(c.get("userid") or "").strip()))
                 ]
                 if not stale:
-                    print(f"✅ [LOGIN-REFRESH] All sessions fresh for owner={owner}")
-                    return
+                    print(f"✅ [LOGIN-REFRESH] All sessions fresh for owner={owner}"); return
                 print(f"🔑 [LOGIN-REFRESH] Re-logging {len(stale)} stale client(s) for owner={owner}")
                 for client in stale:
                     client["owner_userid"] = owner
@@ -1057,13 +1119,8 @@ def auth_login(payload: dict = Body(...)):
                 print(f"✅ [LOGIN-REFRESH] {logged}/{len(clients)} sessions active for owner={owner}")
             except Exception as e:
                 print(f"❌ [LOGIN-REFRESH] owner={owner}: {e}")
-
-        threading.Thread(
-            target=_refresh_on_login,
-            args=(userid,),
-            daemon=True,
-            name=f"login-refresh-{userid}",
-        ).start()
+        threading.Thread(target=_refresh_on_login, args=(userid,), daemon=True,
+                         name=f"login-refresh-{userid}").start()
 
         return {"success": True, "userid": userid, "access_token": create_token(userid)}
     except Exception as e:
@@ -2236,7 +2293,6 @@ async def place_order(request: Request, payload: dict = Body(...)):
     triggerprice      = _safe_float(data.get("triggerprice", 0), 0.0)
     disclosedquantity = _safe_int(data.get("disclosedquantity", 0), 0)
     amoorder          = (data.get("amoorder") or "N").strip().upper()
-    goodtilldate      = (data.get("goodtilldate") or "").strip()
 
     def _extract_client_id(x) -> str:
         if isinstance(x, dict):
@@ -2311,13 +2367,21 @@ async def place_order(request: Request, payload: dict = Body(...)):
             "disclosedquantity": int(disclosedquantity),
             "amoorder":          amoorder,
             "algoid":            "",
-            "goodtilldate":     goodtilldate if orderduration == "GTD" else "",
+            "goodtilldate":      "",
             "tag":               tag or "",
         }
         try:
             resp = sess["mofsl"].PlaceOrder(order_payload)
         except Exception as e:
             resp = {"status": "ERROR", "message": str(e)}
+        # ── Structured log + Telegram alert ──
+        _log_order("PLACE", sess.get("name", client_id), client_id, order_payload, resp)
+        status_ok = isinstance(resp, dict) and (resp.get("status") or "").upper() == "SUCCESS"
+        if not status_ok:
+            send_telegram(
+                owner_userid,
+                _tg_order_msg("Order FAILED", sess.get("name", client_id), order_payload, resp),
+            )
         with lock: responses[key] = resp
 
     for (tag, cid, q) in targets:
@@ -2489,6 +2553,76 @@ def modify_order(request: Request, payload: dict = Body(...)) -> Dict[str, Any]:
             messages.append(f"❌ {row.get('name', '?')} ({row.get('order_id', '?')}): {e}")
 
     return {"message": messages}
+
+
+# ─────────────────────────────────────────────────────────────
+# Telegram Config (per-user)
+# ─────────────────────────────────────────────────────────────
+@app.post("/set_telegram_config")
+async def set_telegram_config(request: Request, payload: dict = Body(...)):
+    """
+    Save a user's Telegram bot_token + chat_id.
+    Each user sets up their own bot so alerts go directly to them.
+
+    Payload: { bot_token: str, chat_id: str, enabled: bool }
+    """
+    owner_userid = resolve_owner_userid(request, userid=payload.get("userid"))
+    if not owner_userid:
+        raise HTTPException(401, "Missing owner userid")
+    bot_token = (payload.get("bot_token") or "").strip()
+    chat_id   = (payload.get("chat_id")   or "").strip()
+    enabled   = bool(payload.get("enabled", True))
+    if not bot_token or not chat_id:
+        raise HTTPException(400, "bot_token and chat_id are required")
+    db_execute(
+        """
+        INSERT INTO telegram_config (owner_userid, bot_token, chat_id, enabled, updated_at)
+        VALUES (%s, %s, %s, %s, NOW())
+        ON CONFLICT (owner_userid) DO UPDATE
+            SET bot_token=%s, chat_id=%s, enabled=%s, updated_at=NOW()
+        """,
+        (owner_userid, bot_token, chat_id, enabled,
+         bot_token, chat_id, enabled),
+    )
+    return {"success": True, "message": "Telegram config saved"}
+
+
+@app.get("/get_telegram_config")
+def get_telegram_config(request: Request, userid: str = None, user_id: str = None):
+    owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
+    if not owner_userid:
+        return {"configured": False}
+    try:
+        row = db_execute(
+            "SELECT chat_id, enabled FROM telegram_config WHERE owner_userid=%s",
+            (owner_userid,), fetch="one",
+        )
+        if not row:
+            return {"configured": False, "enabled": False}
+        return {
+            "configured": bool(row["chat_id"]),
+            "enabled":    bool(row["enabled"]),
+            "chat_id":    row["chat_id"] or "",
+            # bot_token intentionally NOT returned (security)
+        }
+    except Exception as e:
+        return {"configured": False, "error": str(e)}
+
+
+@app.post("/test_telegram")
+async def test_telegram(request: Request, payload: dict = Body(...)):
+    """Send a test message to verify Telegram config is working."""
+    owner_userid = resolve_owner_userid(request, userid=payload.get("userid"))
+    if not owner_userid:
+        raise HTTPException(401, "Missing owner userid")
+    send_telegram(
+        owner_userid,
+        f"✅ <b>Telegram alerts active</b>\n"
+        f"User: {owner_userid}\n"
+        f"Time: {_ist_datetime_now().strftime('%Y-%m-%d %H:%M:%S')} IST\n"
+        f"Your copy trade failures and order alerts will appear here.",
+    )
+    return {"success": True, "message": "Test message sent — check your Telegram"}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2670,14 +2804,34 @@ def process_copy_order(order: dict, setup: dict):
             print(f"📦 [COPY] child={child_id} qty={qty_lot} payload={child_order}")
             try:
                 resp = sess["mofsl"].PlaceOrder(child_order)
-                print(f"📨 [COPY] child={child_id} resp={resp}")
                 coid = (resp or {}).get("uniqueorderid")
+                status_ok = isinstance(resp, dict) and (resp.get("status") or "").upper() == "SUCCESS"
+                # ── Structured log ──
+                _log_order(
+                    f"COPY/{setup_name}",
+                    sess.get("name", child_id), child_id, child_order, resp or {}
+                )
                 if coid:
                     order_mapping[setup_key].setdefault(master_oid, {})[child_id] = coid
                 else:
                     print(f"❌ [COPY] PlaceOrder FAILED child={child_id} resp={resp}")
+                # ── Telegram alert on failure ──
+                if not status_ok:
+                    send_telegram(
+                        owner,
+                        _tg_order_msg(
+                            f"Copy FAILED [{setup_name}]",
+                            sess.get("name", child_id), child_order, resp or {}
+                        ),
+                    )
             except Exception as e:
                 print(f"❌ [COPY] PlaceOrder exception child={child_id}: {e}")
+                send_telegram(
+                    owner,
+                    f"❌ <b>Copy Exception [{setup_name}]</b>\n"
+                    f"Child: {sess.get('name', child_id)}\n"
+                    f"Error: {e}",
+                )
 
         processed_order_ids_placed[setup_key].add(master_oid)
 
@@ -2694,9 +2848,23 @@ def process_copy_order(order: dict, setup: dict):
             if not (isinstance(sess, dict) and sess.get("mofsl")): continue
             try:
                 resp = sess["mofsl"].CancelOrder(coid, sess["userid"])
-                print(f"✅ [COPY] Cancel propagated child={child_id} coid={coid} resp={resp}")
+                status_ok = isinstance(resp, dict) and (resp.get("status") or "").upper() == "SUCCESS"
+                icon = "✅" if status_ok else "❌"
+                print(f"{icon} [COPY] Cancel propagated child={child_id} coid={coid} status={(resp or {}).get('status','')} msg={(resp or {}).get('message','')}")
+                if not status_ok:
+                    send_telegram(
+                        owner,
+                        f"❌ <b>Copy Cancel FAILED [{setup_name}]</b>\n"
+                        f"Child: {child_id}  CancelOID: {coid}\n"
+                        f"Response: {(resp or {}).get('message', str(resp))}",
+                    )
             except Exception as e:
                 print(f"❌ [COPY] Cancel error child={child_id}: {e}")
+                send_telegram(
+                    owner,
+                    f"❌ <b>Copy Cancel Exception [{setup_name}]</b>\n"
+                    f"Child: {child_id}  CancelOID: {coid}\nError: {e}",
+                )
         processed_order_ids_canceled[setup_key].add(master_oid)
 
 
