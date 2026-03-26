@@ -211,19 +211,35 @@ def _log_order(label: str, client_name: str, client_id: str, payload: dict, resp
 # Telegram alert helpers
 # ─────────────────────────────────────────────────────────────
 def _get_telegram_config(owner_userid: str) -> dict:
-    """Load bot_token + chat_id for a specific user from DB."""
+    """
+    Load bot_token + chat_id for a specific user.
+    Priority:
+      1. telegram_config table (user set their own bot via /set_telegram_config)
+      2. user_settings.telegram_chat_id + global TELEGRAM_DEFAULT_TOKEN env var
+      3. Nothing — alerts silently skipped
+    """
     try:
         row = db_execute(
             "SELECT bot_token, chat_id, enabled FROM telegram_config WHERE owner_userid=%s",
             (owner_userid,), fetch="one",
         )
-        if row and row.get("enabled"):
-            return {"bot_token": row["bot_token"] or "", "chat_id": row["chat_id"] or ""}
+        if row and row.get("enabled") and row.get("chat_id"):
+            token = row["bot_token"] or TELEGRAM_DEFAULT_TOKEN
+            if token:
+                return {"bot_token": token, "chat_id": row["chat_id"]}
     except Exception:
         pass
-    # Fall back to global env token if set
+
+    # Fall back: use chat_id from user_settings + global bot token
     if TELEGRAM_DEFAULT_TOKEN:
-        return {"bot_token": TELEGRAM_DEFAULT_TOKEN, "chat_id": ""}
+        try:
+            s = _get_user_settings(owner_userid)
+            cid = s.get("telegram_chat_id", "")
+            if cid:
+                return {"bot_token": TELEGRAM_DEFAULT_TOKEN, "chat_id": cid}
+        except Exception:
+            pass
+
     return {}
 
 
@@ -400,6 +416,21 @@ CREATE INDEX IF NOT EXISTS idx_sm_symbol
     ON symbol_master (stock_symbol);
 CREATE INDEX IF NOT EXISTS idx_sm_symbol_lower
     ON symbol_master ((LOWER(stock_symbol)));
+
+CREATE TABLE IF NOT EXISTS user_settings (
+    owner_userid    TEXT PRIMARY KEY,
+    -- Profile
+    display_name    TEXT DEFAULT '',
+    phone           TEXT DEFAULT '',
+    email           TEXT DEFAULT '',
+    telegram_chat_id TEXT DEFAULT '',
+    -- Trade defaults
+    default_action        TEXT DEFAULT 'BUY',
+    default_product_type  TEXT DEFAULT 'DELIVERY',
+    default_order_type    TEXT DEFAULT 'MARKET',
+    default_order_duration TEXT DEFAULT 'DAY',
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
 
 CREATE TABLE IF NOT EXISTS telegram_config (
     owner_userid TEXT PRIMARY KEY,
@@ -2553,6 +2584,156 @@ def modify_order(request: Request, payload: dict = Body(...)) -> Dict[str, Any]:
             messages.append(f"❌ {row.get('name', '?')} ({row.get('order_id', '?')}): {e}")
 
     return {"message": messages}
+
+
+# ─────────────────────────────────────────────────────────────
+# User Settings — profile + trade defaults
+# ─────────────────────────────────────────────────────────────
+
+_VALID_ACTIONS         = {"BUY", "SELL"}
+_VALID_PRODUCT_TYPES   = {"DELIVERY", "NORMAL", "SELLFROMDP", "VALUEPLUS", "BTST", "MTF"}
+_VALID_ORDER_TYPES     = {"MARKET", "LIMIT", "STOPLOSS", "SL-M"}
+_VALID_ORDER_DURATIONS = {"DAY", "IOC", "GTD", "EOS"}
+
+
+def _get_user_settings(owner_userid: str) -> dict:
+    """Load settings from DB, return defaults if not set yet."""
+    try:
+        row = db_execute(
+            "SELECT * FROM user_settings WHERE owner_userid=%s",
+            (owner_userid,), fetch="one",
+        )
+        if row:
+            return dict(row)
+    except Exception:
+        pass
+    return {
+        "owner_userid":          owner_userid,
+        "display_name":          "",
+        "phone":                 "",
+        "email":                 "",
+        "telegram_chat_id":      "",
+        "default_action":        "BUY",
+        "default_product_type":  "DELIVERY",
+        "default_order_type":    "MARKET",
+        "default_order_duration": "DAY",
+    }
+
+
+@app.get("/user_settings")
+def get_user_settings(request: Request, userid: str = None, user_id: str = None):
+    """
+    Returns the user's saved profile and trade defaults.
+    Frontend uses trade_defaults to pre-fill the Trade form on load.
+    """
+    owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
+    if not owner_userid:
+        raise HTTPException(401, "Missing owner userid")
+
+    s = _get_user_settings(owner_userid)
+    return {
+        "success": True,
+        "profile": {
+            "name":             s.get("display_name", ""),
+            "phone":            s.get("phone", ""),
+            "email":            s.get("email", ""),
+            "telegram_chat_id": s.get("telegram_chat_id", ""),
+        },
+        "trade_defaults": {
+            "action":         s.get("default_action", "BUY"),
+            "product_type":   s.get("default_product_type", "DELIVERY"),
+            "order_type":     s.get("default_order_type", "MARKET"),
+            "order_duration": s.get("default_order_duration", "DAY"),
+        },
+    }
+
+
+@app.post("/user_settings")
+async def save_user_settings(request: Request, payload: dict = Body(...)):
+    """
+    Save profile and/or trade defaults.
+    Partial updates are fine — only provided fields are updated.
+
+    Payload shape:
+    {
+        "profile": {
+            "name": "SRdy",
+            "phone": "9999999999",
+            "email": "user@example.com",
+            "telegram_chat_id": "123456789"
+        },
+        "trade_defaults": {
+            "action": "BUY",
+            "product_type": "DELIVERY",
+            "order_type": "MARKET",
+            "order_duration": "DAY"
+        }
+    }
+    """
+    owner_userid = resolve_owner_userid(request, userid=payload.get("userid"))
+    if not owner_userid:
+        raise HTTPException(401, "Missing owner userid")
+
+    profile  = payload.get("profile") or {}
+    defaults = payload.get("trade_defaults") or {}
+
+    # Validate trade defaults if provided
+    if defaults.get("action") and defaults["action"].upper() not in _VALID_ACTIONS:
+        raise HTTPException(400, f"Invalid action. Must be one of: {_VALID_ACTIONS}")
+    if defaults.get("product_type") and defaults["product_type"].upper() not in _VALID_PRODUCT_TYPES:
+        raise HTTPException(400, f"Invalid product_type. Must be one of: {_VALID_PRODUCT_TYPES}")
+    if defaults.get("order_type") and defaults["order_type"].upper() not in _VALID_ORDER_TYPES:
+        raise HTTPException(400, f"Invalid order_type. Must be one of: {_VALID_ORDER_TYPES}")
+    if defaults.get("order_duration") and defaults["order_duration"].upper() not in _VALID_ORDER_DURATIONS:
+        raise HTTPException(400, f"Invalid order_duration. Must be one of: {_VALID_ORDER_DURATIONS}")
+
+    # Build upsert fields
+    fields: dict = {}
+    if profile.get("name")             is not None: fields["display_name"]          = str(profile["name"]).strip()
+    if profile.get("phone")            is not None: fields["phone"]                 = str(profile["phone"]).strip()
+    if profile.get("email")            is not None: fields["email"]                 = str(profile["email"]).strip()
+    if profile.get("telegram_chat_id") is not None: fields["telegram_chat_id"]      = str(profile["telegram_chat_id"]).strip()
+    if defaults.get("action")          is not None: fields["default_action"]        = defaults["action"].upper().strip()
+    if defaults.get("product_type")    is not None: fields["default_product_type"]  = defaults["product_type"].upper().strip()
+    if defaults.get("order_type")      is not None: fields["default_order_type"]    = defaults["order_type"].upper().strip()
+    if defaults.get("order_duration")  is not None: fields["default_order_duration"]= defaults["order_duration"].upper().strip()
+
+    if not fields:
+        return {"success": True, "message": "Nothing to update"}
+
+    # Upsert
+    col_list = ", ".join(fields.keys())
+    val_list = ", ".join(["%s"] * len(fields))
+    update_clause = ", ".join(f"{k}=%s" for k in fields)
+
+    db_execute(
+        f"""
+        INSERT INTO user_settings (owner_userid, {col_list}, updated_at)
+        VALUES (%s, {val_list}, NOW())
+        ON CONFLICT (owner_userid) DO UPDATE
+            SET {update_clause}, updated_at=NOW()
+        """,
+        [owner_userid] + list(fields.values()) + list(fields.values()),
+    )
+
+    # If telegram_chat_id changed, also sync it to telegram_config table
+    if "telegram_chat_id" in fields and fields["telegram_chat_id"]:
+        try:
+            existing_tg = db_execute(
+                "SELECT bot_token FROM telegram_config WHERE owner_userid=%s",
+                (owner_userid,), fetch="one",
+            )
+            if existing_tg:
+                db_execute(
+                    "UPDATE telegram_config SET chat_id=%s, updated_at=NOW() WHERE owner_userid=%s",
+                    (fields["telegram_chat_id"], owner_userid),
+                )
+            # If no telegram_config row yet, it will be created when user calls /set_telegram_config
+        except Exception as e:
+            print(f"⚠️ [SETTINGS] telegram_config sync failed: {e}")
+
+    print(f"✅ [SETTINGS] Saved for {owner_userid}: {list(fields.keys())}")
+    return {"success": True, "message": "Settings saved"}
 
 
 # ─────────────────────────────────────────────────────────────
