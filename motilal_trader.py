@@ -2187,6 +2187,8 @@ def _fetch_summary_for_owner(owner_userid: str) -> Dict:
 @app.get("/get_holdings")
 def get_holdings(request: Request, userid: str = None, user_id: str = None):
     owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
+    print(f"[HOLDINGS] resolved_owner={owner_userid}")
+
     if not owner_userid:
         return {"ok": False, "error": "userid missing"}
 
@@ -2196,56 +2198,85 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
 
     for client_id, sess in list(mofsl_sessions.items()):
         try:
-            if not isinstance(sess, dict): continue
-            if str(sess.get("owner_userid", "")).strip() != str(owner_userid).strip(): continue
+            if not isinstance(sess, dict):
+                continue
+
+            sess_owner = str(sess.get("owner_userid", "")).strip()
+            if sess_owner != str(owner_userid).strip():
+                print(f"[HOLDINGS] skip client={client_id} sess_owner={sess_owner} req_owner={owner_userid}")
+                continue
+
             name  = sess.get("name", "") or client_id
             Mofsl = sess.get("mofsl")
             uid_  = sess.get("userid") or client_id
-            if not Mofsl or not uid_: continue
+            if not Mofsl or not uid_:
+                print(f"[HOLDINGS] skip client={client_id} no session sdk")
+                continue
 
             resp = Mofsl.GetDPHolding(uid_)
-            if not resp or resp.get("status") != "SUCCESS": continue
+            print(f"[HOLDINGS] client={uid_} name={name} status={(resp or {}).get('status')}")
 
-            invested = 0.0; total_pnl = 0.0
+            if not resp or resp.get("status") != "SUCCESS":
+                continue
+
+            rows_added = 0
+            invested = 0.0
+            total_pnl = 0.0
+
             for h in (resp.get("data") or []):
                 symbol    = (h.get("scripname") or "").strip()
                 qty       = float(h.get("dpquantity", 0) or 0)
                 buy_avg   = float(h.get("buyavgprice", 0) or 0)
                 scripcode = h.get("nsesymboltoken")
-                if not scripcode or qty <= 0: continue
+
+                if not scripcode or qty <= 0:
+                    print(f"[HOLDINGS] filtered symbol={symbol} qty={qty} scripcode={scripcode}")
+                    continue
+
                 try:
                     ltp_resp = Mofsl.GetLtp({"clientcode": uid_, "exchange": "NSE", "scripcode": int(scripcode)})
                     ltp = float((ltp_resp or {}).get("data", {}).get("ltp", 0) or 0) / 100
                 except Exception:
                     ltp = 0.0
+
                 pnl        = round((ltp - buy_avg) * qty, 2)
                 invested  += qty * buy_avg
                 total_pnl += pnl
+                rows_added += 1
+
                 holdings_data.append({
-                    "name": name, "symbol": symbol, "quantity": qty,
-                    "buy_avg": round(buy_avg, 2), "ltp": round(ltp, 2), "pnl": pnl,
+                    "name": name,
+                    "symbol": symbol,
+                    "quantity": qty,
+                    "buy_avg": round(buy_avg, 2),
+                    "ltp": round(ltp, 2),
+                    "pnl": pnl,
                 })
+
+            print(f"[HOLDINGS] client={uid_} added_rows={rows_added}")
 
             available_margin = get_available_margin(Mofsl, uid_)
             capital          = float(capital_map.get(uid_) or capital_map.get(name) or 0)
             current_value    = invested + total_pnl
+
             summary_data[name] = {
-                "name":             name,
-                "capital":          round(capital, 2),
-                "invested":         round(invested, 2),
-                "pnl":              round(total_pnl, 2),
-                "current_value":    round(current_value, 2),
+                "name": name,
+                "capital": round(capital, 2),
+                "invested": round(invested, 2),
+                "pnl": round(total_pnl, 2),
+                "current_value": round(current_value, 2),
                 "available_margin": round(available_margin, 2),
-                "net_gain":         round((current_value + available_margin) - capital, 2),
+                "net_gain": round((current_value + available_margin) - capital, 2),
             }
+
         except Exception as e:
             print(f"❌ Holdings error for {client_id}: {e}")
 
+    print(f"[HOLDINGS] final_count={len(holdings_data)} summary_count={len(summary_data)}")
     global summary_data_global
     summary_data_global[str(owner_userid).strip()] = summary_data
     return {"holdings": holdings_data, "summary": list(summary_data.values())}
-
-
+    
 @app.get("/get_summary")
 def get_summary(request: Request, userid: str = None, user_id: str = None):
     owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
