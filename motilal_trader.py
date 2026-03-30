@@ -1263,23 +1263,30 @@ def debug_holdings_raw(request: Request, userid: str = None, user_id: str = None
                     dp_qty    = float(h.get("dpquantity", 0) or 0)
                     avail_qty = float(h.get("availableqty", 0) or 0)
                     blk_qty   = float(h.get("blockedqty", 0) or 0)
-                    used_qty  = dp_qty if dp_qty > 0 else avail_qty
+                    nse_tok   = h.get("nsesymboltoken")
+                    bse_tok   = h.get("bsesymboltoken") or h.get("bsescripcode")
+                    used_tok  = nse_tok if nse_tok and int(nse_tok or 0) > 0 else bse_tok
+                    exch_used = "NSE" if nse_tok and int(nse_tok or 0) > 0 else "BSE"
+                    # UI shows row only if dpquantity>0 AND has a valid token
+                    will_show = dp_qty > 0 and bool(used_tok) and int(used_tok or 0) > 0
+                    skip_reason = (
+                        "dpquantity=0" if dp_qty <= 0
+                        else "no valid nse/bse token" if not (used_tok and int(used_tok or 0) > 0)
+                        else None
+                    )
                     entry["holdings_rows"].append({
                         "scripname":        h.get("scripname"),
-                        "isin":             h.get("isinno") or h.get("isin"),
+                        "isin":             h.get("scripisinno") or h.get("isinno") or h.get("isin"),
                         "dpquantity":       dp_qty,
                         "availableqty":     avail_qty,
                         "blockedqty":       blk_qty,
-                        "used_qty":         used_qty,
                         "buyavgprice":      h.get("buyavgprice"),
-                        "nsesymboltoken":   h.get("nsesymboltoken"),
-                        "bsesymboltoken":   h.get("bsesymboltoken"),
-                        "will_show_in_ui":  used_qty > 0 and bool(h.get("nsesymboltoken")),
-                        "skip_reason": (
-                            "qty=0 and availableqty=0" if used_qty <= 0
-                            else "no nsesymboltoken" if not h.get("nsesymboltoken")
-                            else None
-                        ),
+                        "nsesymboltoken":   nse_tok,
+                        "bsesymboltoken":   bse_tok,
+                        "token_used":       used_tok,
+                        "exchange_used":    exch_used,
+                        "will_show_in_ui":  will_show,
+                        "skip_reason":      skip_reason,
                     })
             else:
                 entry["holdings_error"] = f"data field is not a list: {type(raw_data).__name__} = {str(raw_data)[:200]}"
@@ -2270,14 +2277,15 @@ def _fetch_summary_for_owner(owner_userid: str) -> Dict:
                 resp = Mofsl.GetDPHolding(uid_)
                 if resp and resp.get("status") == "SUCCESS":
                     for h in (resp.get("data") or []):
-                        dp_qty  = float(h.get("dpquantity", 0) or 0)
-                        avail   = float(h.get("availableqty", 0) or 0)
-                        qty     = dp_qty if dp_qty > 0 else avail
+                        qty     = float(h.get("dpquantity", 0) or 0)
                         buy_avg = float(h.get("buyavgprice", 0) or 0)
-                        sc      = h.get("nsesymboltoken")
-                        if not sc or qty <= 0: continue
+                        nse_tok = h.get("nsesymboltoken")
+                        bse_tok = h.get("bsesymboltoken") or h.get("bsescripcode")
+                        sc      = nse_tok if nse_tok and int(nse_tok or 0) > 0 else bse_tok
+                        exch    = "NSE" if nse_tok and int(nse_tok or 0) > 0 else "BSE"
+                        if qty <= 0 or not sc or int(sc or 0) <= 0: continue
                         try:
-                            ltp_resp = Mofsl.GetLtp({"clientcode": uid_, "exchange": "NSE", "scripcode": int(sc)})
+                            ltp_resp = Mofsl.GetLtp({"clientcode": uid_, "exchange": exch, "scripcode": int(sc)})
                             ltp = float((ltp_resp or {}).get("data", {}).get("ltp", 0) or 0) / 100
                         except Exception:
                             ltp = 0.0
@@ -2344,20 +2352,26 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
 
             for h in (resp.get("data") or []):
                 symbol    = (h.get("scripname") or "").strip()
-                # Use dpquantity; if zero, also check availableqty.
-                # Some API versions set dpquantity=available (excluding blocked).
-                dp_qty    = float(h.get("dpquantity", 0) or 0)
-                avail_qty = float(h.get("availableqty", 0) or 0)
-                qty       = dp_qty if dp_qty > 0 else avail_qty
+                # Per Motilal API docs: dpquantity is the authoritative total DP holding qty.
+                # Filter strictly by dpquantity > 0 only.
+                qty       = float(h.get("dpquantity", 0) or 0)
                 buy_avg   = float(h.get("buyavgprice", 0) or 0)
-                scripcode = h.get("nsesymboltoken")
 
-                if not scripcode or qty <= 0:
-                    print(f"[HOLDINGS] filtered symbol={symbol} qty={qty} scripcode={scripcode}")
+                # Prefer NSE token; fall back to BSE token
+                nse_token = h.get("nsesymboltoken")
+                bse_token = h.get("bsesymboltoken") or h.get("bsescripcode")
+                scripcode = nse_token if nse_token and int(nse_token or 0) > 0 else bse_token
+                exchange  = "NSE" if nse_token and int(nse_token or 0) > 0 else "BSE"
+
+                if qty <= 0:
+                    print(f"[HOLDINGS] filtered symbol={symbol} dpqty={qty} (dpquantity=0)")
+                    continue
+                if not scripcode or int(scripcode or 0) <= 0:
+                    print(f"[HOLDINGS] filtered symbol={symbol} qty={qty} no valid token (nse={nse_token} bse={bse_token})")
                     continue
 
                 try:
-                    ltp_resp = Mofsl.GetLtp({"clientcode": uid_, "exchange": "NSE", "scripcode": int(scripcode)})
+                    ltp_resp = Mofsl.GetLtp({"clientcode": uid_, "exchange": exchange, "scripcode": int(scripcode)})
                     ltp = float((ltp_resp or {}).get("data", {}).get("ltp", 0) or 0) / 100
                 except Exception:
                     ltp = 0.0
