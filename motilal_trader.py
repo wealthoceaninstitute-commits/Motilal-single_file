@@ -2166,7 +2166,9 @@ def _fetch_summary_for_owner(owner_userid: str) -> Dict:
                 resp = Mofsl.GetDPHolding(uid_)
                 if resp and resp.get("status") == "SUCCESS":
                     for h in (resp.get("data") or []):
-                        qty     = float(h.get("dpquantity", 0) or 0)
+                        dp_qty  = float(h.get("dpquantity", 0) or 0)
+                        avail   = float(h.get("availableqty", 0) or 0)
+                        qty     = dp_qty if dp_qty > 0 else avail
                         buy_avg = float(h.get("buyavgprice", 0) or 0)
                         sc      = h.get("nsesymboltoken")
                         if not sc or qty <= 0: continue
@@ -2238,7 +2240,11 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
 
             for h in (resp.get("data") or []):
                 symbol    = (h.get("scripname") or "").strip()
-                qty       = float(h.get("dpquantity", 0) or 0)
+                # Use dpquantity; if zero, also check availableqty.
+                # Some API versions set dpquantity=available (excluding blocked).
+                dp_qty    = float(h.get("dpquantity", 0) or 0)
+                avail_qty = float(h.get("availableqty", 0) or 0)
+                qty       = dp_qty if dp_qty > 0 else avail_qty
                 buy_avg   = float(h.get("buyavgprice", 0) or 0)
                 scripcode = h.get("nsesymboltoken")
 
@@ -2289,7 +2295,79 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
     global summary_data_global
     summary_data_global[str(owner_userid).strip()] = summary_data
     return {"holdings": holdings_data, "summary": list(summary_data.values())}
-    
+
+
+@app.get("/debug_holdings")
+def debug_holdings(request: Request, userid: str = None, user_id: str = None):
+    """
+    Diagnostic endpoint — shows per-client session state and raw GetDPHolding response.
+    Call this (with your JWT) to see exactly why a client's holdings are missing.
+    """
+    owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
+    if not owner_userid:
+        return {"ok": False, "error": "userid missing"}
+
+    result = []
+    all_keys = list(mofsl_sessions.keys())
+
+    for key, sess in list(mofsl_sessions.items()):
+        if not isinstance(sess, dict):
+            continue
+        sess_owner = str(sess.get("owner_userid", "")).strip()
+        if sess_owner != str(owner_userid).strip():
+            continue
+
+        client_id = sess.get("userid", key)
+        name      = sess.get("name", client_id)
+        mofsl_obj = sess.get("mofsl")
+        fresh     = _session_fresh(sess)
+
+        entry = {
+            "session_key": key,
+            "client_id":   client_id,
+            "name":        name,
+            "owner":       sess_owner,
+            "session_fresh": fresh,
+            "has_mofsl":   bool(mofsl_obj),
+            "raw_response": None,
+            "rows": [],
+            "error": None,
+        }
+
+        if not mofsl_obj or not fresh:
+            entry["error"] = "Session missing or stale"
+            result.append(entry)
+            continue
+
+        try:
+            resp = mofsl_obj.GetDPHolding(client_id)
+            entry["raw_response"] = {
+                "status": (resp or {}).get("status"),
+                "message": (resp or {}).get("message"),
+                "data_count": len((resp or {}).get("data") or []),
+            }
+            for h in ((resp or {}).get("data") or []):
+                entry["rows"].append({
+                    "scripname":      h.get("scripname"),
+                    "dpquantity":     h.get("dpquantity"),
+                    "availableqty":   h.get("availableqty"),
+                    "blockedqty":     h.get("blockedqty"),
+                    "buyavgprice":    h.get("buyavgprice"),
+                    "nsesymboltoken": h.get("nsesymboltoken"),
+                })
+        except Exception as e:
+            entry["error"] = str(e)
+
+        result.append(entry)
+
+    return {
+        "owner_userid": owner_userid,
+        "total_session_keys": len(all_keys),
+        "matched_clients": len(result),
+        "clients": result,
+    }
+
+
 @app.get("/get_summary")
 def get_summary(request: Request, userid: str = None, user_id: str = None):
     owner_userid = resolve_owner_userid(request, userid=userid, user_id=user_id)
