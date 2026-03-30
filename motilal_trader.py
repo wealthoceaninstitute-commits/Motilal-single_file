@@ -512,6 +512,11 @@ mofsl_sessions: Dict[str, Dict[str, Any]] = {}
 position_meta:  Dict = {}
 _position_meta_lock = threading.Lock()
 
+
+def _sess_key(owner_userid: str, client_id: str) -> str:
+    """Composite key so different owners' clients never collide in mofsl_sessions."""
+    return f"{str(owner_userid or '').strip()}:{str(client_id or '').strip()}"
+
 _SESSION_TTL_SECONDS = int(os.getenv("MO_SESSION_TTL_SECONDS", "21600"))
 _login_locks: Dict[str, threading.Lock] = {}
 
@@ -544,13 +549,14 @@ def motilal_login(client: dict) -> bool:
         print("Login skipped: missing userid")
         return False
 
-    existing = mofsl_sessions.get(userid)
+    key      = _sess_key(owner_userid, userid)
+    existing = mofsl_sessions.get(key)
     if existing and _session_fresh(existing) and _norm_uid(existing.get("owner_userid", "")) == owner_userid:
         return True
 
-    lk = _lock_for(userid)
+    lk = _lock_for(key)
     with lk:
-        existing = mofsl_sessions.get(userid)
+        existing = mofsl_sessions.get(key)
         if existing and _session_fresh(existing) and _norm_uid(existing.get("owner_userid", "")) == owner_userid:
             return True
         try:
@@ -558,7 +564,7 @@ def motilal_login(client: dict) -> bool:
             mofsl = MOFSLOPENAPI(apikey, Base_Url, None, SourceID, browsername, browserversion)
             resp  = mofsl.login(userid, password, pan, totp, userid)
             if isinstance(resp, dict) and resp.get("status") == "SUCCESS":
-                mofsl_sessions[userid] = {
+                mofsl_sessions[key] = {
                     "name":         name,
                     "userid":       userid,
                     "mofsl":        mofsl,
@@ -593,7 +599,8 @@ def _ensure_session_for_copy(owner: str, client_id: str) -> Optional[dict]:
     if not owner or not client_id:
         return None
 
-    sess = mofsl_sessions.get(client_id)
+    key  = _sess_key(owner, client_id)
+    sess = mofsl_sessions.get(key)
     if (
         isinstance(sess, dict)
         and _session_fresh(sess)
@@ -613,7 +620,7 @@ def _ensure_session_for_copy(owner: str, client_id: str) -> Optional[dict]:
         print(f"❌ [COPY] Login exception: {e}")
         return None
 
-    return mofsl_sessions.get(client_id) if ok else None
+    return mofsl_sessions.get(key) if ok else None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -999,7 +1006,9 @@ def _relogin_stale_clients(label: str = "WATCHDOG"):
         print(f"❌ [{label}] DB read failed: {e}"); return
     stale = [
         dict(row) for row in rows
-        if not _session_fresh(mofsl_sessions.get(str(row.get("userid") or "").strip()))
+        if not _session_fresh(mofsl_sessions.get(
+            _sess_key(str(row.get("owner_userid") or "").strip(), str(row.get("userid") or "").strip())
+        ))
     ]
     if not stale:
         print(f"✅ [{label}] All {len(rows)} sessions fresh."); return
@@ -1125,7 +1134,9 @@ def auth_login(payload: dict = Body(...)):
                 ) or []
                 stale = [
                     dict(c) for c in clients
-                    if not _session_fresh(mofsl_sessions.get(str(c.get("userid") or "").strip()))
+                    if not _session_fresh(mofsl_sessions.get(
+                        _sess_key(owner, str(c.get("userid") or "").strip())
+                    ))
                 ]
                 if not stale:
                     print(f"✅ [LOGIN-REFRESH] All sessions fresh for owner={owner}"); return
@@ -1145,7 +1156,9 @@ def auth_login(payload: dict = Body(...)):
                         print(f"❌ [LOGIN-REFRESH] {client.get('userid')}: {e}")
                 logged = sum(
                     1 for c in clients
-                    if _session_fresh(mofsl_sessions.get(str(c.get("userid") or "").strip()))
+                    if _session_fresh(mofsl_sessions.get(
+                        _sess_key(owner, str(c.get("userid") or "").strip())
+                    ))
                 )
                 print(f"✅ [LOGIN-REFRESH] {logged}/{len(clients)} sessions active for owner={owner}")
             except Exception as e:
@@ -1303,7 +1316,7 @@ def get_clients(request: Request, userid: str = None, user_id: str = None):
     clients = []
     for row in rows:
         client_id = row["userid"]
-        sess = mofsl_sessions.get(client_id)
+        sess = mofsl_sessions.get(_sess_key(uid, client_id))
         sa   = bool(
             sess
             and _norm_uid(sess.get("owner_userid", "")) == uid
@@ -1752,7 +1765,7 @@ async def cancel_order(request: Request, payload: dict = Body(...)):
     def find_sess(order):
         cid = (order or {}).get("client_id") or ""
         if cid:
-            s = mofsl_sessions.get(cid)
+            s = mofsl_sessions.get(_sess_key(owner_userid, cid))
             if s and s.get("owner_userid", "") == owner_userid:
                 return s
         nm = (order or {}).get("name", "")
@@ -2046,7 +2059,7 @@ async def close_position(request: Request, payload: dict = Body(...)):
 
     def find_sess(name, cid_hint=""):
         if cid_hint:
-            s = mofsl_sessions.get(cid_hint)
+            s = mofsl_sessions.get(_sess_key(owner_userid, cid_hint))
             if isinstance(s, dict) and (
                 not owner_userid
                 or str(s.get("owner_userid", "")).strip() == str(owner_userid).strip()
@@ -2376,12 +2389,13 @@ async def place_order(request: Request, payload: dict = Body(...)):
     def _ensure_session(client_id: str) -> dict:
         cid = str(client_id or "").strip()
         if not cid: return {}
-        sess = mofsl_sessions.get(cid)
+        key = _sess_key(owner_userid, cid)
+        sess = mofsl_sessions.get(key)
         if isinstance(sess, dict) and sess.get("mofsl"): return sess
         cobj = _load_client_from_db(owner_userid, cid)
         if not cobj: return {}
         cobj["owner_userid"] = owner_userid
-        return mofsl_sessions.get(cid) or {} if motilal_login(cobj) else {}
+        return mofsl_sessions.get(key) or {} if motilal_login(cobj) else {}
 
     targets = []
     if groupacc:
@@ -2518,7 +2532,7 @@ def modify_order(request: Request, payload: dict = Body(...)) -> Dict[str, Any]:
     def _get_session_for_row(r):
         cid = str(r.get("client_id") or "").strip()
         if cid:
-            s = mofsl_sessions.get(cid)
+            s = mofsl_sessions.get(_sess_key(owner_userid, cid))
             if isinstance(s, dict) and str(s.get("owner_userid", "")).strip() == str(owner_userid).strip():
                 return s
         nm = (r.get("name") or "").strip().lower()
@@ -2981,12 +2995,13 @@ def process_copy_order(order: dict, setup: dict):
             child_id = str(child_id).strip()
             if not child_id: continue
 
-            sess = mofsl_sessions.get(child_id)
+            child_key = _sess_key(owner, child_id)
+            sess = mofsl_sessions.get(child_key)
             if not (isinstance(sess, dict) and sess.get("mofsl") and _session_fresh(sess)):
                 print(f"🔁 [COPY] Re-logging child={child_id}")
                 cobj = _load_client_from_db(owner, child_id)
                 if cobj: motilal_login(cobj)
-                sess = mofsl_sessions.get(child_id)
+                sess = mofsl_sessions.get(child_key)
 
             if not (isinstance(sess, dict) and sess.get("mofsl")):
                 print(f"❌ [COPY] No session child={child_id} — skipping"); continue
@@ -3056,7 +3071,7 @@ def process_copy_order(order: dict, setup: dict):
             processed_order_ids_canceled[setup_key].add(master_oid)
             return
         for child_id, coid in child_map.items():
-            sess = mofsl_sessions.get(child_id)
+            sess = mofsl_sessions.get(_sess_key(owner, child_id))
             if not (isinstance(sess, dict) and sess.get("mofsl")): continue
             try:
                 resp = sess["mofsl"].CancelOrder(coid, sess["userid"])
