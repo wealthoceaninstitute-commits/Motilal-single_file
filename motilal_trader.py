@@ -1194,6 +1194,110 @@ def debug_sessions(request: Request, userid: str = None, user_id: str = None):
     return {"resolved_owner": owner_userid, "sessions": result}
 
 
+@app.get("/debug_holdings_raw")
+def debug_holdings_raw(request: Request, userid: str = None, user_id: str = None):
+    """
+    Open debug endpoint — no auth required.
+    Shows ALL sessions in memory, their owner, session key format,
+    freshness, and the raw GetDPHolding API response per client.
+    Access directly in browser: /debug_holdings_raw?userid=YOUR_USERID
+    Or without userid to see ALL sessions across all owners.
+    """
+    filter_owner = resolve_owner_userid(request, userid=userid, user_id=user_id)
+
+    all_session_keys = list(mofsl_sessions.keys())
+    clients_debug = []
+
+    for key, sess in list(mofsl_sessions.items()):
+        if not isinstance(sess, dict):
+            clients_debug.append({"session_key": key, "error": "not a dict"})
+            continue
+
+        sess_owner = str(sess.get("owner_userid", "")).strip()
+        client_uid = str(sess.get("userid", "") or key).strip()
+        name       = str(sess.get("name", "") or client_uid)
+        fresh      = _session_fresh(sess)
+        login_ts   = sess.get("login_ts", 0)
+        age_mins   = round((int(time.time()) - int(login_ts or 0)) / 60, 1) if login_ts else None
+        mofsl_obj  = sess.get("mofsl")
+
+        # Filter by owner if provided
+        if filter_owner and sess_owner != filter_owner:
+            continue
+
+        entry = {
+            "session_key":    key,
+            "client_id":      client_uid,
+            "name":           name,
+            "owner_userid":   sess_owner,
+            "session_fresh":  fresh,
+            "session_age_minutes": age_mins,
+            "has_mofsl_obj":  bool(mofsl_obj),
+            "holdings_status": None,
+            "holdings_message": None,
+            "holdings_raw_count": 0,
+            "holdings_rows": [],
+            "holdings_error": None,
+        }
+
+        if not mofsl_obj:
+            entry["holdings_error"] = "No MOFSL SDK object in session"
+            clients_debug.append(entry)
+            continue
+
+        if not fresh:
+            entry["holdings_error"] = f"Session stale (age={age_mins} mins)"
+            clients_debug.append(entry)
+            continue
+
+        # Call GetDPHolding and capture full raw response
+        try:
+            resp = mofsl_obj.GetDPHolding(client_uid)
+            entry["holdings_status"]  = (resp or {}).get("status")
+            entry["holdings_message"] = (resp or {}).get("message") or (resp or {}).get("Message")
+            raw_data = (resp or {}).get("data") or []
+            entry["holdings_raw_count"] = len(raw_data) if isinstance(raw_data, list) else 0
+
+            if isinstance(raw_data, list):
+                for h in raw_data:
+                    dp_qty    = float(h.get("dpquantity", 0) or 0)
+                    avail_qty = float(h.get("availableqty", 0) or 0)
+                    blk_qty   = float(h.get("blockedqty", 0) or 0)
+                    used_qty  = dp_qty if dp_qty > 0 else avail_qty
+                    entry["holdings_rows"].append({
+                        "scripname":        h.get("scripname"),
+                        "isin":             h.get("isinno") or h.get("isin"),
+                        "dpquantity":       dp_qty,
+                        "availableqty":     avail_qty,
+                        "blockedqty":       blk_qty,
+                        "used_qty":         used_qty,
+                        "buyavgprice":      h.get("buyavgprice"),
+                        "nsesymboltoken":   h.get("nsesymboltoken"),
+                        "bsesymboltoken":   h.get("bsesymboltoken"),
+                        "will_show_in_ui":  used_qty > 0 and bool(h.get("nsesymboltoken")),
+                        "skip_reason": (
+                            "qty=0 and availableqty=0" if used_qty <= 0
+                            else "no nsesymboltoken" if not h.get("nsesymboltoken")
+                            else None
+                        ),
+                    })
+            else:
+                entry["holdings_error"] = f"data field is not a list: {type(raw_data).__name__} = {str(raw_data)[:200]}"
+
+        except Exception as e:
+            entry["holdings_error"] = f"Exception calling GetDPHolding: {str(e)}"
+
+        clients_debug.append(entry)
+
+    return {
+        "filter_owner":       filter_owner or "(all owners)",
+        "total_session_keys": len(all_session_keys),
+        "all_session_keys":   all_session_keys,
+        "matched_clients":    len(clients_debug),
+        "clients":            clients_debug,
+    }
+
+
 # ─────────────────────────────────────────────────────────────
 # Client CRUD
 # ─────────────────────────────────────────────────────────────
