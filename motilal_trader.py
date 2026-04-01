@@ -2317,84 +2317,126 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
     print(f"[HOLDINGS] resolved_owner={owner_userid}")
 
     if not owner_userid:
-        return {"ok": False, "error": "userid missing"}
+        return {"ok": False, "error": "userid missing", "holdings": [], "summary": []}
 
     holdings_data: List = []
-    capital_map   = _build_client_capital_map(owner_userid)
+    capital_map = _build_client_capital_map(owner_userid)
     summary_data: Dict = {}
 
-    for client_id, sess in list(mofsl_sessions.items()):
+    try:
+        db_clients = db_execute(
+            "SELECT * FROM clients WHERE owner_userid=%s ORDER BY name",
+            (owner_userid,),
+            fetch="all",
+        ) or []
+    except Exception as e:
+        print(f"[HOLDINGS] DB load error: {e}")
+        return {"ok": False, "error": str(e), "holdings": [], "summary": []}
+
+    for row in db_clients:
         try:
-            if not isinstance(sess, dict):
+            client_id = str(row.get("userid") or "").strip()
+            name = str(row.get("name") or client_id).strip()
+            if not client_id:
                 continue
 
-            sess_owner = str(sess.get("owner_userid", "")).strip()
-            if sess_owner != str(owner_userid).strip():
-                print(f"[HOLDINGS] skip client={client_id} sess_owner={sess_owner} req_owner={owner_userid}")
+            key = _sess_key(owner_userid, client_id)
+            sess = mofsl_sessions.get(key)
+
+            # Auto-login if missing or stale
+            if not (
+                isinstance(sess, dict)
+                and _session_fresh(sess)
+                and str(sess.get("owner_userid", "")).strip() == str(owner_userid).strip()
+                and sess.get("mofsl")
+            ):
+                print(f"[HOLDINGS] session missing/stale for {client_id}, attempting relogin")
+                client_obj = dict(row)
+                client_obj["owner_userid"] = owner_userid
+                ok = motilal_login(client_obj)
+                if ok:
+                    sess = mofsl_sessions.get(key)
+                else:
+                    print(f"[HOLDINGS] relogin failed for {client_id}")
+                    continue
+
+            if not sess:
+                print(f"[HOLDINGS] no usable session for {client_id}")
                 continue
 
-            name  = sess.get("name", "") or client_id
             Mofsl = sess.get("mofsl")
-            uid_  = sess.get("userid") or client_id
+            uid_ = str(sess.get("userid") or client_id).strip()
             if not Mofsl or not uid_:
-                print(f"[HOLDINGS] skip client={client_id} no session sdk")
+                print(f"[HOLDINGS] invalid session for {client_id}")
                 continue
 
             resp = Mofsl.GetDPHolding(uid_)
             print(f"[HOLDINGS] client={uid_} name={name} status={(resp or {}).get('status')}")
 
             if not resp or resp.get("status") != "SUCCESS":
+                print(f"[HOLDINGS] GetDPHolding failed for {uid_}: {(resp or {}).get('message')}")
+                continue
+
+            raw_rows = resp.get("data") or []
+            if not isinstance(raw_rows, list):
+                print(f"[HOLDINGS] data not list for {uid_}: {type(raw_rows).__name__}")
                 continue
 
             rows_added = 0
             invested = 0.0
             total_pnl = 0.0
 
-            for h in (resp.get("data") or []):
-                symbol    = (h.get("scripname") or "").strip()
-                # Per Motilal API docs: dpquantity is the authoritative total DP holding qty.
-                # Filter strictly by dpquantity > 0 only.
-                qty       = float(h.get("dpquantity", 0) or 0)
-                buy_avg   = float(h.get("buyavgprice", 0) or 0)
-
-                # Prefer NSE token; fall back to BSE token
-                nse_token = h.get("nsesymboltoken")
-                bse_token = h.get("bsesymboltoken") or h.get("bsescripcode")
-                scripcode = nse_token if nse_token and int(nse_token or 0) > 0 else bse_token
-                exchange  = "NSE" if nse_token and int(nse_token or 0) > 0 else "BSE"
-
-                if qty <= 0:
-                    print(f"[HOLDINGS] filtered symbol={symbol} dpqty={qty} (dpquantity=0)")
-                    continue
-                if not scripcode or int(scripcode or 0) <= 0:
-                    print(f"[HOLDINGS] filtered symbol={symbol} qty={qty} no valid token (nse={nse_token} bse={bse_token})")
-                    continue
-
+            for h in raw_rows:
                 try:
-                    ltp_resp = Mofsl.GetLtp({"clientcode": uid_, "exchange": exchange, "scripcode": int(scripcode)})
-                    ltp = float((ltp_resp or {}).get("data", {}).get("ltp", 0) or 0) / 100
-                except Exception:
+                    symbol = str(h.get("scripname") or h.get("symbol") or "").strip()
+                    qty = float(h.get("dpquantity", 0) or 0)
+                    buy_avg = float(h.get("buyavgprice", 0) or 0)
+
+                    if qty <= 0:
+                        continue
+
+                    nse_token = h.get("nsesymboltoken")
+                    bse_token = h.get("bsesymboltoken") or h.get("bsescripcode")
+                    scripcode = nse_token if nse_token and str(nse_token).strip() not in ("0", "") else bse_token
+                    exchange = "NSE" if nse_token and str(nse_token).strip() not in ("0", "") else "BSE"
+
                     ltp = 0.0
+                    if scripcode and str(scripcode).strip() not in ("0", ""):
+                        try:
+                            ltp_resp = Mofsl.GetLtp({
+                                "clientcode": uid_,
+                                "exchange": exchange,
+                                "scripcode": int(float(scripcode)),
+                            })
+                            ltp = float((ltp_resp or {}).get("data", {}).get("ltp", 0) or 0) / 100
+                        except Exception as ltp_e:
+                            print(f"[HOLDINGS] LTP fetch failed {uid_} {symbol}: {ltp_e}")
+                            ltp = 0.0
+                    else:
+                        print(f"[HOLDINGS] token missing for {uid_} {symbol}, showing row with ltp=0")
 
-                pnl        = round((ltp - buy_avg) * qty, 2)
-                invested  += qty * buy_avg
-                total_pnl += pnl
-                rows_added += 1
+                    pnl = round((ltp - buy_avg) * qty, 2) if ltp > 0 else 0.0
+                    invested += qty * buy_avg
+                    total_pnl += pnl
+                    rows_added += 1
 
-                holdings_data.append({
-                    "name": name,
-                    "symbol": symbol,
-                    "quantity": qty,
-                    "buy_avg": round(buy_avg, 2),
-                    "ltp": round(ltp, 2),
-                    "pnl": pnl,
-                })
+                    holdings_data.append({
+                        "name": name,
+                        "symbol": symbol,
+                        "quantity": qty,
+                        "buy_avg": round(buy_avg, 2),
+                        "ltp": round(ltp, 2),
+                        "pnl": pnl,
+                    })
+
+                except Exception as row_e:
+                    print(f"[HOLDINGS] row error for {uid_}: {row_e}")
 
             print(f"[HOLDINGS] client={uid_} added_rows={rows_added}")
 
             available_margin = get_available_margin(Mofsl, uid_)
-            capital          = float(capital_map.get(uid_) or capital_map.get(name) or 0)
-            current_value    = invested + total_pnl
+            capital = float(capital_map.get(uid_) or capital_map.get(name) or 0)
+            current_value = invested + total_pnl
 
             summary_data[name] = {
                 "name": name,
@@ -2407,13 +2449,13 @@ def get_holdings(request: Request, userid: str = None, user_id: str = None):
             }
 
         except Exception as e:
-            print(f"❌ Holdings error for {client_id}: {e}")
+            print(f"❌ Holdings error for {row.get('userid', '?')}: {e}")
 
     print(f"[HOLDINGS] final_count={len(holdings_data)} summary_count={len(summary_data)}")
     global summary_data_global
     summary_data_global[str(owner_userid).strip()] = summary_data
-    return {"holdings": holdings_data, "summary": list(summary_data.values())}
 
+    return {"ok": True, "holdings": holdings_data, "summary": list(summary_data.values())}
 
 @app.get("/debug_holdings")
 def debug_holdings(request: Request, userid: str = None, user_id: str = None):
